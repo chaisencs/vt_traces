@@ -146,11 +146,17 @@ fn load_auth_config() -> AuthConfig {
 
 fn load_storage() -> anyhow::Result<Arc<dyn StorageEngine>> {
     let storage_mode = env::var("VT_STORAGE_MODE").unwrap_or_else(|_| "memory".to_string());
+    let configured_trace_shards = env::var("VT_STORAGE_TRACE_SHARDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
     let storage: Arc<dyn StorageEngine> = match storage_mode.as_str() {
         "disk" => {
             let path =
                 env::var("VT_STORAGE_PATH").unwrap_or_else(|_| "./var/victoria-traces".to_string());
             let mut config = DiskStorageConfig::default();
+            if let Some(trace_shards) = configured_trace_shards {
+                config = config.with_trace_shards(trace_shards);
+            }
             if let Some(target_segment_size_bytes) =
                 env::var("VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES")
                     .ok()
@@ -169,7 +175,10 @@ fn load_storage() -> anyhow::Result<Arc<dyn StorageEngine>> {
             }
             Arc::new(DiskStorageEngine::open_with_config(path, config)?)
         }
-        _ => Arc::new(MemoryStorageEngine::new()),
+        _ => configured_trace_shards
+            .map(MemoryStorageEngine::with_trace_shards)
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::new(MemoryStorageEngine::new())),
     };
     if env_truthy("VT_STORAGE_BATCH_DISABLED") {
         return Ok(storage);
@@ -180,6 +189,18 @@ fn load_storage() -> anyhow::Result<Arc<dyn StorageEngine>> {
         .and_then(|value| value.parse::<usize>().ok())
     {
         batching = batching.with_max_batch_rows(max_batch_rows);
+    }
+    if let Some(trace_shards) = env::var("VT_STORAGE_BATCH_TRACE_SHARDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        batching = batching.with_trace_shards(trace_shards);
+    }
+    if let Some(max_trace_batch_blocks) = env::var("VT_STORAGE_TRACE_BATCH_MAX_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        batching = batching.with_max_trace_batch_blocks(max_trace_batch_blocks);
     }
     if let Some(max_batch_wait_micros) = env::var("VT_STORAGE_BATCH_MAX_WAIT_MICROS")
         .ok()

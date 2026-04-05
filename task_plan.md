@@ -4,7 +4,7 @@
 Build a production-oriented Rust rewrite of the VictoriaTraces core inside `rust_victoria_trace`, starting with a single-node ingest/storage/query vertical slice and an architecture that can expand to cluster mode later.
 
 ## Current Phase
-Phase 14
+Phase 17
 
 ## Phases
 
@@ -110,6 +110,13 @@ Phase 14
 - [ ] Decide whether metrics belongs in this repository as a first-class series engine or as a separate bounded product slice
 - **Status:** in_progress
 
+### Phase 17: Trace Microbatch Leap
+- [x] Write a bounded design for the batching-layer microbatch route before touching code
+- [x] Add Step 0 metrics for retained blocks and trace batch formation
+- [x] Add Step 1 shard-local trace microbatch combiner on the shared batching layer
+- [x] Re-run same-host `vtbench otlp-protobuf-load` gates before deciding whether to keep pushing the route
+- **Status:** in_progress
+
 ## Key Questions
 1. Which crash-consistency guarantees can be delivered now without overcomplicating the current part lifecycle?
 2. Which overload controls protect the process fastest: per-role concurrency bounds, body-size limits, or both?
@@ -147,3 +154,5 @@ Phase 14
 - The hardening pass through Phase 13 is now complete; the remaining risks are proof-level benchmark evidence and whether metrics should become a first-class series engine here.
 - Phase 14 is now focused on turning `vtbench` into a stronger soak/fault evidence path and deciding how far OTLP metrics should be brought into a trace/log-first product boundary.
 - The current disk ingest focus inside Phase 14 is hot-path reuse and tail-stability work on the synchronous mainline, not a return to the failed async shard-worker experiment.
+- The next performance push is explicitly centered on batching-layer trace microbatches with metrics-backed go/no-go gates, not another speculative disk-only async rewrite.
+- The current retained branch state keeps the batching-layer combiner, disk passthrough batches, and the lighter disk prepare path; the next unresolved bottleneck is now inside the disk append kernel rather than in outer request batching.

@@ -258,6 +258,29 @@
   - Tightened disk `.part` encoding for dynamic fields by promoting homogeneous `bool` and `i64` columns into typed column layouts instead of always using string dictionaries.
   - Extended `vtbench` with `--warmup-secs` and `--report-file`, and verified benchmark reports can be written to disk.
   - Refreshed README capability and deployment guidance so the old `当前限制` section is replaced by production deployment advice.
+
+### Phase 17: Trace Microbatch Leap
+- **Status:** in_progress
+- **Started:** 2026-04-06 02:30
+- Actions taken:
+  - Wrote the trace microbatch design under `docs/plans/2026-04-06-trace-microbatch-design.md` before implementation.
+  - Added Step 0 metrics for retained trace blocks, trace batch queue depth, flush counts, input/output block counts, and batch wait totals/max.
+  - Replaced the old trace pass-through batching path with a shard-local combiner and added tests for staggered-request coalescing and passthrough engines.
+  - Verified that wait-based batch formation (`50us` / `100us`) increases batch ratio but hurts throughput, so the current mainline stays on `VT_STORAGE_BATCH_MAX_WAIT_MICROS=0`.
+  - Added engine-specific trace batch payload modes so memory still coalesces trace blocks while disk now receives passthrough multi-block appends.
+  - Removed `PreparedTraceBlockAppend`'s retained source `TraceBlock` from the disk prepare path and kept only prepared metadata plus encoded row payloads.
+  - Tried a deeper disk prepared-row-batch fusion experiment, benchmarked it, and reverted it after it regressed ingest materially.
+  - Re-ran same-host `vtbench otlp-protobuf-load` after each valid optimization round and kept only the best-performing branch state.
+- Latest same-host fresh single run:
+  - official: `399255.205 spans/s`, `p99=0.675ms`
+  - memory: `275513.872 spans/s`, `p99=0.890ms`
+  - disk: `361882.872 spans/s`, `p99=0.673ms`
+- Step 0 metric snapshots on the current best branch:
+  - memory: `input_blocks=220448`, `output_blocks=102986`, `retained_trace_blocks=102986`
+  - disk: `input_blocks=289504`, `output_blocks=289504`, `flushes=183921`
+- Current interpretation:
+  - The shared batching-layer route is real: disk recovered from the failed async-worker detour and gained another step through combiner + disk passthrough.
+  - The remaining gap to official is no longer primarily batch formation; it is inside the disk append kernel itself, especially WAL append / segment maintenance / live-index update cost.
 - Files created/modified:
   - `rust_victoria_trace/task_plan.md`
   - `rust_victoria_trace/findings.md`
@@ -327,6 +350,27 @@
   - Re-ran fresh release builds plus same-host same-shape fresh single-run and 5-round stability benchmarks against official, memory, and disk.
 - Files created/modified:
   - `rust_victoria_trace/crates/vtstorage/src/disk.rs`
+  - `rust_victoria_trace/progress.md`
+  - `rust_victoria_trace/task_plan.md`
+  - `rust_victoria_trace/findings.md`
+
+### Phase 17: Trace Microbatch Leap
+- **Status:** in_progress
+- Actions taken:
+  - Wrote a bounded design for the batching-layer trace microbatch route under `docs/plans/2026-04-06-trace-microbatch-design.md`.
+  - Started Step 0 by extending storage stats with retained-trace-block and trace-batch formation fields.
+  - Started Step 1 by replacing the old trace pass-through in `BatchingStorageEngine` with per-shard trace batch workers and worker-side block coalescing.
+- Files created/modified:
+  - `rust_victoria_trace/docs/plans/2026-04-06-trace-microbatch-design.md`
+  - `rust_victoria_trace/crates/vtstorage/src/engine.rs`
+  - `rust_victoria_trace/crates/vtstorage/src/batching.rs`
+  - `rust_victoria_trace/crates/vtstorage/src/memory.rs`
+  - `rust_victoria_trace/crates/vtstorage/src/state.rs`
+  - `rust_victoria_trace/crates/vtstorage/src/disk.rs`
+  - `rust_victoria_trace/crates/vtapi/src/app.rs`
+  - `rust_victoria_trace/crates/vtapi/src/main.rs`
+  - `rust_victoria_trace/crates/vtstorage/tests/batching_engine_tests.rs`
+  - `rust_victoria_trace/crates/vtapi/tests/http_api_tests.rs`
   - `rust_victoria_trace/progress.md`
   - `rust_victoria_trace/task_plan.md`
   - `rust_victoria_trace/findings.md`

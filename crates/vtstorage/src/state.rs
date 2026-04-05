@@ -144,6 +144,10 @@ impl IndexedState {
         self.windows_by_trace.len() as u64
     }
 
+    pub(crate) fn retained_blocks(&self) -> u64 {
+        self.blocks.len() as u64
+    }
+
     pub(crate) fn trace_window(&self, trace_id: &str) -> Option<TraceWindow> {
         let trace_ref = self.trace_ids.lookup(trace_id)?;
         let bounds = self.windows_by_trace.get(&trace_ref)?;

@@ -20,7 +20,7 @@ use vtcore::{
 };
 
 use crate::log_state::LogIndexedState;
-use crate::{StorageEngine, StorageError, StorageStatsSnapshot};
+use crate::{StorageEngine, StorageError, StorageStatsSnapshot, TraceBatchPayloadMode};
 
 const SEGMENTS_DIRNAME: &str = "segments";
 const SEGMENT_PREFIX: &str = "segment-";
@@ -309,6 +309,8 @@ impl LiveTraceUpdate {
 struct PreparedBlockRowMetadata {
     trace_id: Arc<str>,
     shard_index: usize,
+    start_unix_nano: i64,
+    end_unix_nano: i64,
     shared_group_index: Option<usize>,
     service: Option<Arc<str>>,
     operation: Option<Arc<str>>,
@@ -323,7 +325,6 @@ struct PreparedSharedGroupMetadata {
 
 #[derive(Debug)]
 struct PreparedTraceBlockAppend {
-    block: TraceBlock,
     shard_index: usize,
     prepared_shared_groups: Vec<PreparedSharedGroupMetadata>,
     prepared_rows: Vec<PreparedBlockRowMetadata>,
@@ -344,7 +345,6 @@ impl PreparedTraceBlockAppend {
             .all(|prepared_row| prepared_row.shard_index == shard_index));
         let (encoded_row_bytes, encoded_row_ranges) = encode_trace_block_rows_packed(&block);
         Self {
-            block,
             shard_index,
             prepared_shared_groups,
             prepared_rows,
@@ -660,12 +660,11 @@ impl DiskStorageEngine {
         active_segment: &mut ActiveSegment,
         observed_segment_paths: &mut FxHashMap<u64, PathBuf>,
     ) -> Result<Vec<LiveTraceUpdate>, StorageError> {
-        let block = &prepared_block.block;
         let prepared_rows = &prepared_block.prepared_rows;
         let prepared_shared_groups = &prepared_block.prepared_shared_groups;
         let encoded_row_bytes = &prepared_block.encoded_row_bytes;
         let encoded_row_ranges = &prepared_block.encoded_row_ranges;
-        let row_count = block.row_count();
+        let row_count = prepared_rows.len();
         let mut live_updates = Vec::new();
 
         let mut batch_start = 0usize;
@@ -686,7 +685,6 @@ impl DiskStorageEngine {
                         .entry(active_segment.segment_id)
                         .or_insert_with(|| active_segment.wal_path.clone());
                     let (batch_updates, bytes_written) = active_segment.append_block_rows(
-                        block,
                         prepared_rows,
                         prepared_shared_groups,
                         &encoded_row_bytes,
@@ -713,7 +711,6 @@ impl DiskStorageEngine {
                 .entry(active_segment.segment_id)
                 .or_insert_with(|| active_segment.wal_path.clone());
             let (batch_updates, bytes_written) = active_segment.append_block_rows(
-                block,
                 prepared_rows,
                 prepared_shared_groups,
                 &encoded_row_bytes,
@@ -979,6 +976,7 @@ impl StorageEngine for DiskStorageEngine {
         StorageStatsSnapshot {
             rows_ingested,
             traces_tracked,
+            retained_trace_blocks: 0,
             persisted_bytes: self.persisted_bytes.load(Ordering::Relaxed),
             segment_count: segment_paths.len() as u64,
             typed_field_columns,
@@ -988,11 +986,16 @@ impl StorageEngine for DiskStorageEngine {
             segment_read_batches: self.segment_read_batches.load(Ordering::Relaxed),
             part_selective_decodes: self.part_selective_decodes.load(Ordering::Relaxed),
             fsync_operations: self.fsync_operations.load(Ordering::Relaxed),
+            ..StorageStatsSnapshot::default()
         }
     }
 
     fn preferred_trace_ingest_shards(&self) -> usize {
         self.trace_shards.len()
+    }
+
+    fn trace_batch_payload_mode(&self) -> TraceBatchPayloadMode {
+        TraceBatchPayloadMode::Passthrough
     }
 }
 
@@ -1417,7 +1420,6 @@ impl ActiveSegment {
 
     fn append_block_rows(
         &mut self,
-        block: &TraceBlock,
         prepared_rows: &[PreparedBlockRowMetadata],
         prepared_shared_groups: &[PreparedSharedGroupMetadata],
         encoded_row_bytes: &[u8],
@@ -1494,8 +1496,8 @@ impl ActiveSegment {
                     .map_err(|_| {
                         StorageError::Message("segment row index exceeds u32 limit".to_string())
                     })?,
-                start_unix_nano: block.start_unix_nano_at(row_index),
-                end_unix_nano: block.end_unix_nano_at(row_index),
+                start_unix_nano: prepared_rows[row_index].start_unix_nano,
+                end_unix_nano: prepared_rows[row_index].end_unix_nano,
             };
             row_locations.push(row_location);
         }
@@ -2478,10 +2480,9 @@ fn push_unique_arc_pair(values: &mut SmallArcPairList, name: Arc<str>, value: Ar
 
 fn merge_live_updates(existing: &mut Vec<LiveTraceUpdate>, incoming: Vec<LiveTraceUpdate>) {
     for mut incoming_update in incoming {
-        if let Some(existing_update) = existing
-            .iter_mut()
-            .find(|existing_update| existing_update.trace_id.as_ref() == incoming_update.trace_id.as_ref())
-        {
+        if let Some(existing_update) = existing.iter_mut().find(|existing_update| {
+            existing_update.trace_id.as_ref() == incoming_update.trace_id.as_ref()
+        }) {
             existing_update.observe_window(
                 incoming_update.start_unix_nano,
                 incoming_update.end_unix_nano,
@@ -2540,6 +2541,8 @@ fn prepare_block_row_metadata(
         }
         prepared_rows.push(PreparedBlockRowMetadata {
             shard_index: trace_shard_index(trace_id.as_ref(), trace_shards),
+            start_unix_nano: block.start_unix_nano_at(row_index),
+            end_unix_nano: block.end_unix_nano_at(row_index),
             shared_group_index,
             trace_id,
             service,
@@ -4532,7 +4535,8 @@ mod tests {
             ),
         ]);
         let prepared_shared_groups = prepare_shared_group_metadata(&block);
-        let prepared_rows = prepare_block_row_metadata(&block, &prepared_shared_groups, trace_shards);
+        let prepared_rows =
+            prepare_block_row_metadata(&block, &prepared_shared_groups, trace_shards);
         let row_locations = vec![
             row(17, 0, 100, 150),
             row(17, 1, 160, 210),
@@ -4624,4 +4628,5 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
 }

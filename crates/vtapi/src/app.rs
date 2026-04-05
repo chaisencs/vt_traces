@@ -4173,6 +4173,11 @@ fn render_storage_metrics(stats: &StorageStatsSnapshot) -> String {
         format!("vt_rows_ingested_total {}", stats.rows_ingested),
         "# TYPE vt_traces_tracked gauge".to_string(),
         format!("vt_traces_tracked {}", stats.traces_tracked),
+        "# TYPE vt_storage_retained_trace_blocks gauge".to_string(),
+        format!(
+            "vt_storage_retained_trace_blocks {}",
+            stats.retained_trace_blocks
+        ),
         "# TYPE vt_storage_persisted_bytes gauge".to_string(),
         format!("vt_storage_persisted_bytes {}", stats.persisted_bytes),
         "# TYPE vt_storage_segments gauge".to_string(),
@@ -4208,6 +4213,61 @@ fn render_storage_metrics(stats: &StorageStatsSnapshot) -> String {
         format!(
             "vt_storage_fsync_operations_total {}",
             stats.fsync_operations
+        ),
+        "# TYPE vt_storage_trace_batch_queue_depth gauge".to_string(),
+        format!(
+            "vt_storage_trace_batch_queue_depth {}",
+            stats.trace_batch_queue_depth
+        ),
+        "# TYPE vt_storage_trace_batch_max_queue_depth gauge".to_string(),
+        format!(
+            "vt_storage_trace_batch_max_queue_depth {}",
+            stats.trace_batch_max_queue_depth
+        ),
+        "# TYPE vt_storage_trace_batch_flushes_total counter".to_string(),
+        format!(
+            "vt_storage_trace_batch_flushes_total {}",
+            stats.trace_batch_flushes
+        ),
+        "# TYPE vt_storage_trace_batch_rows_total counter".to_string(),
+        format!(
+            "vt_storage_trace_batch_rows_total {}",
+            stats.trace_batch_rows
+        ),
+        "# TYPE vt_storage_trace_batch_input_blocks_total counter".to_string(),
+        format!(
+            "vt_storage_trace_batch_input_blocks_total {}",
+            stats.trace_batch_input_blocks
+        ),
+        "# TYPE vt_storage_trace_batch_output_blocks_total counter".to_string(),
+        format!(
+            "vt_storage_trace_batch_output_blocks_total {}",
+            stats.trace_batch_output_blocks
+        ),
+        "# TYPE vt_storage_trace_batch_wait_micros_total counter".to_string(),
+        format!(
+            "vt_storage_trace_batch_wait_micros_total {}",
+            stats.trace_batch_wait_micros_total
+        ),
+        "# TYPE vt_storage_trace_batch_wait_micros_max gauge".to_string(),
+        format!(
+            "vt_storage_trace_batch_wait_micros_max {}",
+            stats.trace_batch_wait_micros_max
+        ),
+        "# TYPE vt_storage_trace_batch_flush_due_to_rows_total counter".to_string(),
+        format!(
+            "vt_storage_trace_batch_flush_due_to_rows_total {}",
+            stats.trace_batch_flush_due_to_rows
+        ),
+        "# TYPE vt_storage_trace_batch_flush_due_to_blocks_total counter".to_string(),
+        format!(
+            "vt_storage_trace_batch_flush_due_to_blocks_total {}",
+            stats.trace_batch_flush_due_to_blocks
+        ),
+        "# TYPE vt_storage_trace_batch_flush_due_to_wait_total counter".to_string(),
+        format!(
+            "vt_storage_trace_batch_flush_due_to_wait_total {}",
+            stats.trace_batch_flush_due_to_wait
         ),
     ]
     .join("\n")

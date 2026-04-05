@@ -181,19 +181,21 @@ impl StorageEngine for MemoryStorageEngine {
     }
 
     fn stats(&self) -> StorageStatsSnapshot {
-        let (rows_ingested, traces_tracked) =
-            self.trace_shards
-                .iter()
-                .fold((0u64, 0u64), |(rows_acc, traces_acc), shard| {
-                    let state = shard.read();
-                    (
-                        rows_acc + state.rows_ingested(),
-                        traces_acc + state.traces_tracked(),
-                    )
-                });
+        let (rows_ingested, traces_tracked, retained_trace_blocks) = self.trace_shards.iter().fold(
+            (0u64, 0u64, 0u64),
+            |(rows_acc, traces_acc, blocks_acc), shard| {
+                let state = shard.read();
+                (
+                    rows_acc + state.rows_ingested(),
+                    traces_acc + state.traces_tracked(),
+                    blocks_acc + state.retained_blocks(),
+                )
+            },
+        );
         StorageStatsSnapshot {
             rows_ingested,
             traces_tracked,
+            retained_trace_blocks,
             persisted_bytes: 0,
             segment_count: 0,
             typed_field_columns: 0,
@@ -203,6 +205,7 @@ impl StorageEngine for MemoryStorageEngine {
             segment_read_batches: 0,
             part_selective_decodes: 0,
             fsync_operations: 0,
+            ..StorageStatsSnapshot::default()
         }
     }
 

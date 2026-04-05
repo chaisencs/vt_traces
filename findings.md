@@ -42,6 +42,12 @@
 - Fresh same-host single run after the change: official `309768.282 spans/s` at `p99=1.132ms`, memory `323530.539 spans/s` at `p99=0.842ms`, disk `340055.678 spans/s` at `p99=0.793ms`.
 - Fresh same-host 5-round serial median after the change: official `321503.677 spans/s` at `p99=1.061ms`, memory `153990.072 spans/s` at `p99=1.819ms`, disk `346439.448 spans/s` at `p99=0.748ms`.
 - One disk round in the new 5-round run still collapsed (`159796.984 spans/s`, `p99=3.192ms`), and a post-run `/metrics` read took seconds because read-side drain still has to absorb pending live updates; the remaining performance risk is now mostly tail instability and read-path merge debt rather than average ingest throughput.
+- The higher-success "big leap" path is to add trace microbatching at the shared `BatchingStorageEngine` layer, not to retry a disk-internal async shard-worker design; this route directly attacks the tiny-request ingest shape shared by both memory and disk.
+- The first gating metrics for that route are retained trace blocks, trace batch queue depth, trace batch flush counts, input-vs-output block counts, and batch wait totals/max.
+- The batching-layer trace combiner is only worthwhile at `max_batch_wait=0` on this machine; tiny positive waits (`50us`, `100us`) improved batch ratios but regressed real throughput.
+- Disk benefits from engine-specific passthrough batching: allowing disk to receive multi-block `append_trace_blocks(...)` batches without rebuilding one synthetic `TraceBlock` lifted fresh disk ingest into the low-`360k spans/s` range on the current host.
+- The lighter disk prepare path also benefits from dropping the retained source `TraceBlock` after `PreparedTraceBlockAppend::new`; keeping only prepared row metadata plus encoded row payloads preserved semantics while trimming work.
+- A deeper disk prepared-row-batch fusion attempt regressed hard enough to discard; the remaining gap to official is now inside the disk append kernel itself rather than in the shared batching envelope.
 
 ## Technical Decisions
 | Decision | Rationale |
@@ -56,6 +62,9 @@
 | Batch on-disk reads per segment before optimizing encodings | Avoids wasting I/O on per-row file open patterns that would distort later performance work |
 | Treat durability and backpressure as P0 before claiming production readiness | They define whether acknowledged writes are trustworthy and whether overload is survivable |
 | Reuse the append-time `SegmentAccumulator` scan to build live updates instead of rescanning prepared rows after append | It reduces duplicate work on the write hot path without changing ingest semantics or reintroducing the failed async worker experiment |
+| Put the next "big leap" on batching-layer per-shard trace microbatches with worker-side coalescing | It is shared by memory and disk, matches the current benchmark shape, and has objective metrics/gates to tell us quickly whether the route is real |
+| Keep engine-specific trace batch payload modes | Memory needs coalesced blocks to reduce retained heap block count; disk performs better when it receives passthrough multi-block appends |
+| Reject positive microbatch waits on the current mainline | Measured `50us` / `100us` waits increased coalescing ratios but reduced actual ingest throughput |
 
 ## Issues Encountered
 | Issue | Resolution |
@@ -66,6 +75,7 @@
 | `reqwest 0.12` pulled in transitive crates requiring newer Rust than 1.73 | Downgrade to `reqwest 0.11` and pin `url` / `idna` / `indexmap` in `Cargo.lock` via `cargo update --precise` |
 | The async shard-worker experiment regressed disk ingest badly compared with checkpoint `2fd0eca` | Restored the `2fd0eca` mainline first, then resumed optimization from the known-good synchronous path |
 | Earlier performance reasoning over-weighted `observe_live_updates` even though the benchmark is pure ingest | Rechecked the write path and targeted append-time live-update construction instead of the later read-side drain |
+| A deeper disk prepared-row-batch fusion experiment regressed far below the current best branch | Reverted the experiment and kept the simpler disk passthrough / lighter prepare path on the mainline |
 
 ## Resources
 - Local clone from prior research:

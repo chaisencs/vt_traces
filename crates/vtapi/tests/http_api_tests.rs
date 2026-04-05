@@ -1303,9 +1303,12 @@ async fn metrics_endpoint_exposes_storage_counters() {
 
     assert!(body.contains("vt_rows_ingested_total"));
     assert!(body.contains("vt_traces_tracked"));
+    assert!(body.contains("vt_storage_retained_trace_blocks"));
     assert!(body.contains("vt_storage_segments"));
     assert!(body.contains("vt_storage_segment_read_batches_total"));
     assert!(body.contains("vt_storage_part_selective_decodes_total"));
+    assert!(body.contains("vt_storage_trace_batch_flushes_total"));
+    assert!(body.contains("vt_storage_trace_batch_input_blocks_total"));
 }
 
 #[tokio::test]
