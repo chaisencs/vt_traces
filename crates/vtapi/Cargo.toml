@@ -1,0 +1,31 @@
+[package]
+name = "vtapi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vtcore = { path = "../vtcore" }
+vtingest = { path = "../vtingest" }
+vtquery = { path = "../vtquery" }
+vtstorage = { path = "../vtstorage" }
+
+[dev-dependencies]
+reqwest.workspace = true
+rcgen = "0.12.1"
+serial_test = "3.2"
+time.workspace = true
+tower.workspace = true

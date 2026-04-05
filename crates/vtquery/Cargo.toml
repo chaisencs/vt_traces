@@ -1,0 +1,9 @@
+[package]
+name = "vtquery"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+vtcore = { path = "../vtcore" }
+vtstorage = { path = "../vtstorage" }

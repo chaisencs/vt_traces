@@ -1,0 +1,14 @@
+[package]
+name = "vtbench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+vtapi = { path = "../vtapi" }
+vtcore = { path = "../vtcore" }
+vtstorage = { path = "../vtstorage" }
