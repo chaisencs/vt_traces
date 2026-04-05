@@ -1,19 +1,27 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    cell::RefCell,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use prost::Message;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use serde_json::{Map, Number, Value};
-use vtcore::{Field, TraceModelError, TraceSpanRow};
+use smallvec::SmallVec;
+use vtcore::{CompactSpanId, Field, TraceBlock, TraceBlockBuilder, TraceModelError, TraceSpanRow};
 
 use crate::{
-    flatten::normalize_value,
-    AttributeValue, ExportTraceServiceRequest, KeyValue, ResourceSpans, ScopeSpans, SpanRecord,
-    Status,
+    flatten::normalize_value, AttributeValue, ExportTraceServiceRequest, KeyValue, ResourceSpans,
+    ScopeSpans, SpanRecord, Status,
 };
 
 const WIRE_VARINT: u8 = 0;
 const WIRE_FIXED64: u8 = 1;
 const WIRE_LENGTH_DELIMITED: u8 = 2;
 const WIRE_FIXED32: u8 = 5;
+const MAX_FIELD_NAME_CACHE_ENTRIES: usize = 16_384;
+const MAX_FIELD_VALUE_CACHE_ENTRIES: usize = 65_536;
+const MAX_IDENTIFIER_CACHE_ENTRIES: usize = 16_384;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtobufCodecError {
@@ -27,9 +35,12 @@ pub enum ProtobufCodecError {
 
 #[derive(Default)]
 struct FieldNameCache {
-    resource_attr: Vec<(String, Arc<str>)>,
-    scope_attr: Vec<(String, Arc<str>)>,
-    span_attr: Vec<(String, Arc<str>)>,
+    resource_attr: FxHashMap<Arc<str>, Arc<str>>,
+    scope_attr: FxHashMap<Arc<str>, Arc<str>>,
+    span_attr: FxHashMap<Arc<str>, Arc<str>>,
+    last_resource_attr: Option<(Arc<str>, Arc<str>)>,
+    last_scope_attr: Option<(Arc<str>, Arc<str>)>,
+    last_span_attr: Option<(Arc<str>, Arc<str>)>,
     instrumentation_scope_name: Option<Arc<str>>,
     instrumentation_scope_version: Option<Arc<str>>,
     status_code: Option<Arc<str>>,
@@ -38,21 +49,161 @@ struct FieldNameCache {
 
 #[derive(Default)]
 struct FieldValueCache {
-    strings: Vec<Arc<str>>,
-    integers: HashMap<i64, Arc<str>>,
-    doubles: HashMap<u64, Arc<str>>,
+    strings: FxHashSet<Arc<str>>,
+    integers: FxHashMap<i64, Arc<str>>,
+    doubles: FxHashMap<u64, Arc<str>>,
+    last_string: Option<Arc<str>>,
+    last_integer: Option<(i64, Arc<str>)>,
+    last_double: Option<(u64, Arc<str>)>,
     empty: Option<Arc<str>>,
     true_value: Option<Arc<str>>,
     false_value: Option<Arc<str>>,
 }
 
 #[derive(Default)]
+struct IdentifierCache {
+    trace_ids: FxHashMap<[u8; 16], Arc<str>>,
+    last_trace_id: Option<([u8; 16], Arc<str>)>,
+}
+
+#[derive(Default)]
 struct FastTraceRowsDecoder {
     field_names: FieldNameCache,
     field_values: FieldValueCache,
+    identifiers: IdentifierCache,
 }
 
-#[derive(Clone, Copy)]
+thread_local! {
+    static FAST_TRACE_ROWS_DECODER: RefCell<FastTraceRowsDecoder> =
+        RefCell::new(FastTraceRowsDecoder::default());
+}
+
+trait TraceBlockCollector {
+    fn reserve_rows(&mut self, additional: usize);
+    fn reserve_fields(&mut self, additional: usize);
+    #[allow(clippy::too_many_arguments)]
+    fn push_prevalidated_split_fields(
+        &mut self,
+        trace_id: Arc<str>,
+        span_id: CompactSpanId,
+        parent_span_id: Option<CompactSpanId>,
+        name: Arc<str>,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+        time_unix_nano: i64,
+        shared_fields: &[Field],
+        fields: SmallVec<[Field; 8]>,
+    );
+}
+
+impl TraceBlockCollector for TraceBlockBuilder {
+    fn reserve_rows(&mut self, additional: usize) {
+        self.reserve_rows(additional);
+    }
+
+    fn reserve_fields(&mut self, additional: usize) {
+        self.reserve_fields(additional);
+    }
+
+    fn push_prevalidated_split_fields(
+        &mut self,
+        trace_id: Arc<str>,
+        span_id: CompactSpanId,
+        parent_span_id: Option<CompactSpanId>,
+        name: Arc<str>,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+        time_unix_nano: i64,
+        shared_fields: &[Field],
+        fields: SmallVec<[Field; 8]>,
+    ) {
+        TraceBlockBuilder::push_prevalidated_split_fields(
+            self,
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            start_unix_nano,
+            end_unix_nano,
+            time_unix_nano,
+            shared_fields,
+            fields,
+        );
+    }
+}
+
+struct ShardedTraceBlockCollectors {
+    builders: Vec<TraceBlockBuilder>,
+}
+
+impl ShardedTraceBlockCollectors {
+    fn new(trace_shards: usize, estimated_rows: usize, estimated_fields: usize) -> Self {
+        let trace_shards = trace_shards.max(1);
+        let per_shard_rows = estimated_rows / trace_shards + 1;
+        let per_shard_fields = estimated_fields / trace_shards + 1;
+        Self {
+            builders: (0..trace_shards)
+                .map(|_| {
+                    let mut builder = TraceBlockBuilder::with_capacity(per_shard_rows);
+                    builder.reserve_fields(per_shard_fields);
+                    builder
+                })
+                .collect(),
+        }
+    }
+
+    fn finish(self) -> Vec<TraceBlock> {
+        self.builders
+            .into_iter()
+            .map(TraceBlockBuilder::finish)
+            .filter(|block| !block.is_empty())
+            .collect()
+    }
+}
+
+impl TraceBlockCollector for ShardedTraceBlockCollectors {
+    fn reserve_rows(&mut self, additional: usize) {
+        let per_shard = additional / self.builders.len().max(1) + 1;
+        for builder in &mut self.builders {
+            builder.reserve_rows(per_shard);
+        }
+    }
+
+    fn reserve_fields(&mut self, additional: usize) {
+        let per_shard = additional / self.builders.len().max(1) + 1;
+        for builder in &mut self.builders {
+            builder.reserve_fields(per_shard);
+        }
+    }
+
+    fn push_prevalidated_split_fields(
+        &mut self,
+        trace_id: Arc<str>,
+        span_id: CompactSpanId,
+        parent_span_id: Option<CompactSpanId>,
+        name: Arc<str>,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+        time_unix_nano: i64,
+        shared_fields: &[Field],
+        fields: SmallVec<[Field; 8]>,
+    ) {
+        let shard_index = trace_shard_index(trace_id.as_ref(), self.builders.len());
+        self.builders[shard_index].push_prevalidated_split_fields(
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            start_unix_nano,
+            end_unix_nano,
+            time_unix_nano,
+            shared_fields,
+            fields,
+        );
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum FieldPrefix {
     ResourceAttr,
     ScopeAttr,
@@ -61,17 +212,26 @@ enum FieldPrefix {
 
 impl FieldNameCache {
     fn prefixed(&mut self, prefix: FieldPrefix, key: &str) -> Arc<str> {
-        let cache = match prefix {
-            FieldPrefix::ResourceAttr => &mut self.resource_attr,
-            FieldPrefix::ScopeAttr => &mut self.scope_attr,
-            FieldPrefix::SpanAttr => &mut self.span_attr,
+        let (cache, last) = match prefix {
+            FieldPrefix::ResourceAttr => (&mut self.resource_attr, &mut self.last_resource_attr),
+            FieldPrefix::ScopeAttr => (&mut self.scope_attr, &mut self.last_scope_attr),
+            FieldPrefix::SpanAttr => (&mut self.span_attr, &mut self.last_span_attr),
         };
-        if let Some((_, existing)) = cache.iter().find(|(existing_key, _)| existing_key == key) {
-            return existing.clone();
+        if let Some((last_key, last_prefixed)) = last.as_ref() {
+            if last_key.as_ref() == key {
+                return last_prefixed.clone();
+            }
+        }
+        if let Some(existing) = cache.get(key) {
+            let existing = existing.clone();
+            *last = Some((Arc::<str>::from(key), existing.clone()));
+            return existing;
         }
 
         let value: Arc<str> = prefixed_key(prefix.value(), key).into();
-        cache.push((key.to_string(), value.clone()));
+        let key = Arc::<str>::from(key);
+        cache.insert(key.clone(), value.clone());
+        *last = Some((key, value.clone()));
         value
     }
 
@@ -98,6 +258,21 @@ impl FieldNameCache {
             .get_or_insert_with(|| Arc::<str>::from("status_message"))
             .clone()
     }
+
+    fn clear_if_oversized(&mut self) {
+        if self.resource_attr.len() + self.scope_attr.len() + self.span_attr.len()
+            <= MAX_FIELD_NAME_CACHE_ENTRIES
+        {
+            return;
+        }
+
+        self.resource_attr.clear();
+        self.scope_attr.clear();
+        self.span_attr.clear();
+        self.last_resource_attr = None;
+        self.last_scope_attr = None;
+        self.last_span_attr = None;
+    }
 }
 
 impl FieldValueCache {
@@ -120,25 +295,41 @@ impl FieldValueCache {
     }
 
     fn integer(&mut self, value: i64) -> Arc<str> {
+        if let Some((last_value, cached)) = self.last_integer.as_ref() {
+            if *last_value == value {
+                return cached.clone();
+            }
+        }
         if let Some(existing) = self.integers.get(&value) {
-            return existing.clone();
+            let existing = existing.clone();
+            self.last_integer = Some((value, existing.clone()));
+            return existing;
         }
 
         let rendered = value.to_string();
         let interned: Arc<str> = rendered.as_str().into();
         self.integers.insert(value, interned.clone());
+        self.last_integer = Some((value, interned.clone()));
         interned
     }
 
     fn double(&mut self, value: f64) -> Arc<str> {
         let key = value.to_bits();
+        if let Some((last_key, cached)) = self.last_double.as_ref() {
+            if *last_key == key {
+                return cached.clone();
+            }
+        }
         if let Some(existing) = self.doubles.get(&key) {
-            return existing.clone();
+            let existing = existing.clone();
+            self.last_double = Some((key, existing.clone()));
+            return existing;
         }
 
         let rendered = value.to_string();
         let interned: Arc<str> = rendered.as_str().into();
         self.doubles.insert(key, interned.clone());
+        self.last_double = Some((key, interned.clone()));
         interned
     }
 
@@ -146,16 +337,20 @@ impl FieldValueCache {
         if value.is_empty() {
             return self.empty();
         }
-        if let Some(existing) = self
-            .strings
-            .iter()
-            .find(|existing| existing.as_ref() == value)
-        {
-            return existing.clone();
+        if let Some(last_string) = self.last_string.as_ref() {
+            if last_string.as_ref() == value {
+                return last_string.clone();
+            }
+        }
+        if let Some(existing) = self.strings.get(value) {
+            let existing = existing.clone();
+            self.last_string = Some(existing.clone());
+            return existing;
         }
 
         let interned: Arc<str> = value.into();
-        self.strings.push(interned.clone());
+        self.strings.insert(interned.clone());
+        self.last_string = Some(interned.clone());
         interned
     }
 
@@ -163,23 +358,121 @@ impl FieldValueCache {
         if value.is_empty() {
             return self.empty();
         }
-        if let Some(existing) = self
-            .strings
-            .iter()
-            .find(|existing| existing.as_ref() == value.as_str())
-        {
-            return existing.clone();
+        if let Some(last_string) = self.last_string.as_ref() {
+            if last_string.as_ref() == value.as_str() {
+                return last_string.clone();
+            }
+        }
+        if let Some(existing) = self.strings.get(value.as_str()) {
+            let existing = existing.clone();
+            self.last_string = Some(existing.clone());
+            return existing;
         }
 
         let interned: Arc<str> = value.as_str().into();
-        self.strings.push(interned.clone());
+        self.strings.insert(interned.clone());
+        self.last_string = Some(interned.clone());
         interned
+    }
+
+    fn clear_if_oversized(&mut self) {
+        if self.strings.len() + self.integers.len() + self.doubles.len()
+            <= MAX_FIELD_VALUE_CACHE_ENTRIES
+        {
+            return;
+        }
+
+        self.strings.clear();
+        self.integers.clear();
+        self.doubles.clear();
+        self.last_string = None;
+        self.last_integer = None;
+        self.last_double = None;
+    }
+}
+
+impl IdentifierCache {
+    fn trace_id(&mut self, bytes: &[u8]) -> Arc<str> {
+        if let Ok(key) = <[u8; 16]>::try_from(bytes) {
+            if let Some((last_key, cached)) = self.last_trace_id.as_ref() {
+                if *last_key == key {
+                    return cached.clone();
+                }
+            }
+            if let Some(existing) = self.trace_ids.get(&key) {
+                let existing = existing.clone();
+                self.last_trace_id = Some((key, existing.clone()));
+                return existing;
+            }
+            let encoded: Arc<str> = encode_hex(bytes).into();
+            self.trace_ids.insert(key, encoded.clone());
+            self.last_trace_id = Some((key, encoded.clone()));
+            return encoded;
+        }
+        encode_hex(bytes).into()
+    }
+
+    fn span_id(&mut self, bytes: &[u8]) -> CompactSpanId {
+        if let Ok(key) = <[u8; 8]>::try_from(bytes) {
+            return CompactSpanId::Hex64(u64::from_be_bytes(key));
+        }
+        CompactSpanId::from(encode_hex(bytes))
+    }
+
+    fn parent_span_id(&mut self, bytes: &[u8]) -> CompactSpanId {
+        if let Ok(key) = <[u8; 8]>::try_from(bytes) {
+            return CompactSpanId::Hex64(u64::from_be_bytes(key));
+        }
+        CompactSpanId::from(encode_hex(bytes))
+    }
+
+    fn clear_if_oversized(&mut self) {
+        if self.trace_ids.len() <= MAX_IDENTIFIER_CACHE_ENTRIES {
+            return;
+        }
+
+        self.trace_ids.clear();
+        self.last_trace_id = None;
     }
 }
 
 impl FastTraceRowsDecoder {
-    fn decode(mut self, bytes: &[u8]) -> Result<Vec<TraceSpanRow>, ProtobufCodecError> {
-        let mut rows = Vec::new();
+    fn decode(&mut self, bytes: &[u8]) -> Result<Vec<TraceSpanRow>, ProtobufCodecError> {
+        Ok(self.decode_block(bytes)?.rows())
+    }
+
+    fn decode_block(&mut self, bytes: &[u8]) -> Result<TraceBlock, ProtobufCodecError> {
+        let mut builder = TraceBlockBuilder::with_capacity(estimated_trace_rows(bytes.len()));
+        builder.reserve_fields(estimated_trace_fields(bytes.len()));
+        self.decode_into_collector(bytes, &mut builder)?;
+        Ok(builder.finish())
+    }
+
+    fn decode_sharded_blocks(
+        &mut self,
+        bytes: &[u8],
+        trace_shards: usize,
+    ) -> Result<Vec<TraceBlock>, ProtobufCodecError> {
+        let mut collectors = ShardedTraceBlockCollectors::new(
+            trace_shards,
+            estimated_trace_rows(bytes.len()),
+            estimated_trace_fields(bytes.len()),
+        );
+        self.decode_into_collector(bytes, &mut collectors)?;
+        Ok(collectors.finish())
+    }
+
+    fn clear_oversized_caches(&mut self) {
+        self.field_names.clear_if_oversized();
+        self.field_values.clear_if_oversized();
+        self.identifiers.clear_if_oversized();
+    }
+
+    fn decode_into_collector<C: TraceBlockCollector>(
+        &mut self,
+        bytes: &[u8],
+        collector: &mut C,
+    ) -> Result<(), ProtobufCodecError> {
         let mut cursor = 0usize;
 
         while cursor < bytes.len() {
@@ -187,22 +480,22 @@ impl FastTraceRowsDecoder {
             match (field_number, wire_type) {
                 (1, WIRE_LENGTH_DELIMITED) => {
                     let resource_spans = decode_length_delimited(bytes, &mut cursor)?;
-                    self.decode_resource_spans(resource_spans, &mut rows)?;
+                    self.decode_resource_spans(resource_spans, collector)?;
                 }
                 _ => skip_field(bytes, &mut cursor, wire_type)?,
             }
         }
 
-        Ok(rows)
+        Ok(())
     }
 
-    fn decode_resource_spans(
+    fn decode_resource_spans<C: TraceBlockCollector>(
         &mut self,
         bytes: &[u8],
-        rows: &mut Vec<TraceSpanRow>,
+        collector: &mut C,
     ) -> Result<(), ProtobufCodecError> {
-        let mut resource_fields = Vec::new();
-        let mut scope_spans = Vec::new();
+        let mut resource_fields = SmallVec::<[Field; 8]>::new();
+        let mut scope_spans = SmallVec::<[&[u8]; 4]>::new();
         let mut cursor = 0usize;
 
         while cursor < bytes.len() {
@@ -221,7 +514,7 @@ impl FastTraceRowsDecoder {
         }
 
         for scope_spans in scope_spans {
-            self.decode_scope_spans(scope_spans, &resource_fields, rows)?;
+            self.decode_scope_spans(scope_spans, &resource_fields, collector)?;
         }
 
         Ok(())
@@ -231,8 +524,8 @@ impl FastTraceRowsDecoder {
         &mut self,
         bytes: &[u8],
         prefix: FieldPrefix,
-    ) -> Result<Vec<Field>, ProtobufCodecError> {
-        let mut fields = Vec::new();
+    ) -> Result<SmallVec<[Field; 8]>, ProtobufCodecError> {
+        let mut fields = SmallVec::<[Field; 8]>::new();
         let mut cursor = 0usize;
 
         while cursor < bytes.len() {
@@ -251,16 +544,16 @@ impl FastTraceRowsDecoder {
         Ok(fields)
     }
 
-    fn decode_scope_spans(
+    fn decode_scope_spans<C: TraceBlockCollector>(
         &mut self,
         bytes: &[u8],
         resource_fields: &[Field],
-        rows: &mut Vec<TraceSpanRow>,
+        collector: &mut C,
     ) -> Result<(), ProtobufCodecError> {
         let mut scope_name = None;
         let mut scope_version = None;
-        let mut scope_attributes = Vec::new();
-        let mut spans = Vec::new();
+        let mut scope_attributes = SmallVec::<[Field; 8]>::new();
+        let mut spans = SmallVec::<[&[u8]; 8]>::new();
         let mut cursor = 0usize;
 
         while cursor < bytes.len() {
@@ -280,7 +573,7 @@ impl FastTraceRowsDecoder {
             }
         }
 
-        let mut shared_fields = Vec::with_capacity(
+        let mut shared_fields = SmallVec::<[Field; 8]>::with_capacity(
             resource_fields.len()
                 + scope_attributes.len()
                 + usize::from(scope_name.is_some())
@@ -300,9 +593,11 @@ impl FastTraceRowsDecoder {
             ));
         }
         shared_fields.extend(scope_attributes);
+        collector.reserve_rows(spans.len());
+        collector.reserve_fields((shared_fields.len() + 4) * spans.len());
 
         for span in spans {
-            rows.push(self.decode_span(span, &shared_fields)?);
+            self.decode_span_into_builder(span, &shared_fields, collector)?;
         }
 
         Ok(())
@@ -343,37 +638,47 @@ impl FastTraceRowsDecoder {
         Ok(scope)
     }
 
-    fn decode_span(
+    fn decode_span_into_builder<C: TraceBlockCollector>(
         &mut self,
         bytes: &[u8],
         shared_fields: &[Field],
-    ) -> Result<TraceSpanRow, ProtobufCodecError> {
-        let mut trace_id = String::new();
-        let mut span_id = String::new();
+        collector: &mut C,
+    ) -> Result<(), ProtobufCodecError> {
+        let mut trace_id = None;
+        let mut span_id = None;
         let mut parent_span_id = None;
-        let mut name = String::new();
+        let mut name = None;
         let mut start_time_unix_nano = 0u64;
         let mut end_time_unix_nano = 0u64;
-        let mut fields = shared_fields.to_vec();
+        let mut fields = SmallVec::<[Field; 8]>::new();
         let mut cursor = 0usize;
 
         while cursor < bytes.len() {
             let (field_number, wire_type) = decode_key(bytes, &mut cursor)?;
             match (field_number, wire_type) {
                 (1, WIRE_LENGTH_DELIMITED) => {
-                    trace_id = encode_hex(decode_length_delimited(bytes, &mut cursor)?);
+                    trace_id = Some(
+                        self.identifiers
+                            .trace_id(decode_length_delimited(bytes, &mut cursor)?),
+                    );
                 }
                 (2, WIRE_LENGTH_DELIMITED) => {
-                    span_id = encode_hex(decode_length_delimited(bytes, &mut cursor)?);
+                    span_id = Some(
+                        self.identifiers
+                            .span_id(decode_length_delimited(bytes, &mut cursor)?),
+                    );
                 }
                 (4, WIRE_LENGTH_DELIMITED) => {
                     let parent = decode_length_delimited(bytes, &mut cursor)?;
                     if !parent.is_empty() {
-                        parent_span_id = Some(encode_hex(parent));
+                        parent_span_id = Some(self.identifiers.parent_span_id(parent));
                     }
                 }
                 (5, WIRE_LENGTH_DELIMITED) => {
-                    name = decode_str(bytes, &mut cursor)?.to_owned();
+                    name = Some(
+                        self.field_values
+                            .normalized_borrowed(decode_str(bytes, &mut cursor)?),
+                    );
                 }
                 (7, WIRE_FIXED64) => {
                     start_time_unix_nano = decode_fixed64(bytes, &mut cursor)?;
@@ -403,18 +708,29 @@ impl FastTraceRowsDecoder {
             }
         }
 
-        TraceSpanRow::new_prevalidated_unsorted_fields(
-            trace_id,
-            span_id,
-            parent_span_id,
-            name,
-            decode_unix_nano(start_time_unix_nano),
-            decode_unix_nano(end_time_unix_nano),
-            fields,
-        )
-        .map_err(ProtobufCodecError::from)
-    }
+        let start_unix_nano = decode_unix_nano(start_time_unix_nano);
+        let end_unix_nano = decode_unix_nano(end_time_unix_nano);
+        if end_unix_nano < start_unix_nano {
+            return Err(TraceModelError::InvalidTimeRange {
+                start_unix_nano,
+                end_unix_nano,
+            }
+            .into());
+        }
 
+        collector.push_prevalidated_split_fields(
+            trace_id.unwrap_or_else(|| Arc::<str>::from("")),
+            span_id.unwrap_or_else(|| CompactSpanId::from("")),
+            parent_span_id,
+            name.unwrap_or_else(|| Arc::<str>::from("")),
+            start_unix_nano,
+            end_unix_nano,
+            end_unix_nano,
+            shared_fields,
+            fields,
+        );
+        Ok(())
+    }
     fn decode_status(&mut self, bytes: &[u8]) -> Result<DecodedStatus, ProtobufCodecError> {
         let mut code = 0i32;
         let mut message = self.field_values.empty();
@@ -487,7 +803,9 @@ impl FastTraceRowsDecoder {
                         .normalized_borrowed(decode_str(bytes, &mut cursor)?);
                 }
                 (2, WIRE_VARINT) => {
-                    value = self.field_values.boolean(decode_varint(bytes, &mut cursor)? != 0);
+                    value = self
+                        .field_values
+                        .boolean(decode_varint(bytes, &mut cursor)? != 0);
                 }
                 (3, WIRE_VARINT) => {
                     value = self
@@ -521,7 +839,7 @@ impl FastTraceRowsDecoder {
 struct DecodedInstrumentationScope {
     name: Option<Arc<str>>,
     version: Option<Arc<str>>,
-    attributes: Vec<Field>,
+    attributes: SmallVec<[Field; 8]>,
 }
 
 struct DecodedStatus {
@@ -547,7 +865,37 @@ pub fn decode_export_trace_service_request_protobuf(
 }
 
 pub fn decode_trace_rows_protobuf(bytes: &[u8]) -> Result<Vec<TraceSpanRow>, ProtobufCodecError> {
-    FastTraceRowsDecoder::default().decode(bytes)
+    with_fast_trace_rows_decoder(|decoder| decoder.decode(bytes))
+}
+
+pub fn decode_trace_block_protobuf(bytes: &[u8]) -> Result<TraceBlock, ProtobufCodecError> {
+    with_fast_trace_rows_decoder(|decoder| decoder.decode_block(bytes))
+}
+
+pub fn decode_trace_blocks_protobuf_sharded(
+    bytes: &[u8],
+    trace_shards: usize,
+) -> Result<Vec<TraceBlock>, ProtobufCodecError> {
+    with_fast_trace_rows_decoder(|decoder| decoder.decode_sharded_blocks(bytes, trace_shards))
+}
+
+fn with_fast_trace_rows_decoder<T>(
+    f: impl FnOnce(&mut FastTraceRowsDecoder) -> Result<T, ProtobufCodecError>,
+) -> Result<T, ProtobufCodecError> {
+    FAST_TRACE_ROWS_DECODER.with(|decoder| {
+        let mut decoder = decoder.borrow_mut();
+        let result = f(&mut decoder);
+        decoder.clear_oversized_caches();
+        result
+    })
+}
+
+fn estimated_trace_rows(payload_bytes: usize) -> usize {
+    (payload_bytes / 192).max(1)
+}
+
+fn estimated_trace_fields(payload_bytes: usize) -> usize {
+    (payload_bytes / 24).max(8)
 }
 
 pub fn encode_export_trace_service_request_protobuf(
@@ -604,7 +952,9 @@ fn flatten_otlp_export_request(
                 .scope
                 .as_ref()
                 .map(|scope| &scope.attributes)
-                .map(|attrs| flatten_otlp_key_values(attrs, FieldPrefix::ScopeAttr, &mut field_names))
+                .map(|attrs| {
+                    flatten_otlp_key_values(attrs, FieldPrefix::ScopeAttr, &mut field_names)
+                })
                 .unwrap_or_default();
             let mut shared_fields = Vec::with_capacity(
                 resource_fields.len()
@@ -651,7 +1001,10 @@ fn flatten_otlp_export_request(
                     &mut field_names,
                 );
                 if let Some(status) = span.status.as_ref() {
-                    fields.push(Field::new(field_names.status_code(), status.code.to_string()));
+                    fields.push(Field::new(
+                        field_names.status_code(),
+                        status.code.to_string(),
+                    ));
                     fields.push(Field::new(
                         field_names.status_message(),
                         normalize_value(status.message.clone()),
@@ -711,7 +1064,9 @@ fn flatten_otlp_any_value(value: Option<&OtlpAnyValue>) -> String {
         Some(otlp_any_value::Value::BoolValue(value)) => value.to_string(),
         Some(otlp_any_value::Value::IntValue(value)) => value.to_string(),
         Some(otlp_any_value::Value::DoubleValue(value)) => value.to_string(),
-        Some(otlp_any_value::Value::ArrayValue(value)) => json_value_from_array_ref(value).to_string(),
+        Some(otlp_any_value::Value::ArrayValue(value)) => {
+            json_value_from_array_ref(value).to_string()
+        }
         Some(otlp_any_value::Value::KvlistValue(value)) => {
             json_value_from_key_values_ref(&value.values).to_string()
         }
@@ -1010,6 +1365,15 @@ fn encode_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn trace_shard_index(trace_id: &str, trace_shards: usize) -> usize {
+    if trace_shards <= 1 {
+        return 0;
+    }
+    let mut hasher = FxHasher::default();
+    trace_id.hash(&mut hasher);
+    (hasher.finish() as usize) % trace_shards
+}
+
 fn prefixed_key(prefix: &str, key: &str) -> String {
     let mut output = String::with_capacity(prefix.len() + key.len());
     output.push_str(prefix);
@@ -1032,7 +1396,9 @@ fn decode_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64, ProtobufCodecE
 
     loop {
         if *cursor >= bytes.len() {
-            return Err(protobuf_decode_error("unexpected EOF while decoding varint"));
+            return Err(protobuf_decode_error(
+                "unexpected EOF while decoding varint",
+            ));
         }
         let byte = bytes[*cursor];
         *cursor += 1;

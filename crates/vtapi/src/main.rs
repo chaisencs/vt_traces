@@ -1,5 +1,6 @@
 use std::{collections::HashMap, env, fs, net::SocketAddr, sync::Arc, time::Duration};
 
+use mimalloc::MiMalloc;
 use reqwest::{Certificate, Client, Identity};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use vtapi::{
@@ -15,12 +16,13 @@ use vtstorage::{
     DiskSyncPolicy, MemoryStorageEngine, StorageEngine,
 };
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -186,7 +188,9 @@ fn load_storage() -> anyhow::Result<Arc<dyn StorageEngine>> {
         batching = batching.with_max_batch_wait(Duration::from_micros(max_batch_wait_micros));
     }
 
-    Ok(Arc::new(BatchingStorageEngine::with_config(storage, batching)))
+    Ok(Arc::new(BatchingStorageEngine::with_config(
+        storage, batching,
+    )))
 }
 
 fn env_truthy(name: &str) -> bool {

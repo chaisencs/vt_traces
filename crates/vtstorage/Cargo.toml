@@ -7,7 +7,9 @@ edition.workspace = true
 crc32fast.workspace = true
 parking_lot.workspace = true
 roaring.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 vtcore = { path = "../vtcore" }

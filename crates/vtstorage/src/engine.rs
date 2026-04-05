@@ -1,6 +1,7 @@
 use thiserror::Error;
 use vtcore::{
-    LogRow, LogSearchRequest, TraceSearchHit, TraceSearchRequest, TraceSpanRow, TraceWindow,
+    LogRow, LogSearchRequest, TraceBlock, TraceSearchHit, TraceSearchRequest, TraceSpanRow,
+    TraceWindow,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -29,6 +30,15 @@ pub enum StorageError {
 }
 
 pub trait StorageEngine: Send + Sync + 'static {
+    fn append_trace_block(&self, block: TraceBlock) -> Result<(), StorageError> {
+        self.append_rows(block.rows())
+    }
+    fn append_trace_blocks(&self, blocks: Vec<TraceBlock>) -> Result<(), StorageError> {
+        for block in blocks {
+            self.append_trace_block(block)?;
+        }
+        Ok(())
+    }
     fn append_rows(&self, rows: Vec<TraceSpanRow>) -> Result<(), StorageError>;
     fn append_logs(&self, rows: Vec<LogRow>) -> Result<(), StorageError>;
     fn trace_window(&self, trace_id: &str) -> Option<TraceWindow>;
@@ -45,4 +55,7 @@ pub trait StorageEngine: Send + Sync + 'static {
         end_unix_nano: i64,
     ) -> Vec<TraceSpanRow>;
     fn stats(&self) -> StorageStatsSnapshot;
+    fn preferred_trace_ingest_shards(&self) -> usize {
+        1
+    }
 }

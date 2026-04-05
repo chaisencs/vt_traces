@@ -1,15 +1,26 @@
-use std::io::{Cursor, Read};
+use std::{
+    io::{Cursor, Read},
+    ops::Range,
+};
 
 use thiserror::Error;
 
-use crate::{Field, LogRow, TraceSpanRow};
+use crate::{CompactSpanId, Field, LogRow, TraceBlock, TraceSpanRow};
 
 const ROW_CODEC_VERSION: u8 = 1;
 const ROW_BATCH_MAGIC: &[u8] = b"VTROWB1";
 const ROW_BATCH_VERSION: u8 = 1;
+const TRACE_BLOCK_MAGIC: &[u8] = b"VTBLKB1";
+const TRACE_BLOCK_VERSION: u8 = 3;
 const LOG_ROW_CODEC_VERSION: u8 = 1;
 const LOG_ROW_BATCH_MAGIC: &[u8] = b"VTLOGB1";
 const LOG_ROW_BATCH_VERSION: u8 = 1;
+const COMPACT_SPAN_ID_TEXT_TAG: u8 = 0;
+const COMPACT_SPAN_ID_HEX64_TAG: u8 = 1;
+const OPTIONAL_COMPACT_SPAN_ID_NONE_TAG: u8 = 0;
+const OPTIONAL_COMPACT_SPAN_ID_TEXT_TAG: u8 = 1;
+const OPTIONAL_COMPACT_SPAN_ID_HEX64_TAG: u8 = 2;
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Error)]
 pub enum RowCodecError {
@@ -21,6 +32,11 @@ pub enum RowCodecError {
     InvalidBatchHeader,
     #[error("invalid utf-8 string: {0}")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
+}
+
+struct EncodedSharedFieldGroup {
+    field_count: u32,
+    encoded_fields: Vec<u8>,
 }
 
 pub fn encode_trace_row(row: &TraceSpanRow) -> Vec<u8> {
@@ -80,6 +96,171 @@ pub fn encode_trace_rows(rows: &[TraceSpanRow]) -> Vec<u8> {
     encode_trace_rows_from_encoded_rows(rows.iter().map(encode_trace_row))
 }
 
+pub fn encode_trace_block_row(block: &TraceBlock, row_index: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(256 + block.fields_at(row_index).len() * 32);
+    encode_trace_block_row_into(&mut output, block, row_index);
+    output
+}
+
+pub fn encode_trace_block_rows_packed(block: &TraceBlock) -> (Vec<u8>, Vec<Range<usize>>) {
+    let mut bytes = Vec::with_capacity(
+        256 * block.row_count() + (block.shared_fields.len() + block.fields.len()) * 32,
+    );
+    let mut ranges = Vec::with_capacity(block.row_count());
+    let shared_group_encodings = encode_shared_field_groups(block);
+    for row_index in 0..block.row_count() {
+        let start = bytes.len();
+        bytes.push(ROW_CODEC_VERSION);
+        write_string(&mut bytes, block.trace_id_at(row_index));
+        write_compact_span_id_as_string(&mut bytes, &block.span_ids[row_index]);
+        write_optional_compact_span_id_as_string(
+            &mut bytes,
+            block.parent_span_ids[row_index].as_ref(),
+        );
+        write_string(&mut bytes, block.name_at(row_index));
+        write_i64(&mut bytes, block.start_unix_nano_at(row_index));
+        write_i64(&mut bytes, block.end_unix_nano_at(row_index));
+        write_i64(&mut bytes, block.time_unix_nano_at(row_index));
+        let shared_group = block
+            .shared_field_group_id_at(row_index)
+            .checked_sub(1)
+            .and_then(|group_index| shared_group_encodings.get(group_index as usize));
+        let row_fields = block.row_fields_at(row_index);
+        write_u32(
+            &mut bytes,
+            shared_group.map_or(0, |group| group.field_count) + row_fields.len() as u32,
+        );
+        if let Some(shared_group) = shared_group {
+            bytes.extend_from_slice(&shared_group.encoded_fields);
+        }
+        for field in row_fields {
+            write_string(&mut bytes, &field.name);
+            write_string(&mut bytes, &field.value);
+        }
+        ranges.push(start..bytes.len());
+    }
+    (bytes, ranges)
+}
+
+pub fn encode_trace_block(block: &TraceBlock) -> Vec<u8> {
+    let mut output =
+        Vec::with_capacity(256 + (block.shared_fields.len() + block.fields.len()) * 24);
+    output.extend_from_slice(TRACE_BLOCK_MAGIC);
+    output.push(TRACE_BLOCK_VERSION);
+    write_u32(&mut output, block.row_count() as u32);
+
+    for values in [&block.trace_ids, &block.names] {
+        write_u32(&mut output, values.len() as u32);
+        for value in values.iter() {
+            write_string(&mut output, value.as_ref());
+        }
+    }
+
+    write_u32(&mut output, block.span_ids.len() as u32);
+    for value in &block.span_ids {
+        write_compact_span_id(&mut output, value);
+    }
+
+    write_u32(&mut output, block.parent_span_ids.len() as u32);
+    for value in &block.parent_span_ids {
+        write_optional_compact_span_id(&mut output, value.as_ref());
+    }
+
+    for values in [
+        &block.start_unix_nanos,
+        &block.end_unix_nanos,
+        &block.time_unix_nanos,
+    ] {
+        write_u32(&mut output, values.len() as u32);
+        for value in values.iter() {
+            write_i64(&mut output, *value);
+        }
+    }
+
+    write_u32(&mut output, block.shared_field_group_ids.len() as u32);
+    for group_id in &block.shared_field_group_ids {
+        write_u32(&mut output, *group_id);
+    }
+
+    write_u32(&mut output, block.shared_field_offsets.len() as u32);
+    for offset in &block.shared_field_offsets {
+        write_u32(&mut output, *offset);
+    }
+
+    write_u32(&mut output, block.shared_fields.len() as u32);
+    for field in &block.shared_fields {
+        write_string(&mut output, &field.name);
+        write_string(&mut output, &field.value);
+    }
+
+    write_u32(&mut output, block.field_offsets.len() as u32);
+    for offset in &block.field_offsets {
+        write_u32(&mut output, *offset);
+    }
+
+    write_u32(&mut output, block.fields.len() as u32);
+    for field in &block.fields {
+        write_string(&mut output, &field.name);
+        write_string(&mut output, &field.value);
+    }
+
+    output
+}
+
+pub fn decode_trace_block(bytes: &[u8]) -> Result<TraceBlock, RowCodecError> {
+    if bytes.len() < TRACE_BLOCK_MAGIC.len() + 1 + 4 {
+        return Err(RowCodecError::InvalidBatchHeader);
+    }
+
+    let mut cursor = Cursor::new(bytes);
+    let mut magic = vec![0u8; TRACE_BLOCK_MAGIC.len()];
+    cursor
+        .read_exact(&mut magic)
+        .map_err(map_read_error_to_codec_error)?;
+    if magic != TRACE_BLOCK_MAGIC {
+        return Err(RowCodecError::InvalidBatchHeader);
+    }
+
+    let version = read_u8(&mut cursor)?;
+    if version != TRACE_BLOCK_VERSION {
+        return Err(RowCodecError::InvalidVersion(version));
+    }
+
+    let row_count = read_u32(&mut cursor)? as usize;
+    let trace_ids = read_string_vec(&mut cursor)?;
+    let names = read_string_vec(&mut cursor)?;
+    let span_ids = read_compact_span_id_vec(&mut cursor)?;
+    let parent_span_ids = read_optional_compact_span_id_vec(&mut cursor)?;
+    let start_unix_nanos = read_i64_vec(&mut cursor)?;
+    let end_unix_nanos = read_i64_vec(&mut cursor)?;
+    let time_unix_nanos = read_i64_vec(&mut cursor)?;
+    let shared_field_group_ids = read_u32_vec(&mut cursor)?;
+    let shared_field_offsets = read_u32_vec(&mut cursor)?;
+    let shared_fields = read_fields(&mut cursor)?;
+    let field_offsets = read_u32_vec(&mut cursor)?;
+    let fields = read_fields(&mut cursor)?;
+
+    let block = TraceBlock {
+        trace_ids: trace_ids.into_iter().map(Into::into).collect(),
+        span_ids,
+        parent_span_ids,
+        names: names.into_iter().map(Into::into).collect(),
+        start_unix_nanos,
+        end_unix_nanos,
+        time_unix_nanos,
+        shared_field_group_ids,
+        shared_field_offsets,
+        shared_fields,
+        field_offsets,
+        fields,
+    };
+
+    if block.row_count() != row_count {
+        return Err(RowCodecError::InvalidBatchHeader);
+    }
+    Ok(block)
+}
+
 pub fn encode_trace_rows_from_encoded_rows<'a, I, B>(encoded_rows: I) -> Vec<u8>
 where
     I: IntoIterator<Item = B>,
@@ -100,6 +281,40 @@ where
         output.extend_from_slice(encoded_row);
     }
     output
+}
+
+fn encode_trace_block_row_into(output: &mut Vec<u8>, block: &TraceBlock, row_index: usize) {
+    output.push(ROW_CODEC_VERSION);
+    write_string(output, block.trace_id_at(row_index));
+    write_compact_span_id_as_string(output, &block.span_ids[row_index]);
+    write_optional_compact_span_id_as_string(output, block.parent_span_ids[row_index].as_ref());
+    write_string(output, block.name_at(row_index));
+    write_i64(output, block.start_unix_nano_at(row_index));
+    write_i64(output, block.end_unix_nano_at(row_index));
+    write_i64(output, block.time_unix_nano_at(row_index));
+    let fields = block.fields_at(row_index);
+    write_u32(output, fields.len() as u32);
+    for field in fields {
+        write_string(output, &field.name);
+        write_string(output, &field.value);
+    }
+}
+
+fn encode_shared_field_groups(block: &TraceBlock) -> Vec<EncodedSharedFieldGroup> {
+    let mut encoded_groups = Vec::with_capacity(block.shared_field_group_count());
+    for group_id in 1..=block.shared_field_group_count() as u32 {
+        let shared_fields = block.shared_fields_for_group_id(group_id);
+        let mut encoded_fields = Vec::with_capacity(shared_fields.len() * 32);
+        for field in shared_fields {
+            write_string(&mut encoded_fields, &field.name);
+            write_string(&mut encoded_fields, &field.value);
+        }
+        encoded_groups.push(EncodedSharedFieldGroup {
+            field_count: shared_fields.len() as u32,
+            encoded_fields,
+        });
+    }
+    encoded_groups
 }
 
 pub fn decode_trace_rows(bytes: &[u8]) -> Result<Vec<TraceSpanRow>, RowCodecError> {
@@ -251,6 +466,10 @@ fn write_i64(output: &mut Vec<u8>, value: i64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+fn write_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
 fn write_i32(output: &mut Vec<u8>, value: i32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
@@ -265,6 +484,53 @@ fn write_optional_string(output: &mut Vec<u8>, value: Option<&str>) {
         Some(value) => {
             output.push(1);
             write_string(output, value);
+        }
+        None => output.push(0),
+    }
+}
+
+fn write_compact_span_id(output: &mut Vec<u8>, value: &CompactSpanId) {
+    match value {
+        CompactSpanId::Text(value) => {
+            output.push(COMPACT_SPAN_ID_TEXT_TAG);
+            write_string(output, value);
+        }
+        CompactSpanId::Hex64(value) => {
+            output.push(COMPACT_SPAN_ID_HEX64_TAG);
+            write_u64(output, *value);
+        }
+    }
+}
+
+fn write_optional_compact_span_id(output: &mut Vec<u8>, value: Option<&CompactSpanId>) {
+    match value {
+        None => output.push(OPTIONAL_COMPACT_SPAN_ID_NONE_TAG),
+        Some(CompactSpanId::Text(value)) => {
+            output.push(OPTIONAL_COMPACT_SPAN_ID_TEXT_TAG);
+            write_string(output, value);
+        }
+        Some(CompactSpanId::Hex64(value)) => {
+            output.push(OPTIONAL_COMPACT_SPAN_ID_HEX64_TAG);
+            write_u64(output, *value);
+        }
+    }
+}
+
+fn write_compact_span_id_as_string(output: &mut Vec<u8>, value: &CompactSpanId) {
+    match value {
+        CompactSpanId::Text(value) => write_string(output, value),
+        CompactSpanId::Hex64(value) => {
+            write_u32(output, 16);
+            append_hex_u64(output, *value);
+        }
+    }
+}
+
+fn write_optional_compact_span_id_as_string(output: &mut Vec<u8>, value: Option<&CompactSpanId>) {
+    match value {
+        Some(value) => {
+            output.push(1);
+            write_compact_span_id_as_string(output, value);
         }
         None => output.push(0),
     }
@@ -314,6 +580,14 @@ fn read_i64(cursor: &mut Cursor<&[u8]>) -> Result<i64, RowCodecError> {
     Ok(i64::from_le_bytes(bytes))
 }
 
+fn read_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64, RowCodecError> {
+    let mut bytes = [0u8; 8];
+    cursor
+        .read_exact(&mut bytes)
+        .map_err(map_read_error_to_codec_error)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 fn read_i32(cursor: &mut Cursor<&[u8]>) -> Result<i32, RowCodecError> {
     let mut bytes = [0u8; 4];
     cursor
@@ -355,9 +629,98 @@ fn read_optional_i32(cursor: &mut Cursor<&[u8]>) -> Result<Option<i32>, RowCodec
     }
 }
 
+fn read_string_vec(cursor: &mut Cursor<&[u8]>) -> Result<Vec<String>, RowCodecError> {
+    let len = read_u32(cursor)? as usize;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_string(cursor)?);
+    }
+    Ok(values)
+}
+
+fn read_compact_span_id(cursor: &mut Cursor<&[u8]>) -> Result<CompactSpanId, RowCodecError> {
+    match read_u8(cursor)? {
+        COMPACT_SPAN_ID_TEXT_TAG => Ok(CompactSpanId::Text(read_string(cursor)?.into())),
+        COMPACT_SPAN_ID_HEX64_TAG => Ok(CompactSpanId::Hex64(read_u64(cursor)?)),
+        other => Err(RowCodecError::InvalidVersion(other)),
+    }
+}
+
+fn read_compact_span_id_vec(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<Vec<CompactSpanId>, RowCodecError> {
+    let len = read_u32(cursor)? as usize;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_compact_span_id(cursor)?);
+    }
+    Ok(values)
+}
+
+fn read_optional_compact_span_id(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<Option<CompactSpanId>, RowCodecError> {
+    match read_u8(cursor)? {
+        OPTIONAL_COMPACT_SPAN_ID_NONE_TAG => Ok(None),
+        OPTIONAL_COMPACT_SPAN_ID_TEXT_TAG => {
+            Ok(Some(CompactSpanId::Text(read_string(cursor)?.into())))
+        }
+        OPTIONAL_COMPACT_SPAN_ID_HEX64_TAG => Ok(Some(CompactSpanId::Hex64(read_u64(cursor)?))),
+        other => Err(RowCodecError::InvalidVersion(other)),
+    }
+}
+
+fn read_optional_compact_span_id_vec(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<Vec<Option<CompactSpanId>>, RowCodecError> {
+    let len = read_u32(cursor)? as usize;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_optional_compact_span_id(cursor)?);
+    }
+    Ok(values)
+}
+
+fn read_i64_vec(cursor: &mut Cursor<&[u8]>) -> Result<Vec<i64>, RowCodecError> {
+    let len = read_u32(cursor)? as usize;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_i64(cursor)?);
+    }
+    Ok(values)
+}
+
+fn read_u32_vec(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u32>, RowCodecError> {
+    let len = read_u32(cursor)? as usize;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_u32(cursor)?);
+    }
+    Ok(values)
+}
+
+fn read_fields(cursor: &mut Cursor<&[u8]>) -> Result<Vec<Field>, RowCodecError> {
+    let len = read_u32(cursor)? as usize;
+    let mut fields = Vec::with_capacity(len);
+    for _ in 0..len {
+        fields.push(Field {
+            name: read_string(cursor)?.into(),
+            value: read_string(cursor)?.into(),
+        });
+    }
+    Ok(fields)
+}
+
 fn map_read_error_to_codec_error(error: std::io::Error) -> RowCodecError {
     match error.kind() {
         std::io::ErrorKind::UnexpectedEof => RowCodecError::UnexpectedEof,
         _ => RowCodecError::UnexpectedEof,
+    }
+}
+
+fn append_hex_u64(output: &mut Vec<u8>, value: u64) {
+    for shift in (0..16).rev() {
+        let nibble = ((value >> (shift * 4)) & 0x0f) as usize;
+        output.push(HEX_DIGITS[nibble]);
     }
 }

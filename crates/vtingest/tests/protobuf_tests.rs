@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use vtingest::{
     decode_export_logs_service_request_protobuf, decode_export_trace_service_request_protobuf,
-    decode_trace_rows_protobuf, encode_export_logs_service_request_protobuf,
-    encode_export_trace_service_request_protobuf, flatten_export_request, AttributeValue,
-    ExportLogsServiceRequest, ExportTraceServiceRequest, KeyValue, LogRecord, ResourceLogs,
-    ResourceSpans, ScopeLogs, ScopeSpans, SpanRecord, Status,
+    decode_trace_block_protobuf, decode_trace_blocks_protobuf_sharded, decode_trace_rows_protobuf,
+    encode_export_logs_service_request_protobuf, encode_export_trace_service_request_protobuf,
+    flatten_export_request, AttributeValue, ExportLogsServiceRequest, ExportTraceServiceRequest,
+    KeyValue, LogRecord, ResourceLogs, ResourceSpans, ScopeLogs, ScopeSpans, SpanRecord, Status,
 };
 
 #[test]
@@ -262,6 +262,101 @@ fn protobuf_fast_path_reuses_field_name_arcs_for_repeated_keys() {
 }
 
 #[test]
+fn protobuf_fast_path_reuses_trace_and_name_storage_within_trace_block() {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource_attributes: vec![KeyValue::new(
+                "service.name",
+                AttributeValue::String("checkout".to_string()),
+            )],
+            scope_spans: vec![ScopeSpans {
+                scope_name: None,
+                scope_version: None,
+                scope_attributes: Vec::new(),
+                spans: vec![
+                    SpanRecord {
+                        trace_id: "00112233445566778899aabbccddeeff".to_string(),
+                        span_id: "0123456789abcdef".to_string(),
+                        parent_span_id: None,
+                        name: "POST /protobuf".to_string(),
+                        start_time_unix_nano: 100,
+                        end_time_unix_nano: 180,
+                        attributes: Vec::new(),
+                        status: None,
+                    },
+                    SpanRecord {
+                        trace_id: "00112233445566778899aabbccddeeff".to_string(),
+                        span_id: "fedcba9876543210".to_string(),
+                        parent_span_id: Some("0123456789abcdef".to_string()),
+                        name: "POST /protobuf".to_string(),
+                        start_time_unix_nano: 200,
+                        end_time_unix_nano: 260,
+                        attributes: Vec::new(),
+                        status: None,
+                    },
+                ],
+            }],
+        }],
+    };
+
+    let encoded =
+        encode_export_trace_service_request_protobuf(&request).expect("encode protobuf request");
+    let block = decode_trace_block_protobuf(&encoded).expect("fast path block");
+
+    assert!(Arc::ptr_eq(&block.trace_ids[0], &block.trace_ids[1]));
+    assert!(Arc::ptr_eq(&block.names[0], &block.names[1]));
+}
+
+#[test]
+fn protobuf_fast_path_reuses_identifier_storage_across_repeated_decodes() {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource_attributes: vec![KeyValue::new(
+                "service.name",
+                AttributeValue::String("checkout".to_string()),
+            )],
+            scope_spans: vec![ScopeSpans {
+                scope_name: Some("io.opentelemetry.rust".to_string()),
+                scope_version: Some("1.0.0".to_string()),
+                scope_attributes: Vec::new(),
+                spans: vec![
+                    SpanRecord {
+                        trace_id: "00112233445566778899aabbccddeeff".to_string(),
+                        span_id: "0123456789abcdef".to_string(),
+                        parent_span_id: None,
+                        name: "POST /protobuf".to_string(),
+                        start_time_unix_nano: 100,
+                        end_time_unix_nano: 180,
+                        attributes: Vec::new(),
+                        status: None,
+                    },
+                    SpanRecord {
+                        trace_id: "00112233445566778899aabbccddeeff".to_string(),
+                        span_id: "fedcba9876543210".to_string(),
+                        parent_span_id: Some("0123456789abcdef".to_string()),
+                        name: "POST /protobuf".to_string(),
+                        start_time_unix_nano: 200,
+                        end_time_unix_nano: 260,
+                        attributes: Vec::new(),
+                        status: None,
+                    },
+                ],
+            }],
+        }],
+    };
+
+    let encoded =
+        encode_export_trace_service_request_protobuf(&request).expect("encode protobuf request");
+    let first = decode_trace_block_protobuf(&encoded).expect("first fast path block");
+    let second = decode_trace_block_protobuf(&encoded).expect("second fast path block");
+
+    assert!(Arc::ptr_eq(&first.trace_ids[0], &second.trace_ids[0]));
+    assert_eq!(first.span_ids[0], second.span_ids[0]);
+    assert!(Arc::ptr_eq(&first.names[0], &second.names[0]));
+    assert_eq!(first.parent_span_ids[1], second.parent_span_ids[1]);
+}
+
+#[test]
 fn protobuf_fast_path_reuses_field_value_arcs_for_repeated_strings() {
     let request = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
@@ -400,4 +495,120 @@ fn protobuf_fast_path_decodes_nested_any_values_equivalent_to_flattening_request
     let flattened = flatten_export_request(&request).expect("flatten request");
 
     assert_eq!(fast_rows, flattened);
+}
+
+#[test]
+fn protobuf_fast_path_decodes_trace_block_equivalent_to_rows() {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource_attributes: vec![KeyValue::new(
+                "service.name",
+                AttributeValue::String("checkout".to_string()),
+            )],
+            scope_spans: vec![ScopeSpans {
+                scope_name: Some("io.opentelemetry.rust".to_string()),
+                scope_version: Some("1.0.0".to_string()),
+                scope_attributes: Vec::new(),
+                spans: vec![
+                    SpanRecord {
+                        trace_id: "00112233445566778899aabbccddeeff".to_string(),
+                        span_id: "0123456789abcdef".to_string(),
+                        parent_span_id: None,
+                        name: "POST /protobuf".to_string(),
+                        start_time_unix_nano: 100,
+                        end_time_unix_nano: 180,
+                        attributes: vec![KeyValue::new(
+                            "http.method",
+                            AttributeValue::String("POST".to_string()),
+                        )],
+                        status: Some(Status {
+                            code: 0,
+                            message: "OK".to_string(),
+                        }),
+                    },
+                    SpanRecord {
+                        trace_id: "00112233445566778899aabbccddeeff".to_string(),
+                        span_id: "fedcba9876543210".to_string(),
+                        parent_span_id: Some("0123456789abcdef".to_string()),
+                        name: "POST /protobuf/child".to_string(),
+                        start_time_unix_nano: 190,
+                        end_time_unix_nano: 250,
+                        attributes: vec![KeyValue::new(
+                            "http.status_code",
+                            AttributeValue::I64(200),
+                        )],
+                        status: Some(Status {
+                            code: 0,
+                            message: "OK".to_string(),
+                        }),
+                    },
+                ],
+            }],
+        }],
+    };
+
+    let encoded =
+        encode_export_trace_service_request_protobuf(&request).expect("encode protobuf request");
+    let rows = decode_trace_rows_protobuf(&encoded).expect("fast path rows");
+    let block = decode_trace_block_protobuf(&encoded).expect("fast path block");
+
+    assert_eq!(block.rows(), rows);
+}
+
+#[test]
+fn protobuf_fast_path_decodes_sharded_blocks_equivalent_to_rows() {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource_attributes: vec![KeyValue::new(
+                "service.name",
+                AttributeValue::String("checkout".to_string()),
+            )],
+            scope_spans: vec![ScopeSpans {
+                scope_name: Some("io.opentelemetry.rust".to_string()),
+                scope_version: Some("1.0.0".to_string()),
+                scope_attributes: Vec::new(),
+                spans: vec![
+                    SpanRecord {
+                        trace_id: "00112233445566778899aabbccddeeff".to_string(),
+                        span_id: "0123456789abcdef".to_string(),
+                        parent_span_id: None,
+                        name: "GET /one".to_string(),
+                        start_time_unix_nano: 100,
+                        end_time_unix_nano: 150,
+                        attributes: vec![KeyValue::new(
+                            "http.method",
+                            AttributeValue::String("GET".to_string()),
+                        )],
+                        status: None,
+                    },
+                    SpanRecord {
+                        trace_id: "11112222333344445555666677778888".to_string(),
+                        span_id: "fedcba9876543210".to_string(),
+                        parent_span_id: None,
+                        name: "POST /two".to_string(),
+                        start_time_unix_nano: 200,
+                        end_time_unix_nano: 260,
+                        attributes: vec![KeyValue::new(
+                            "http.method",
+                            AttributeValue::String("POST".to_string()),
+                        )],
+                        status: None,
+                    },
+                ],
+            }],
+        }],
+    };
+
+    let encoded =
+        encode_export_trace_service_request_protobuf(&request).expect("encode protobuf request");
+    let mut rows = decode_trace_rows_protobuf(&encoded).expect("fast path rows");
+    let mut sharded_rows: Vec<_> = decode_trace_blocks_protobuf_sharded(&encoded, 4)
+        .expect("sharded blocks")
+        .into_iter()
+        .flat_map(|block| block.rows())
+        .collect();
+
+    rows.sort_by(|left, right| left.span_id.cmp(&right.span_id));
+    sharded_rows.sort_by(|left, right| left.span_id.cmp(&right.span_id));
+    assert_eq!(sharded_rows, rows);
 }

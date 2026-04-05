@@ -1,7 +1,8 @@
 use vtcore::{
-    decode_log_row, decode_log_rows, decode_trace_row, decode_trace_rows, encode_log_row,
-    encode_log_rows, encode_trace_row, encode_trace_rows, encode_trace_rows_from_encoded_rows,
-    Field, LogRow, TraceSpanRow,
+    decode_log_row, decode_log_rows, decode_trace_block, decode_trace_row, decode_trace_rows,
+    encode_log_row, encode_log_rows, encode_trace_block, encode_trace_block_row,
+    encode_trace_block_rows_packed, encode_trace_row, encode_trace_rows,
+    encode_trace_rows_from_encoded_rows, Field, LogRow, TraceBlock, TraceSpanRow,
 };
 
 fn make_row(trace_id: &str, span_id: &str, start: i64, end: i64) -> TraceSpanRow {
@@ -59,6 +60,78 @@ fn trace_row_binary_codec_reuses_preencoded_rows_for_batches() {
             .map(|encoded_row| encoded_row.as_slice()),
     );
     let decoded = decode_trace_rows(&encoded).expect("decode rows");
+
+    assert_eq!(decoded, rows);
+}
+
+#[test]
+fn trace_block_binary_codec_round_trips_rows() {
+    let rows = vec![
+        make_row("trace-1", "span-1", 100, 150),
+        make_row("trace-1", "span-2", 160, 210),
+        make_row("trace-2", "span-1", 220, 250),
+    ];
+
+    let block = TraceBlock::from_rows(rows.clone());
+    let encoded = encode_trace_block(&block);
+    let decoded = decode_trace_block(&encoded).expect("decode trace block");
+
+    assert_eq!(decoded.rows(), rows);
+}
+
+#[test]
+fn trace_block_binary_codec_compacts_hex_span_ids_more_than_textual_ids() {
+    let hex_block = TraceBlock::from_rows(vec![TraceSpanRow::new(
+        "trace-compact".to_string(),
+        "0123456789abcdef".to_string(),
+        Some("1111111111111111".to_string()),
+        "span-compact".to_string(),
+        100,
+        150,
+        vec![Field::new("resource_attr:service.name", "checkout")],
+    )
+    .expect("hex row")]);
+    let text_block = TraceBlock::from_rows(vec![TraceSpanRow::new(
+        "trace-compact".to_string(),
+        "0123456789abcdeg".to_string(),
+        Some("111111111111111g".to_string()),
+        "span-compact".to_string(),
+        100,
+        150,
+        vec![Field::new("resource_attr:service.name", "checkout")],
+    )
+    .expect("text row")]);
+
+    let hex_encoded = encode_trace_block(&hex_block);
+    let text_encoded = encode_trace_block(&text_block);
+
+    assert!(
+        hex_encoded.len() < text_encoded.len(),
+        "hex span identifiers should encode more compactly than non-hex text",
+    );
+}
+
+#[test]
+fn trace_block_row_encoder_matches_trace_row_encoder() {
+    let row = make_row("trace-direct", "span-direct", 100, 140);
+    let block = TraceBlock::from_rows(vec![row.clone()]);
+
+    assert_eq!(encode_trace_block_row(&block, 0), encode_trace_row(&row));
+}
+
+#[test]
+fn trace_block_row_batch_encoder_packs_rows_without_losing_boundaries() {
+    let rows = vec![
+        make_row("trace-pack-1", "span-1", 100, 150),
+        make_row("trace-pack-1", "span-2", 160, 210),
+    ];
+    let block = TraceBlock::from_rows(rows.clone());
+    let (bytes, ranges) = encode_trace_block_rows_packed(&block);
+
+    let decoded: Vec<TraceSpanRow> = ranges
+        .iter()
+        .map(|range| decode_trace_row(&bytes[range.clone()]).expect("decode packed row"))
+        .collect();
 
     assert_eq!(decoded, rows);
 }

@@ -15,6 +15,7 @@ pub use logs_proto::{
     LogsProtobufCodecError,
 };
 pub use proto::{
-    decode_export_trace_service_request_protobuf, decode_trace_rows_protobuf,
+    decode_export_trace_service_request_protobuf, decode_trace_block_protobuf,
+    decode_trace_blocks_protobuf_sharded, decode_trace_rows_protobuf,
     encode_export_trace_service_request_protobuf, ProtobufCodecError,
 };

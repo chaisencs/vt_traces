@@ -1,4 +1,4 @@
-use vtcore::{Field, LogRow, TraceSpanRow, TraceWindow};
+use vtcore::{Field, LogRow, TraceBlockBuilder, TraceSpanRow, TraceWindow};
 
 #[test]
 fn trace_span_row_normalizes_core_fields_and_duration() {
@@ -88,11 +88,8 @@ fn trace_span_row_prevalidated_constructor_preserves_unsorted_fields() {
     )
     .expect("row should be created");
 
-    let custom_field_names: Vec<&str> = row
-        .fields
-        .iter()
-        .map(|field| field.name.as_ref())
-        .collect();
+    let custom_field_names: Vec<&str> =
+        row.fields.iter().map(|field| field.name.as_ref()).collect();
 
     assert_eq!(custom_field_names, vec!["z_field", "a_field", "m_field"]);
 }
@@ -146,4 +143,83 @@ fn log_row_round_trips_through_trace_row_encoding() {
         decoded.field_value("log_attr:http.method").as_deref(),
         Some("POST")
     );
+}
+
+#[test]
+fn trace_block_builder_can_append_shared_and_row_fields_without_intermediate_row_vec() {
+    let mut builder = TraceBlockBuilder::with_capacity(1);
+    let shared_fields = vec![
+        Field::new("resource_attr:service.name", "checkout"),
+        Field::new("instrumentation_scope.name", "io.opentelemetry.rust"),
+    ];
+
+    builder.push_prevalidated_split_fields(
+        "trace-4",
+        "span-4",
+        Some("parent-4".into()),
+        "POST /checkout",
+        100,
+        180,
+        180,
+        &shared_fields,
+        vec![Field::new("span_attr:http.method", "POST")],
+    );
+
+    let block = builder.finish();
+    let row = block.row(0);
+
+    assert_eq!(row.trace_id, "trace-4");
+    assert_eq!(row.span_id, "span-4");
+    assert_eq!(row.parent_span_id.as_deref(), Some("parent-4"));
+    assert_eq!(row.name, "POST /checkout");
+    assert_eq!(
+        row.fields
+            .iter()
+            .map(|field| (field.name.as_ref(), field.value.as_ref()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("resource_attr:service.name", "checkout"),
+            ("instrumentation_scope.name", "io.opentelemetry.rust"),
+            ("span_attr:http.method", "POST"),
+        ]
+    );
+}
+
+#[test]
+fn trace_block_builder_deduplicates_reused_shared_field_groups() {
+    let mut builder = TraceBlockBuilder::with_capacity(2);
+    let shared_fields = vec![
+        Field::new("resource_attr:service.name", "checkout"),
+        Field::new("instrumentation_scope.name", "io.opentelemetry.rust"),
+    ];
+
+    builder.push_prevalidated_split_fields(
+        "trace-5",
+        "span-5a",
+        None,
+        "POST /checkout",
+        100,
+        150,
+        150,
+        &shared_fields,
+        vec![Field::new("span_attr:http.method", "POST")],
+    );
+    builder.push_prevalidated_split_fields(
+        "trace-5",
+        "span-5b",
+        Some("span-5a".into()),
+        "POST /checkout",
+        160,
+        220,
+        220,
+        &shared_fields,
+        vec![Field::new("span_attr:http.status_code", "200")],
+    );
+
+    let block = builder.finish();
+
+    assert_eq!(block.shared_field_group_count(), 1);
+    assert_eq!(block.stored_field_count(), 4);
+    assert_eq!(block.row(0).fields.len(), 3);
+    assert_eq!(block.row(1).fields.len(), 3);
 }

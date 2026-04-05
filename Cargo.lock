@@ -553,6 +553,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "667f4fec20f29dfc6bc7357c582d91796c169ad7e2fce709468aefeb2c099870"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -587,6 +597,15 @@ name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1ee66a4b64c74f4ef288bcbb9192ad9c3feaad75193129ac8509af543894fd8"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "mime"
@@ -820,6 +839,12 @@ dependencies = [
  "bytemuck",
  "byteorder",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustls"
@@ -1338,6 +1363,7 @@ dependencies = [
  "anyhow",
  "axum",
  "hyper-util",
+ "mimalloc",
  "rcgen",
  "reqwest",
  "rustls",
@@ -1364,11 +1390,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "reqwest",
  "serde_json",
  "tokio",
  "vtapi",
  "vtcore",
+ "vtingest",
  "vtstorage",
 ]
 
@@ -1385,8 +1413,10 @@ name = "vtingest"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "rustc-hash",
  "serde",
  "serde_json",
+ "smallvec",
  "thiserror",
  "vtcore",
 ]
@@ -1407,8 +1437,10 @@ dependencies = [
  "crc32fast",
  "parking_lot",
  "roaring",
+ "rustc-hash",
  "serde",
  "serde_json",
+ "smallvec",
  "thiserror",
  "vtcore",
 ]

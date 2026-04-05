@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 prost.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 vtcore = { path = "../vtcore" }

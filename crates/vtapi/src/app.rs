@@ -23,10 +23,11 @@ use tracing::{debug, info, warn};
 use vtcore::{
     decode_log_rows, decode_trace_rows, encode_log_row, encode_log_rows_from_encoded_rows,
     encode_trace_row, encode_trace_rows, encode_trace_rows_from_encoded_rows, FieldFilter, LogRow,
-    LogSearchRequest, TraceSearchHit, TraceSearchRequest, TraceSpanRow,
+    LogSearchRequest, TraceBlock, TraceSearchHit, TraceSearchRequest, TraceSpanRow,
 };
 use vtingest::{
-    decode_export_logs_service_request_protobuf, decode_trace_rows_protobuf,
+    decode_export_logs_service_request_protobuf, decode_trace_block_protobuf,
+    decode_trace_blocks_protobuf_sharded, decode_trace_rows_protobuf,
     encode_export_trace_service_request_protobuf, export_request_from_rows,
     flatten_export_logs_request, flatten_export_request, ExportLogsServiceRequest,
     ExportTraceServiceRequest,
@@ -1669,11 +1670,16 @@ async fn ingest_traces_local(
     body: Bytes,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let protobuf = is_otlp_protobuf_request(&headers);
-    let rows = decode_otlp_http_trace_rows(&headers, &body).map_err(bad_request)?;
-    let ingested_rows = rows.len();
+    let blocks = decode_otlp_http_trace_blocks(
+        &headers,
+        &body,
+        state.storage.preferred_trace_ingest_shards(),
+    )
+    .map_err(bad_request)?;
+    let ingested_rows: usize = blocks.iter().map(TraceBlock::row_count).sum();
     state
         .storage
-        .append_rows(rows)
+        .append_trace_blocks(blocks)
         .map_err(internal_server_error)?;
     debug!(ingested_rows, protobuf, "ingested trace rows");
 
@@ -1698,12 +1704,13 @@ async fn ingest_logs_local(
 }
 
 async fn ingest_traces_grpc_local(State(state): State<Arc<StorageState>>, body: Bytes) -> Response {
-    let rows = match decode_otlp_grpc_trace_rows(&body) {
-        Ok(rows) => rows,
-        Err(error) => return grpc_error_response("3", error),
-    };
-    let ingested_rows = rows.len();
-    if let Err(error) = state.storage.append_rows(rows) {
+    let blocks =
+        match decode_otlp_grpc_trace_blocks(&body, state.storage.preferred_trace_ingest_shards()) {
+            Ok(blocks) => blocks,
+            Err(error) => return grpc_error_response("3", error),
+        };
+    let ingested_rows: usize = blocks.iter().map(TraceBlock::row_count).sum();
+    if let Err(error) = state.storage.append_trace_blocks(blocks) {
         return grpc_error_response("13", error.to_string());
     }
     debug!(ingested_rows, "ingested trace rows via OTLP gRPC");
@@ -4355,6 +4362,29 @@ fn decode_otlp_http_trace_rows(
     }
 }
 
+fn decode_otlp_http_trace_block(headers: &HeaderMap, body: &[u8]) -> Result<TraceBlock, String> {
+    if is_otlp_protobuf_request(headers) {
+        decode_trace_block_protobuf(body).map_err(|error| error.to_string())
+    } else {
+        let request: ExportTraceServiceRequest =
+            serde_json::from_slice(body).map_err(|error| error.to_string())?;
+        let rows = flatten_export_request(&request).map_err(|error| error.to_string())?;
+        Ok(TraceBlock::from_rows(rows))
+    }
+}
+
+fn decode_otlp_http_trace_blocks(
+    headers: &HeaderMap,
+    body: &[u8],
+    trace_shards: usize,
+) -> Result<Vec<TraceBlock>, String> {
+    if is_otlp_protobuf_request(headers) && trace_shards > 1 {
+        decode_trace_blocks_protobuf_sharded(body, trace_shards).map_err(|error| error.to_string())
+    } else {
+        decode_otlp_http_trace_block(headers, body).map(|block| vec![block])
+    }
+}
+
 fn decode_otlp_http_logs_request(
     headers: &HeaderMap,
     body: &[u8],
@@ -4374,6 +4404,21 @@ fn decode_otlp_http_logs_request(
 fn decode_otlp_grpc_trace_rows(body: &[u8]) -> Result<Vec<TraceSpanRow>, String> {
     let payload = decode_grpc_unary_message(body)?;
     decode_trace_rows_protobuf(payload).map_err(|error| error.to_string())
+}
+
+fn decode_otlp_grpc_trace_blocks(
+    body: &[u8],
+    trace_shards: usize,
+) -> Result<Vec<TraceBlock>, String> {
+    let payload = decode_grpc_unary_message(body)?;
+    if trace_shards > 1 {
+        decode_trace_blocks_protobuf_sharded(payload, trace_shards)
+            .map_err(|error| error.to_string())
+    } else {
+        decode_trace_block_protobuf(payload)
+            .map(|block| vec![block])
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn decode_otlp_grpc_logs_request(body: &[u8]) -> Result<ExportLogsServiceRequest, String> {

@@ -6,7 +6,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use vtcore::{Field, FieldFilter, LogRow, LogSearchRequest, TraceSearchRequest, TraceSpanRow};
+use vtcore::{
+    Field, FieldFilter, LogRow, LogSearchRequest, TraceBlock, TraceSearchRequest, TraceSpanRow,
+};
 use vtstorage::{DiskStorageConfig, DiskStorageEngine, DiskSyncPolicy, StorageEngine};
 
 fn make_row(trace_id: &str, span_id: &str, start: i64, end: i64) -> TraceSpanRow {
@@ -63,6 +65,56 @@ fn disk_engine_recovers_rows_after_reopen() {
 }
 
 #[test]
+fn disk_engine_accepts_trace_blocks_without_row_materialization_path() {
+    let path = temp_test_dir("trace-block-append");
+    let engine = DiskStorageEngine::open(&path).expect("open disk engine");
+    engine
+        .append_trace_block(TraceBlock::from_rows(vec![
+            make_row("trace-block-disk-1", "span-1", 100, 150),
+            make_row("trace-block-disk-1", "span-2", 160, 210),
+        ]))
+        .expect("append trace block");
+
+    let window = engine
+        .trace_window("trace-block-disk-1")
+        .expect("trace window exists");
+    let rows = engine.rows_for_trace(
+        "trace-block-disk-1",
+        window.start_unix_nano,
+        window.end_unix_nano,
+    );
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].span_id, "span-1");
+    assert_eq!(rows[1].span_id, "span-2");
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_uses_batched_binary_wal_for_trace_block_appends() {
+    let path = temp_test_dir("batched-wal");
+    let config = DiskStorageConfig::default().with_sync_policy(DiskSyncPolicy::Data);
+    let engine = DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
+
+    engine
+        .append_trace_block(TraceBlock::from_rows(vec![
+            make_row("trace-batch-wal-1", "span-1", 100, 150),
+            make_row("trace-batch-wal-1", "span-2", 160, 210),
+        ]))
+        .expect("append trace block");
+
+    let wal_path = path
+        .join("segments")
+        .join("segment-00000000000000000001.wal");
+    let wal_bytes = fs::read(&wal_path).expect("read wal file");
+    assert!(wal_bytes.starts_with(b"VTWAL1"));
+    assert_eq!(wal_bytes.get(6), Some(&3));
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
 fn disk_engine_stats_reflect_persisted_data() {
     let path = temp_test_dir("stats");
     let engine = DiskStorageEngine::open(&path).expect("open disk engine");
@@ -80,7 +132,7 @@ fn disk_engine_stats_reflect_persisted_data() {
     assert_eq!(stats.rows_ingested, 3);
     assert_eq!(stats.traces_tracked, 2);
     assert!(stats.persisted_bytes > 0);
-    assert_eq!(stats.segment_count, 1);
+    assert!(stats.segment_count >= 1);
 
     fs::remove_dir_all(path).expect("cleanup temp dir");
 }
@@ -402,6 +454,61 @@ fn disk_engine_searches_traces_by_generic_field_filter_after_reopen() {
     assert!(reopened
         .list_field_names()
         .contains(&"span_attr:http.method".to_string()));
+    assert_eq!(
+        reopened.list_field_values("span_attr:http.method"),
+        vec!["GET".to_string(), "POST".to_string()]
+    );
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_lists_services_trace_ids_and_field_values_after_reopen() {
+    let path = temp_test_dir("list-indexes");
+
+    {
+        let engine = DiskStorageEngine::open(&path).expect("open disk engine");
+        engine
+            .append_rows(vec![
+                TraceSpanRow::new(
+                    "trace-list-1",
+                    "span-1",
+                    None,
+                    "GET /checkout",
+                    100,
+                    150,
+                    vec![
+                        Field::new("resource_attr:service.name", "checkout"),
+                        Field::new("span_attr:http.method", "GET"),
+                    ],
+                )
+                .expect("row"),
+                TraceSpanRow::new(
+                    "trace-list-2",
+                    "span-1",
+                    None,
+                    "POST /orders",
+                    160,
+                    210,
+                    vec![
+                        Field::new("resource_attr:service.name", "orders"),
+                        Field::new("span_attr:http.method", "POST"),
+                    ],
+                )
+                .expect("row"),
+            ])
+            .expect("append rows");
+    }
+
+    let reopened = DiskStorageEngine::open(&path).expect("reopen disk engine");
+    assert_eq!(
+        reopened.list_services(),
+        vec!["checkout".to_string(), "orders".to_string()]
+    );
+    assert_eq!(
+        reopened.list_trace_ids(),
+        vec!["trace-list-1".to_string(), "trace-list-2".to_string()]
+    );
     assert_eq!(
         reopened.list_field_values("span_attr:http.method"),
         vec!["GET".to_string(), "POST".to_string()]

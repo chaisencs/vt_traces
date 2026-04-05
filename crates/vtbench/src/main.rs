@@ -14,17 +14,22 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use reqwest::Client;
 use serde_json::json;
 use vtapi::build_router_with_storage_and_limits;
 use vtcore::{Field, TraceSearchRequest, TraceSpanRow};
+use vtingest::{
+    encode_export_trace_service_request_protobuf, AttributeValue, ExportTraceServiceRequest,
+    KeyValue, ResourceSpans, ScopeSpans, SpanRecord, Status,
+};
 use vtstorage::{BatchingStorageConfig, BatchingStorageEngine, MemoryStorageEngine, StorageEngine};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
     let mode = args.next().ok_or_else(|| {
-        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest> [--key=value ...]")
+        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load> [--key=value ...]")
     })?;
     let options = parse_options(args)?;
 
@@ -32,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         "storage-ingest" => run_storage_ingest(options),
         "storage-query" => run_storage_query(options),
         "http-ingest" => run_http_ingest(options).await,
+        "otlp-protobuf-load" => run_otlp_protobuf_load(options).await,
         _ => bail!("unknown mode: {mode}"),
     }
 }
@@ -300,6 +306,110 @@ async fn run_http_ingest(options: BenchOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_otlp_protobuf_load(options: BenchOptions) -> anyhow::Result<()> {
+    let url = options
+        .url
+        .clone()
+        .ok_or_else(|| anyhow!("--url is required for otlp-protobuf-load"))?;
+    let requests = options.requests.max(1);
+    let spans_per_request = options.spans_per_request.max(1);
+    let concurrency = options.concurrency.max(1);
+    let payload_variants = options.payload_variants.max(1);
+    let payloads = make_otlp_protobuf_payload_variants(payload_variants, spans_per_request)?;
+    let client = Client::new();
+    let started = Instant::now();
+    let deadline = options
+        .duration_secs
+        .map(Duration::from_secs)
+        .map(|duration| started + duration);
+    let mut latencies = LatencySummary::default();
+    let mut timeline = TimelineSummary::new(sample_interval(&options));
+    let mut request_index = 0usize;
+    let mut error_count = 0usize;
+    let warmup_deadline = options
+        .warmup_secs
+        .map(Duration::from_secs)
+        .map(|duration| started + duration);
+    let mut measured_started = None;
+    while request_index < requests
+        || deadline
+            .map(|deadline| Instant::now() < deadline)
+            .unwrap_or(false)
+    {
+        let remaining = requests.saturating_sub(request_index);
+        let wave = if deadline.is_some() {
+            concurrency
+        } else {
+            concurrency.min(remaining.max(1))
+        };
+        let mut tasks = Vec::with_capacity(wave);
+        for offset in 0..wave {
+            let client = client.clone();
+            let url = url.clone();
+            let payload = payloads[(request_index + offset) % payloads.len()].clone();
+            tasks.push(tokio::spawn(async move {
+                let request_started = Instant::now();
+                let response = client
+                    .post(url)
+                    .header("content-type", "application/x-protobuf")
+                    .body(payload)
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) => (response.status().is_success(), request_started.elapsed()),
+                    Err(_) => (false, request_started.elapsed()),
+                }
+            }));
+        }
+        for task in tasks {
+            let (success, latency) = task.await.expect("join protobuf ingest task");
+            if warmup_deadline
+                .map(|deadline| Instant::now() >= deadline)
+                .unwrap_or(true)
+            {
+                if measured_started.is_none() {
+                    measured_started = Some(Instant::now());
+                }
+                if success {
+                    latencies.record(latency);
+                } else {
+                    error_count += spans_per_request;
+                }
+                if let Some(measured_started) = measured_started {
+                    timeline.record(
+                        measured_started.elapsed(),
+                        latency,
+                        spans_per_request,
+                        success,
+                    );
+                }
+            }
+        }
+        request_index += wave;
+    }
+    let elapsed = measured_started
+        .map(|started| started.elapsed())
+        .unwrap_or_else(|| started.elapsed());
+
+    print_summary_and_report(
+        &options,
+        "otlp-protobuf-load",
+        request_index * spans_per_request,
+        elapsed,
+        &[
+            ("requests", request_index.to_string()),
+            ("spans_per_request", spans_per_request.to_string()),
+            ("concurrency", concurrency.to_string()),
+            ("payload_variants", payload_variants.to_string()),
+            ("url", url),
+        ],
+        Some(&latencies),
+        &timeline,
+        error_count,
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct BenchOptions {
     rows: usize,
@@ -309,7 +419,9 @@ struct BenchOptions {
     queries: usize,
     requests: usize,
     spans_per_request: usize,
+    payload_variants: usize,
     concurrency: usize,
+    url: Option<String>,
     duration_secs: Option<u64>,
     warmup_secs: Option<u64>,
     sample_interval_secs: Option<u64>,
@@ -328,7 +440,9 @@ impl Default for BenchOptions {
             queries: 50_000,
             requests: 2_000,
             spans_per_request: 5,
+            payload_variants: 1024,
             concurrency: 32,
+            url: None,
             duration_secs: None,
             warmup_secs: None,
             sample_interval_secs: None,
@@ -354,7 +468,9 @@ fn parse_options(args: impl Iterator<Item = String>) -> anyhow::Result<BenchOpti
             "queries" => options.queries = value.parse()?,
             "requests" => options.requests = value.parse()?,
             "spans-per-request" => options.spans_per_request = value.parse()?,
+            "payload-variants" => options.payload_variants = value.parse()?,
             "concurrency" => options.concurrency = value.parse()?,
+            "url" => options.url = Some(value.to_string()),
             "duration-secs" => options.duration_secs = Some(value.parse()?),
             "warmup-secs" => options.warmup_secs = Some(value.parse()?),
             "sample-interval-secs" => options.sample_interval_secs = Some(value.parse()?),
@@ -431,6 +547,62 @@ fn make_http_payload(request_index: usize, spans_per_request: usize) -> serde_js
             }
         ]
     })
+}
+
+fn make_otlp_protobuf_payload_variants(
+    payload_variants: usize,
+    spans_per_request: usize,
+) -> anyhow::Result<Vec<Bytes>> {
+    (0..payload_variants.max(1))
+        .map(|request_index| make_otlp_protobuf_payload(request_index, spans_per_request))
+        .collect()
+}
+
+fn make_otlp_protobuf_payload(
+    request_index: usize,
+    spans_per_request: usize,
+) -> anyhow::Result<Bytes> {
+    let spans = (0..spans_per_request)
+        .map(|offset| {
+            let absolute_index = request_index * spans_per_request + offset;
+            SpanRecord {
+                trace_id: format!("{:032x}", request_index + 1),
+                span_id: format!("{:016x}", absolute_index + 1),
+                parent_span_id: None,
+                name: "GET /checkout".to_string(),
+                start_time_unix_nano: (absolute_index as i64) * 100,
+                end_time_unix_nano: (absolute_index as i64) * 100 + 75,
+                attributes: vec![
+                    KeyValue::new("http.method", AttributeValue::String("GET".to_string())),
+                    KeyValue::new(
+                        "http.route",
+                        AttributeValue::String("/checkout".to_string()),
+                    ),
+                ],
+                status: Some(Status {
+                    code: 0,
+                    message: "OK".to_string(),
+                }),
+            }
+        })
+        .collect();
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource_attributes: vec![KeyValue::new(
+                "service.name",
+                AttributeValue::String("checkout".to_string()),
+            )],
+            scope_spans: vec![ScopeSpans {
+                scope_name: Some("vtbench".to_string()),
+                scope_version: Some("0.1.0".to_string()),
+                scope_attributes: Vec::new(),
+                spans,
+            }],
+        }],
+    };
+    Ok(Bytes::from(encode_export_trace_service_request_protobuf(
+        &request,
+    )?))
 }
 
 #[derive(Debug, Default)]
@@ -651,8 +823,9 @@ fn format_socket_addr(addr: SocketAddr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_options, LatencySummary};
+    use super::{make_otlp_protobuf_payload_variants, parse_options, LatencySummary};
     use std::time::Duration;
+    use vtingest::decode_export_trace_service_request_protobuf;
 
     #[test]
     fn parse_options_reads_duration_secs() {
@@ -684,6 +857,38 @@ mod tests {
             options.report_file.as_deref(),
             Some(std::path::Path::new("/tmp/vtbench.json"))
         );
+    }
+
+    #[test]
+    fn parse_options_reads_payload_variants_and_url() {
+        let options = parse_options(
+            [
+                "--payload-variants=2048".to_string(),
+                "--url=http://127.0.0.1:13000/v1/traces".to_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("options should parse");
+
+        assert_eq!(options.payload_variants, 2048);
+        assert_eq!(
+            options.url.as_deref(),
+            Some("http://127.0.0.1:13000/v1/traces")
+        );
+    }
+
+    #[test]
+    fn protobuf_payload_variants_use_distinct_trace_ids() {
+        let payloads =
+            make_otlp_protobuf_payload_variants(2, 3).expect("protobuf payloads should build");
+        let first =
+            decode_export_trace_service_request_protobuf(&payloads[0]).expect("first payload");
+        let second =
+            decode_export_trace_service_request_protobuf(&payloads[1]).expect("second payload");
+
+        let first_trace_id = &first.resource_spans[0].scope_spans[0].spans[0].trace_id;
+        let second_trace_id = &second.resource_spans[0].scope_spans[0].spans[0].trace_id;
+        assert_ne!(first_trace_id, second_trace_id);
     }
 
     #[test]

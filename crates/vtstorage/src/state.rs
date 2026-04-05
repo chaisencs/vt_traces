@@ -1,75 +1,139 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use roaring::RoaringBitmap;
-use vtcore::{FieldFilter, TraceSearchHit, TraceSearchRequest, TraceSpanRow, TraceWindow};
-
-use crate::bloom::StringBloomFilter;
+use rustc_hash::{FxHashMap, FxHashSet};
+use vtcore::{Field, TraceBlock, TraceSearchHit, TraceSearchRequest, TraceSpanRow, TraceWindow};
 
 type TraceRef = u32;
 type StringRef = u32;
+
+#[derive(Default)]
+struct BlockInternCache<'a> {
+    trace_ids: FxHashMap<&'a str, TraceRef>,
+    strings: FxHashMap<&'a str, StringRef>,
+}
+
+impl<'a> BlockInternCache<'a> {
+    fn trace_ref(&mut self, table: &mut StringTable, value: &'a str) -> TraceRef {
+        if let Some(existing) = self.trace_ids.get(value) {
+            return *existing;
+        }
+        let trace_ref = table.intern(value);
+        self.trace_ids.insert(value, trace_ref);
+        trace_ref
+    }
+
+    fn string_ref(&mut self, table: &mut StringTable, value: &'a str) -> StringRef {
+        if let Some(existing) = self.strings.get(value) {
+            return *existing;
+        }
+        let string_ref = table.intern(value);
+        self.strings.insert(value, string_ref);
+        string_ref
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedGroupIndexUpdate {
+    services: Vec<StringRef>,
+    indexed_fields: Vec<(StringRef, StringRef)>,
+}
+
+impl SharedGroupIndexUpdate {
+    fn record_service(&mut self, service_ref: StringRef) {
+        if !self.services.contains(&service_ref) {
+            self.services.push(service_ref);
+        }
+    }
+
+    fn record_indexed_field(&mut self, field_name_ref: StringRef, field_value_ref: StringRef) {
+        if !self.indexed_fields.iter().any(|(name_ref, value_ref)| {
+            *name_ref == field_name_ref && *value_ref == field_value_ref
+        }) {
+            self.indexed_fields.push((field_name_ref, field_value_ref));
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct IndexedState {
     trace_ids: StringTable,
     strings: StringTable,
     all_trace_refs: RoaringBitmap,
-    rows_by_trace: HashMap<TraceRef, Vec<TraceSpanRow>>,
-    windows_by_trace: HashMap<TraceRef, TraceWindowBounds>,
-    services_by_trace: HashMap<TraceRef, HashSet<StringRef>>,
-    trace_refs_by_service: HashMap<StringRef, RoaringBitmap>,
-    operations_by_trace: HashMap<TraceRef, HashSet<StringRef>>,
-    operation_bloom_by_trace: HashMap<TraceRef, StringBloomFilter>,
-    indexed_fields_by_trace: HashMap<TraceRef, HashMap<StringRef, HashSet<StringRef>>>,
-    field_token_bloom_by_trace: HashMap<TraceRef, StringBloomFilter>,
-    trace_refs_by_field_name_value: HashMap<StringRef, HashMap<StringRef, RoaringBitmap>>,
-    field_values_by_name: HashMap<StringRef, HashSet<StringRef>>,
+    blocks: Vec<Arc<TraceBlock>>,
+    row_refs_by_trace: FxHashMap<TraceRef, Vec<BlockRowRef>>,
+    windows_by_trace: FxHashMap<TraceRef, TraceWindowBounds>,
+    services_by_trace: FxHashMap<TraceRef, FxHashSet<StringRef>>,
+    trace_refs_by_service: FxHashMap<StringRef, RoaringBitmap>,
+    trace_refs_by_operation: FxHashMap<StringRef, RoaringBitmap>,
+    trace_refs_by_field_name_value: FxHashMap<StringRef, FxHashMap<StringRef, RoaringBitmap>>,
+    field_values_by_name: FxHashMap<StringRef, FxHashSet<StringRef>>,
     rows_ingested: u64,
 }
 
 impl IndexedState {
-    pub(crate) fn ingest_rows<I>(&mut self, rows: I)
-    where
-        I: IntoIterator<Item = TraceSpanRow>,
-    {
-        let mut batch_by_trace: HashMap<TraceRef, BatchTraceUpdate> = HashMap::new();
-        let mut rows_ingested = 0u64;
-        for row in rows {
-            let trace_ref = self.trace_ids.intern(&row.trace_id);
-            let batch = batch_by_trace
-                .entry(trace_ref)
-                .or_insert_with(|| BatchTraceUpdate::new(row.start_unix_nano, row.end_unix_nano));
-            batch.observe_window(row.start_unix_nano, row.end_unix_nano);
-            if let Some(service_name) = row.service_name() {
-                if !service_name.is_empty() && service_name != "-" {
-                    batch.services.insert(self.strings.intern(service_name));
-                }
-            }
-            batch.operations.insert(self.strings.intern(&row.name));
-            self.collect_indexed_fields(&mut batch.indexed_fields, &row);
-            batch.rows.push(row);
-            rows_ingested += 1;
+    pub(crate) fn ingest_block(&mut self, block: TraceBlock) {
+        if block.is_empty() {
+            return;
         }
+
+        let row_count = block.row_count();
+        let block = Arc::new(block);
+        let mut block_intern_cache = BlockInternCache::default();
+        let shared_group_updates = self.build_shared_group_updates(&block, &mut block_intern_cache);
+        let block_id = self.blocks.len() as u32;
+
+        if Self::block_has_single_trace(&block) {
+            let trace_ref = block_intern_cache.trace_ref(&mut self.trace_ids, block.trace_id_at(0));
+            let batch = self.build_single_trace_batch(
+                block_id,
+                &block,
+                &shared_group_updates,
+                &mut block_intern_cache,
+            );
+            self.blocks.push(block);
+            self.apply_trace_batch(trace_ref, batch);
+            self.rows_ingested += row_count as u64;
+            return;
+        }
+
+        let mut batch_by_trace: FxHashMap<TraceRef, BatchTraceUpdate> = FxHashMap::default();
+        batch_by_trace.reserve(row_count.min(8));
+
+        for row_index in 0..row_count {
+            let trace_ref =
+                block_intern_cache.trace_ref(&mut self.trace_ids, block.trace_id_at(row_index));
+            let batch = batch_by_trace.entry(trace_ref).or_insert_with(|| {
+                BatchTraceUpdate::new(
+                    block.start_unix_nano_at(row_index),
+                    block.end_unix_nano_at(row_index),
+                )
+            });
+            batch.observe_window(
+                block.start_unix_nano_at(row_index),
+                block.end_unix_nano_at(row_index),
+            );
+            batch.rows.push(BlockRowRef {
+                block_id,
+                row_index: row_index as u32,
+            });
+
+            self.collect_row_indexes(
+                batch,
+                &block,
+                row_index,
+                &shared_group_updates,
+                &mut block_intern_cache,
+            );
+        }
+
+        self.blocks.push(block);
 
         for (trace_ref, batch) in batch_by_trace {
-            self.all_trace_refs.insert(trace_ref);
-            self.windows_by_trace
-                .entry(trace_ref)
-                .and_modify(|window| {
-                    window.observe(batch.start_unix_nano, batch.end_unix_nano)
-                })
-                .or_insert_with(|| TraceWindowBounds::new(batch.start_unix_nano, batch.end_unix_nano));
-
-            let rows = self.rows_by_trace.entry(trace_ref).or_default();
-            merge_sorted_trace_rows(rows, batch.rows);
-
-            self.merge_trace_services(trace_ref, batch.services);
-            self.merge_trace_operations(trace_ref, batch.operations);
-            self.merge_trace_fields(trace_ref, batch.indexed_fields);
+            self.apply_trace_batch(trace_ref, batch);
         }
-        self.rows_ingested += rows_ingested;
+
+        self.rows_ingested += row_count as u64;
     }
 
     pub(crate) fn rows_ingested(&self) -> u64 {
@@ -147,30 +211,19 @@ impl IndexedState {
 
     pub(crate) fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
         let candidate_trace_refs = self.candidate_trace_refs(request);
-        let operation_filter = request
+        if request
             .operation_name
             .as_ref()
-            .map(|operation_name| self.strings.lookup(operation_name));
-        if matches!(operation_filter, Some(None)) {
+            .is_some_and(|operation_name| self.strings.lookup(operation_name).is_none())
+        {
             return Vec::new();
         }
-
-        let field_filters: Vec<(StringRef, StringRef, &FieldFilter)> = match request
-            .field_filters
-            .iter()
-            .map(|field_filter| {
-                Some((
-                    self.strings.lookup(&field_filter.name)?,
-                    self.strings.lookup(&field_filter.value)?,
-                    field_filter,
-                ))
-            })
-            .collect()
-        {
-            Some(field_filters) => field_filters,
-            None if request.field_filters.is_empty() => Vec::new(),
-            None => return Vec::new(),
-        };
+        if request.field_filters.iter().any(|field_filter| {
+            self.strings.lookup(&field_filter.name).is_none()
+                || self.strings.lookup(&field_filter.value).is_none()
+        }) {
+            return Vec::new();
+        }
 
         let mut hits: Vec<TraceSearchHit> = candidate_trace_refs
             .into_iter()
@@ -180,29 +233,6 @@ impl IndexedState {
                     && window.start_unix_nano <= request.end_unix_nano;
                 if !overlaps {
                     return None;
-                }
-
-                if let Some(Some(operation_ref)) = operation_filter {
-                    let operation_name = request.operation_name.as_deref()?;
-                    let bloom = self.operation_bloom_by_trace.get(&trace_ref)?;
-                    if !bloom.might_contain(operation_name) {
-                        return None;
-                    }
-                    let operations = self.operations_by_trace.get(&trace_ref)?;
-                    if !operations.contains(&operation_ref) {
-                        return None;
-                    }
-                }
-
-                for (field_name_ref, field_value_ref, field_filter) in &field_filters {
-                    if !self.trace_matches_field_filter(
-                        trace_ref,
-                        *field_name_ref,
-                        *field_value_ref,
-                        field_filter,
-                    ) {
-                        return None;
-                    }
                 }
 
                 let mut services: Vec<String> = self
@@ -247,52 +277,125 @@ impl IndexedState {
         let Some(trace_ref) = self.trace_ids.lookup(trace_id) else {
             return Vec::new();
         };
-        self.rows_by_trace
+        self.row_refs_by_trace
             .get(&trace_ref)
-            .map(|rows| {
-                rows.iter()
-                    .filter(|row| {
-                        row.end_unix_nano >= start_unix_nano && row.start_unix_nano <= end_unix_nano
+            .map(|row_refs| {
+                row_refs
+                    .iter()
+                    .filter_map(|row_ref| {
+                        let block = self.blocks.get(row_ref.block_id as usize)?;
+                        let row_index = row_ref.row_index as usize;
+                        let row_end = block.end_unix_nano_at(row_index);
+                        let row_start = block.start_unix_nano_at(row_index);
+                        if row_end < start_unix_nano || row_start > end_unix_nano {
+                            return None;
+                        }
+                        Some(block.row(row_index))
                     })
-                    .cloned()
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    fn collect_indexed_fields(
+    fn collect_row_indexes<'a>(
         &mut self,
-        indexed_fields: &mut HashMap<StringRef, HashSet<StringRef>>,
-        row: &TraceSpanRow,
+        batch: &mut BatchTraceUpdate,
+        block: &'a TraceBlock,
+        row_index: usize,
+        shared_group_updates: &[SharedGroupIndexUpdate],
+        block_intern_cache: &mut BlockInternCache<'a>,
     ) {
-        self.collect_indexed_field(indexed_fields, "name", &row.name);
-        self.collect_indexed_field(indexed_fields, "duration", &row.duration_nanos().to_string());
-        for field in &row.fields {
-            if should_index_field(&field.name) {
-                self.collect_indexed_field(indexed_fields, &field.name, &field.value);
+        push_unique_ref(
+            &mut batch.operations,
+            block_intern_cache.string_ref(&mut self.strings, block.name_at(row_index)),
+        );
+
+        let shared_group_id = block.shared_field_group_id_at(row_index);
+        if shared_group_id != 0
+            && push_unique_u32(&mut batch.applied_shared_groups, shared_group_id)
+        {
+            if let Some(shared_group_update) =
+                shared_group_updates.get(shared_group_id as usize - 1)
+            {
+                for service_ref in &shared_group_update.services {
+                    push_unique_ref(&mut batch.services, *service_ref);
+                }
+                for (field_name_ref, field_value_ref) in &shared_group_update.indexed_fields {
+                    Self::insert_indexed_field(
+                        &mut batch.indexed_fields,
+                        *field_name_ref,
+                        *field_value_ref,
+                    );
+                }
             }
+        }
+
+        for field in block.row_fields_at(row_index) {
+            self.collect_row_field(batch, field, block_intern_cache);
         }
     }
 
-    fn collect_indexed_field(
+    fn collect_row_field<'a>(
         &mut self,
-        indexed_fields: &mut HashMap<StringRef, HashSet<StringRef>>,
-        field_name: &str,
-        field_value: &str,
+        batch: &mut BatchTraceUpdate,
+        field: &'a Field,
+        block_intern_cache: &mut BlockInternCache<'a>,
     ) {
+        let field_name = field.name.as_ref();
+        let field_value = field.value.as_ref();
         if field_name.is_empty() || field_value.is_empty() {
             return;
         }
 
-        let field_name_ref = self.strings.intern(field_name);
-        let field_value_ref = self.strings.intern(field_value);
-        indexed_fields
-            .entry(field_name_ref)
-            .or_default()
-            .insert(field_value_ref);
+        let field_value_ref = block_intern_cache.string_ref(&mut self.strings, field_value);
+        if field_name == "resource_attr:service.name" && field_value != "-" {
+            push_unique_ref(&mut batch.services, field_value_ref);
+        }
+        if should_index_field(field_name) {
+            let field_name_ref = block_intern_cache.string_ref(&mut self.strings, field_name);
+            Self::insert_indexed_field(&mut batch.indexed_fields, field_name_ref, field_value_ref);
+        }
     }
 
-    fn merge_trace_services(&mut self, trace_ref: TraceRef, services: HashSet<StringRef>) {
+    fn build_shared_group_updates<'a>(
+        &mut self,
+        block: &'a TraceBlock,
+        block_intern_cache: &mut BlockInternCache<'a>,
+    ) -> Vec<SharedGroupIndexUpdate> {
+        let mut shared_group_updates = Vec::with_capacity(block.shared_field_group_count());
+        for group_id in 1..=block.shared_field_group_count() as u32 {
+            let mut update = SharedGroupIndexUpdate::default();
+            for field in block.shared_fields_for_group_id(group_id) {
+                let field_name = field.name.as_ref();
+                let field_value = field.value.as_ref();
+                if field_name.is_empty() || field_value.is_empty() {
+                    continue;
+                }
+
+                let field_value_ref = block_intern_cache.string_ref(&mut self.strings, field_value);
+                if field_name == "resource_attr:service.name" && field_value != "-" {
+                    update.record_service(field_value_ref);
+                }
+                if should_index_field(field_name) {
+                    let field_name_ref =
+                        block_intern_cache.string_ref(&mut self.strings, field_name);
+                    update.record_indexed_field(field_name_ref, field_value_ref);
+                }
+            }
+            shared_group_updates.push(update);
+        }
+        shared_group_updates
+    }
+
+    fn insert_indexed_field(
+        indexed_fields: &mut Vec<(StringRef, StringRef)>,
+        field_name_ref: StringRef,
+        field_value_ref: StringRef,
+    ) {
+        push_unique_ref_pair(indexed_fields, field_name_ref, field_value_ref);
+    }
+
+    fn merge_trace_services(&mut self, trace_ref: TraceRef, services: Vec<StringRef>) {
         if services.is_empty() {
             return;
         }
@@ -309,62 +412,39 @@ impl IndexedState {
         }
     }
 
-    fn merge_trace_operations(&mut self, trace_ref: TraceRef, operations: HashSet<StringRef>) {
+    fn merge_trace_operations(&mut self, trace_ref: TraceRef, operations: Vec<StringRef>) {
         if operations.is_empty() {
             return;
         }
 
-        let trace_operations = self.operations_by_trace.entry(trace_ref).or_default();
-        trace_operations.reserve(operations.len());
-        let bloom = self.operation_bloom_by_trace.entry(trace_ref).or_default();
         for operation_ref in operations {
-            if trace_operations.insert(operation_ref) {
-                if let Some(operation_name) = self.strings.resolve(operation_ref) {
-                    bloom.insert(operation_name);
-                }
-            }
+            self.trace_refs_by_operation
+                .entry(operation_ref)
+                .or_default()
+                .insert(trace_ref);
         }
     }
 
     fn merge_trace_fields(
         &mut self,
         trace_ref: TraceRef,
-        indexed_fields: HashMap<StringRef, HashSet<StringRef>>,
+        indexed_fields: Vec<(StringRef, StringRef)>,
     ) {
         if indexed_fields.is_empty() {
             return;
         }
 
-        let trace_fields = self.indexed_fields_by_trace.entry(trace_ref).or_default();
-        let bloom = self.field_token_bloom_by_trace.entry(trace_ref).or_default();
-        for (field_name_ref, values) in indexed_fields {
-            let field_name = self
-                .strings
-                .resolve(field_name_ref)
-                .unwrap_or_default()
-                .to_string();
-            let trace_values = trace_fields.entry(field_name_ref).or_default();
-            trace_values.reserve(values.len());
-            for field_value_ref in values {
-                if trace_values.insert(field_value_ref) {
-                    let field_value = self
-                        .strings
-                        .resolve(field_value_ref)
-                        .unwrap_or_default()
-                        .to_string();
-                    bloom.insert(&field_bloom_token(&field_name, &field_value));
-                    self.trace_refs_by_field_name_value
-                        .entry(field_name_ref)
-                        .or_default()
-                        .entry(field_value_ref)
-                        .or_default()
-                        .insert(trace_ref);
-                    self.field_values_by_name
-                        .entry(field_name_ref)
-                        .or_default()
-                        .insert(field_value_ref);
-                }
-            }
+        for (field_name_ref, field_value_ref) in indexed_fields {
+            self.trace_refs_by_field_name_value
+                .entry(field_name_ref)
+                .or_default()
+                .entry(field_value_ref)
+                .or_default()
+                .insert(trace_ref);
+            self.field_values_by_name
+                .entry(field_name_ref)
+                .or_default()
+                .insert(field_value_ref);
         }
     }
 
@@ -382,6 +462,21 @@ impl IndexedState {
 
         if request.service_name.is_some() && candidate_refs.is_none() {
             return RoaringBitmap::new();
+        }
+
+        if let Some(operation_name) = &request.operation_name {
+            let Some(operation_ref) = self.strings.lookup(operation_name) else {
+                return RoaringBitmap::new();
+            };
+            let matching = self
+                .trace_refs_by_operation
+                .get(&operation_ref)
+                .cloned()
+                .unwrap_or_default();
+            candidate_refs = Some(match candidate_refs {
+                Some(current) => current & matching,
+                None => matching,
+            });
         }
 
         for field_filter in &request.field_filters {
@@ -406,31 +501,66 @@ impl IndexedState {
         candidate_refs.unwrap_or_else(|| self.all_trace_refs.clone())
     }
 
-    fn trace_matches_field_filter(
-        &self,
-        trace_ref: TraceRef,
-        field_name_ref: StringRef,
-        field_value_ref: StringRef,
-        field_filter: &FieldFilter,
-    ) -> bool {
-        let bloom = match self.field_token_bloom_by_trace.get(&trace_ref) {
-            Some(bloom) => bloom,
-            None => return false,
-        };
-        if !bloom.might_contain(&field_bloom_token(&field_filter.name, &field_filter.value)) {
-            return false;
+    fn block_has_single_trace(block: &TraceBlock) -> bool {
+        let first_trace_id = block.trace_id_at(0);
+        block
+            .trace_ids
+            .iter()
+            .skip(1)
+            .all(|trace_id| trace_id.as_ref() == first_trace_id)
+    }
+
+    fn build_single_trace_batch<'a>(
+        &mut self,
+        block_id: u32,
+        block: &'a TraceBlock,
+        shared_group_updates: &[SharedGroupIndexUpdate],
+        block_intern_cache: &mut BlockInternCache<'a>,
+    ) -> BatchTraceUpdate {
+        let mut batch =
+            BatchTraceUpdate::new(block.start_unix_nano_at(0), block.end_unix_nano_at(0));
+        batch.rows.reserve(block.row_count());
+        for row_index in 0..block.row_count() {
+            batch.observe_window(
+                block.start_unix_nano_at(row_index),
+                block.end_unix_nano_at(row_index),
+            );
+            batch.rows.push(BlockRowRef {
+                block_id,
+                row_index: row_index as u32,
+            });
+            self.collect_row_indexes(
+                &mut batch,
+                block,
+                row_index,
+                shared_group_updates,
+                block_intern_cache,
+            );
         }
-        self.indexed_fields_by_trace
-            .get(&trace_ref)
-            .and_then(|fields| fields.get(&field_name_ref))
-            .map(|values| values.contains(&field_value_ref))
-            .unwrap_or(false)
+        batch
+    }
+
+    fn apply_trace_batch(&mut self, trace_ref: TraceRef, batch: BatchTraceUpdate) {
+        self.all_trace_refs.insert(trace_ref);
+        self.windows_by_trace
+            .entry(trace_ref)
+            .and_modify(|window| {
+                window.observe(batch.start_unix_nano, batch.end_unix_nano);
+            })
+            .or_insert_with(|| TraceWindowBounds::new(batch.start_unix_nano, batch.end_unix_nano));
+
+        let rows = self.row_refs_by_trace.entry(trace_ref).or_default();
+        merge_sorted_block_row_refs(rows, batch.rows, &self.blocks);
+
+        self.merge_trace_services(trace_ref, batch.services);
+        self.merge_trace_operations(trace_ref, batch.operations);
+        self.merge_trace_fields(trace_ref, batch.indexed_fields);
     }
 }
 
 #[derive(Debug, Default)]
 struct StringTable {
-    ids_by_value: HashMap<Arc<str>, u32>,
+    ids_by_value: FxHashMap<Arc<str>, u32>,
     values_by_id: Vec<Arc<str>>,
 }
 
@@ -452,8 +582,16 @@ impl StringTable {
     }
 
     fn resolve(&self, id: u32) -> Option<&str> {
-        self.values_by_id.get(id as usize).map(|value| value.as_ref())
+        self.values_by_id
+            .get(id as usize)
+            .map(|value| value.as_ref())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockRowRef {
+    block_id: u32,
+    row_index: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -464,10 +602,11 @@ struct TraceWindowBounds {
 
 #[derive(Debug)]
 struct BatchTraceUpdate {
-    rows: Vec<TraceSpanRow>,
-    services: HashSet<StringRef>,
-    operations: HashSet<StringRef>,
-    indexed_fields: HashMap<StringRef, HashSet<StringRef>>,
+    rows: Vec<BlockRowRef>,
+    services: Vec<StringRef>,
+    operations: Vec<StringRef>,
+    indexed_fields: Vec<(StringRef, StringRef)>,
+    applied_shared_groups: Vec<u32>,
     start_unix_nano: i64,
     end_unix_nano: i64,
 }
@@ -476,9 +615,10 @@ impl BatchTraceUpdate {
     fn new(start_unix_nano: i64, end_unix_nano: i64) -> Self {
         Self {
             rows: Vec::new(),
-            services: HashSet::new(),
-            operations: HashSet::new(),
-            indexed_fields: HashMap::new(),
+            services: Vec::new(),
+            operations: Vec::new(),
+            indexed_fields: Vec::new(),
+            applied_shared_groups: Vec::new(),
             start_unix_nano,
             end_unix_nano,
         }
@@ -512,8 +652,33 @@ impl TraceWindowBounds {
     }
 }
 
-fn field_bloom_token(field_name: &str, field_value: &str) -> String {
-    format!("{field_name}={field_value}")
+fn push_unique_u32(values: &mut Vec<u32>, value: u32) -> bool {
+    if values.contains(&value) {
+        return false;
+    }
+    values.push(value);
+    true
+}
+
+fn push_unique_ref(values: &mut Vec<StringRef>, value: StringRef) {
+    if values.contains(&value) {
+        return;
+    }
+    values.push(value);
+}
+
+fn push_unique_ref_pair(
+    values: &mut Vec<(StringRef, StringRef)>,
+    name: StringRef,
+    value: StringRef,
+) {
+    if values
+        .iter()
+        .any(|(existing_name, existing_value)| *existing_name == name && *existing_value == value)
+    {
+        return;
+    }
+    values.push((name, value));
 }
 
 fn should_index_field(field_name: &str) -> bool {
@@ -523,12 +688,16 @@ fn should_index_field(field_name: &str) -> bool {
     )
 }
 
-fn merge_sorted_trace_rows(existing: &mut Vec<TraceSpanRow>, mut incoming: Vec<TraceSpanRow>) {
+fn merge_sorted_block_row_refs(
+    existing: &mut Vec<BlockRowRef>,
+    mut incoming: Vec<BlockRowRef>,
+    blocks: &[Arc<TraceBlock>],
+) {
     if incoming.is_empty() {
         return;
     }
 
-    sort_trace_rows_by_end(&mut incoming);
+    sort_block_row_refs_by_end(&mut incoming, blocks);
     if existing.is_empty() {
         *existing = incoming;
         return;
@@ -537,7 +706,10 @@ fn merge_sorted_trace_rows(existing: &mut Vec<TraceSpanRow>, mut incoming: Vec<T
     let append_only = existing
         .last()
         .zip(incoming.first())
-        .map(|(current_last, incoming_first)| current_last.end_unix_nano <= incoming_first.end_unix_nano)
+        .map(|(current_last, incoming_first)| {
+            row_ref_end_unix_nano(*current_last, blocks)
+                <= row_ref_end_unix_nano(*incoming_first, blocks)
+        })
         .unwrap_or(false);
     if append_only {
         existing.reserve(incoming.len());
@@ -548,7 +720,10 @@ fn merge_sorted_trace_rows(existing: &mut Vec<TraceSpanRow>, mut incoming: Vec<T
     let prepend_only = existing
         .first()
         .zip(incoming.last())
-        .map(|(current_first, incoming_last)| incoming_last.end_unix_nano <= current_first.end_unix_nano)
+        .map(|(current_first, incoming_last)| {
+            row_ref_end_unix_nano(*incoming_last, blocks)
+                <= row_ref_end_unix_nano(*current_first, blocks)
+        })
         .unwrap_or(false);
     if prepend_only {
         incoming.reserve(existing.len());
@@ -559,22 +734,25 @@ fn merge_sorted_trace_rows(existing: &mut Vec<TraceSpanRow>, mut incoming: Vec<T
 
     existing.reserve(incoming.len());
     existing.extend(incoming);
-    existing.sort_by_key(|row| row.end_unix_nano);
+    existing.sort_by_key(|row_ref| row_ref_end_unix_nano(*row_ref, blocks));
 }
 
-fn sort_trace_rows_by_end(rows: &mut Vec<TraceSpanRow>) {
-    if rows
-        .windows(2)
-        .any(|window| window[0].end_unix_nano > window[1].end_unix_nano)
-    {
-        rows.sort_by_key(|row| row.end_unix_nano);
+fn sort_block_row_refs_by_end(rows: &mut [BlockRowRef], blocks: &[Arc<TraceBlock>]) {
+    if rows.windows(2).any(|window| {
+        row_ref_end_unix_nano(window[0], blocks) > row_ref_end_unix_nano(window[1], blocks)
+    }) {
+        rows.sort_by_key(|row_ref| row_ref_end_unix_nano(*row_ref, blocks));
     }
+}
+
+fn row_ref_end_unix_nano(row_ref: BlockRowRef, blocks: &[Arc<TraceBlock>]) -> i64 {
+    blocks[row_ref.block_id as usize].end_unix_nano_at(row_ref.row_index as usize)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::merge_sorted_trace_rows;
-    use vtcore::TraceSpanRow;
+    use super::{merge_sorted_block_row_refs, row_ref_end_unix_nano, BlockRowRef, IndexedState};
+    use vtcore::{Field, TraceBlock, TraceSpanRow};
 
     fn make_row(trace_id: &str, span_id: &str, start: i64, end: i64) -> TraceSpanRow {
         TraceSpanRow::new_unsorted_fields(
@@ -584,39 +762,122 @@ mod tests {
             format!("span-{span_id}"),
             start,
             end,
-            Vec::new(),
+            vec![Field::new("resource_attr:service.name", "checkout")],
         )
         .expect("valid row")
     }
 
     #[test]
-    fn merge_sorted_trace_rows_appends_sorted_tail_without_reordering_existing_rows() {
-        let mut existing = vec![
+    fn ingest_block_preserves_row_order_by_end_time_per_trace() {
+        let mut state = IndexedState::default();
+        state.ingest_block(TraceBlock::from_rows(vec![
+            make_row("trace-1", "span-3", 300, 350),
             make_row("trace-1", "span-1", 100, 150),
             make_row("trace-1", "span-2", 200, 250),
-        ];
-        let incoming = vec![
-            make_row("trace-1", "span-3", 260, 300),
-            make_row("trace-1", "span-4", 310, 360),
-        ];
+        ]));
 
-        merge_sorted_trace_rows(&mut existing, incoming);
-
-        let end_times: Vec<i64> = existing.iter().map(|row| row.end_unix_nano).collect();
-        assert_eq!(end_times, vec![150, 250, 300, 360]);
+        let rows = state.rows_for_trace("trace-1", 0, 1_000);
+        let end_times: Vec<i64> = rows.iter().map(|row| row.end_unix_nano).collect();
+        assert_eq!(end_times, vec![150, 250, 350]);
     }
 
     #[test]
-    fn merge_sorted_trace_rows_sorts_unsorted_incoming_batch() {
-        let mut existing = vec![make_row("trace-2", "span-1", 10, 20)];
+    fn ingest_block_merges_multiple_blocks_for_same_trace() {
+        let mut state = IndexedState::default();
+        state.ingest_block(TraceBlock::from_rows(vec![
+            make_row("trace-2", "span-1", 100, 150),
+            make_row("trace-2", "span-3", 300, 350),
+        ]));
+        state.ingest_block(TraceBlock::from_rows(vec![make_row(
+            "trace-2", "span-2", 200, 250,
+        )]));
+
+        let span_ids: Vec<String> = state
+            .rows_for_trace("trace-2", 0, 1_000)
+            .into_iter()
+            .map(|row| row.span_id)
+            .collect();
+        assert_eq!(span_ids, vec!["span-1", "span-2", "span-3"]);
+    }
+
+    #[test]
+    fn merge_sorted_block_row_refs_sorts_unsorted_incoming_batch() {
+        let mut state = IndexedState::default();
+        state.ingest_block(TraceBlock::from_rows(vec![
+            make_row("trace-3", "span-1", 10, 20),
+            make_row("trace-3", "span-3", 40, 60),
+            make_row("trace-3", "span-2", 20, 30),
+        ]));
+
+        let mut existing = vec![BlockRowRef {
+            block_id: 0,
+            row_index: 0,
+        }];
         let incoming = vec![
-            make_row("trace-2", "span-3", 40, 60),
-            make_row("trace-2", "span-2", 20, 30),
+            BlockRowRef {
+                block_id: 0,
+                row_index: 1,
+            },
+            BlockRowRef {
+                block_id: 0,
+                row_index: 2,
+            },
         ];
 
-        merge_sorted_trace_rows(&mut existing, incoming);
+        merge_sorted_block_row_refs(&mut existing, incoming, &state.blocks);
+        let end_times: Vec<i64> = existing
+            .iter()
+            .map(|row_ref| row_ref_end_unix_nano(*row_ref, &state.blocks))
+            .collect();
+        assert_eq!(end_times, vec![20, 30, 60]);
+    }
 
-        let span_ids: Vec<&str> = existing.iter().map(|row| row.span_id.as_str()).collect();
-        assert_eq!(span_ids, vec!["span-1", "span-2", "span-3"]);
+    #[test]
+    fn ingest_block_indexes_shared_field_groups_without_losing_row_filters() {
+        let mut state = IndexedState::default();
+        let mut builder = TraceBlock::builder();
+        let shared_fields = vec![
+            Field::new("resource_attr:service.name", "checkout"),
+            Field::new("resource_attr:deployment.environment", "prod"),
+        ];
+        builder.push_prevalidated_split_fields(
+            "trace-shared-1",
+            "span-1",
+            None,
+            "POST /checkout",
+            100,
+            150,
+            150,
+            &shared_fields,
+            vec![Field::new("span_attr:http.method", "POST")],
+        );
+        builder.push_prevalidated_split_fields(
+            "trace-shared-1",
+            "span-2",
+            Some("span-1".into()),
+            "POST /checkout",
+            160,
+            210,
+            210,
+            &shared_fields,
+            vec![Field::new("span_attr:http.status_code", "200")],
+        );
+
+        state.ingest_block(builder.finish());
+
+        let hits = state.search_traces(&vtcore::TraceSearchRequest {
+            start_unix_nano: 0,
+            end_unix_nano: 1_000,
+            service_name: Some("checkout".to_string()),
+            operation_name: Some("POST /checkout".to_string()),
+            field_filters: vec![vtcore::FieldFilter {
+                name: "span_attr:http.status_code".to_string(),
+                value: "200".to_string(),
+            }],
+            limit: 10,
+        });
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].trace_id, "trace-shared-1");
     }
 }

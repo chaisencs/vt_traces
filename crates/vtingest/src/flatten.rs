@@ -179,14 +179,19 @@ pub fn export_request_from_rows(rows: &[TraceSpanRow]) -> ExportTraceServiceRequ
 
         for field in &row.fields {
             if let Some(key) = field.name.strip_prefix("resource_attr:") {
-                resource_attributes.push(KeyValue::string(key.to_string(), field.value.to_string()));
+                resource_attributes
+                    .push(KeyValue::string(key.to_string(), field.value.to_string()));
             } else if let Some(key) = field.name.strip_prefix("scope_attr:") {
                 scope_attributes.push(KeyValue::string(key.to_string(), field.value.to_string()));
             } else if let Some(key) = field.name.strip_prefix("span_attr:") {
                 span_attributes.push(KeyValue::string(key.to_string(), field.value.to_string()));
-            } else if field.name.as_ref() == "instrumentation_scope.name" && field.value.as_ref() != "-" {
+            } else if field.name.as_ref() == "instrumentation_scope.name"
+                && field.value.as_ref() != "-"
+            {
                 scope_name = Some(field.value.to_string());
-            } else if field.name.as_ref() == "instrumentation_scope.version" && field.value.as_ref() != "-" {
+            } else if field.name.as_ref() == "instrumentation_scope.version"
+                && field.value.as_ref() != "-"
+            {
                 scope_version = Some(field.value.to_string());
             } else if field.name.as_ref() == "status_code" {
                 status_code = field.value.parse::<i32>().ok();
