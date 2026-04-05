@@ -627,39 +627,16 @@ impl DiskStorageEngine {
         }
     }
 
-    fn publish_live_block_updates(
+    fn enqueue_live_trace_updates_for_shard(
         &self,
-        prepared_rows: &[PreparedBlockRowMetadata],
-        prepared_shared_groups: &[PreparedSharedGroupMetadata],
-        row_locations: Vec<SegmentRowLocation>,
+        shard_index: usize,
+        updates: Vec<LiveTraceUpdate>,
     ) {
-        let updates_by_shard = collect_live_trace_updates_from_prepared_rows(
-            prepared_rows,
-            prepared_shared_groups,
-            row_locations,
-            self.trace_shards.len(),
-        );
-        self.enqueue_live_trace_updates(updates_by_shard);
-    }
-
-    fn publish_live_row_updates(
-        &self,
-        rows: &[TraceSpanRow],
-        row_locations: Vec<SegmentRowLocation>,
-    ) {
-        let shard_count = self.trace_shards.len();
-        let updates_by_shard =
-            collect_live_trace_updates_from_rows(rows, row_locations, shard_count);
-        self.enqueue_live_trace_updates(updates_by_shard);
-    }
-
-    fn enqueue_live_trace_updates(&self, updates_by_shard: Vec<Vec<LiveTraceUpdate>>) {
-        let mut pending = self.pending_trace_updates.lock();
-        for (shard_index, updates) in updates_by_shard.into_iter().enumerate() {
-            if !updates.is_empty() {
-                pending.push((shard_index, updates));
-            }
+        if updates.is_empty() {
+            return;
         }
+        let mut pending = self.pending_trace_updates.lock();
+        pending.push((shard_index, updates));
     }
 
     fn drain_pending_trace_updates(&self) {
@@ -682,14 +659,14 @@ impl DiskStorageEngine {
         prepared_block: &PreparedTraceBlockAppend,
         active_segment: &mut ActiveSegment,
         observed_segment_paths: &mut FxHashMap<u64, PathBuf>,
-    ) -> Result<Vec<SegmentRowLocation>, StorageError> {
+    ) -> Result<Vec<LiveTraceUpdate>, StorageError> {
         let block = &prepared_block.block;
         let prepared_rows = &prepared_block.prepared_rows;
         let prepared_shared_groups = &prepared_block.prepared_shared_groups;
         let encoded_row_bytes = &prepared_block.encoded_row_bytes;
         let encoded_row_ranges = &prepared_block.encoded_row_ranges;
         let row_count = block.row_count();
-        let mut row_locations = Vec::with_capacity(row_count);
+        let mut live_updates = Vec::new();
 
         let mut batch_start = 0usize;
         let mut pending_batch_bytes = 0u64;
@@ -708,7 +685,7 @@ impl DiskStorageEngine {
                     observed_segment_paths
                         .entry(active_segment.segment_id)
                         .or_insert_with(|| active_segment.wal_path.clone());
-                    let (batch_locations, bytes_written) = active_segment.append_block_rows(
+                    let (batch_updates, bytes_written) = active_segment.append_block_rows(
                         block,
                         prepared_rows,
                         prepared_shared_groups,
@@ -719,7 +696,7 @@ impl DiskStorageEngine {
                     )?;
                     self.persisted_bytes
                         .fetch_add(bytes_written, Ordering::Relaxed);
-                    row_locations.extend(batch_locations);
+                    merge_live_updates(&mut live_updates, batch_updates);
                 }
                 self.rotate_active_segment(active_segment)?;
                 batch_start = index;
@@ -735,7 +712,7 @@ impl DiskStorageEngine {
             observed_segment_paths
                 .entry(active_segment.segment_id)
                 .or_insert_with(|| active_segment.wal_path.clone());
-            let (batch_locations, bytes_written) = active_segment.append_block_rows(
+            let (batch_updates, bytes_written) = active_segment.append_block_rows(
                 block,
                 prepared_rows,
                 prepared_shared_groups,
@@ -746,10 +723,10 @@ impl DiskStorageEngine {
             )?;
             self.persisted_bytes
                 .fetch_add(bytes_written, Ordering::Relaxed);
-            row_locations.extend(batch_locations);
+            merge_live_updates(&mut live_updates, batch_updates);
         }
 
-        Ok(row_locations)
+        Ok(live_updates)
     }
 
     fn append_prepared_trace_blocks(
@@ -767,7 +744,7 @@ impl DiskStorageEngine {
         for prepared_block in &prepared_blocks {
             let mut active_segment_slot = self.active_segments[prepared_block.shard_index].lock();
             let active_segment = self.ensure_active_segment(&mut active_segment_slot)?;
-            let row_locations = self.append_prepared_trace_block(
+            let live_updates = self.append_prepared_trace_block(
                 prepared_block,
                 active_segment,
                 &mut observed_segment_paths,
@@ -778,16 +755,12 @@ impl DiskStorageEngine {
                 flush_count += 1;
             }
             drop(active_segment_slot);
-            published_updates.push(row_locations);
+            published_updates.push(live_updates);
         }
 
         self.publish_live_segment_paths(observed_segment_paths);
-        for (prepared_block, row_locations) in prepared_blocks.into_iter().zip(published_updates) {
-            self.publish_live_block_updates(
-                &prepared_block.prepared_rows,
-                &prepared_block.prepared_shared_groups,
-                row_locations,
-            );
+        for (prepared_block, live_updates) in prepared_blocks.into_iter().zip(published_updates) {
+            self.enqueue_live_trace_updates_for_shard(prepared_block.shard_index, live_updates);
         }
 
         if flush_count > 0 {
@@ -1451,7 +1424,7 @@ impl ActiveSegment {
         encoded_row_ranges: &[std::ops::Range<usize>],
         start_index: usize,
         end_index: usize,
-    ) -> Result<(Vec<SegmentRowLocation>, u64), StorageError> {
+    ) -> Result<(Vec<LiveTraceUpdate>, u64), StorageError> {
         if start_index >= end_index {
             return Ok((Vec::new(), 0));
         }
@@ -1526,14 +1499,14 @@ impl ActiveSegment {
             };
             row_locations.push(row_location);
         }
-        self.accumulator.observe_prepared_block_rows(
+        let live_updates = self.accumulator.observe_prepared_block_rows(
             &prepared_rows[start_index..end_index],
             prepared_shared_groups,
             &row_locations,
             &mut intern_cache,
         );
         self.accumulator.persisted_bytes += bytes_written;
-        Ok((row_locations, bytes_written))
+        Ok((live_updates, bytes_written))
     }
 
     fn read_rows(
@@ -1599,12 +1572,13 @@ impl SegmentAccumulator {
         prepared_shared_groups: &'a [PreparedSharedGroupMetadata],
         row_locations: &[SegmentRowLocation],
         intern_cache: &mut BatchInternCache<'a>,
-    ) {
+    ) -> Vec<LiveTraceUpdate> {
         if prepared_rows.is_empty() {
-            return;
+            return Vec::new();
         }
         debug_assert_eq!(prepared_rows.len(), row_locations.len());
 
+        let mut live_updates = Vec::new();
         let mut run_start = 0usize;
         while run_start < prepared_rows.len() {
             let trace_id = prepared_rows[run_start].trace_id.as_ref();
@@ -1614,14 +1588,17 @@ impl SegmentAccumulator {
             {
                 run_end += 1;
             }
-            self.observe_prepared_block_row_run(
+            if let Some(live_update) = self.observe_prepared_block_row_run(
                 &prepared_rows[run_start..run_end],
                 prepared_shared_groups,
                 &row_locations[run_start..run_end],
                 intern_cache,
-            );
+            ) {
+                live_updates.push(live_update);
+            }
             run_start = run_end;
         }
+        live_updates
     }
 
     fn observe_prepared_block_row_run<'a>(
@@ -1630,12 +1607,12 @@ impl SegmentAccumulator {
         prepared_shared_groups: &'a [PreparedSharedGroupMetadata],
         row_locations: &[SegmentRowLocation],
         intern_cache: &mut BatchInternCache<'a>,
-    ) {
+    ) -> Option<LiveTraceUpdate> {
         let Some(first_row) = prepared_rows.first() else {
-            return;
+            return None;
         };
         let Some(first_location) = row_locations.first() else {
-            return;
+            return None;
         };
         debug_assert_eq!(prepared_rows.len(), row_locations.len());
 
@@ -1659,11 +1636,19 @@ impl SegmentAccumulator {
                 .entry(trace_ref)
                 .or_insert_with(|| SegmentTraceAccumulator::new(start_unix_nano, end_unix_nano));
             trace.window.observe(start_unix_nano, end_unix_nano);
+            let mut live_update =
+                LiveTraceUpdate::new(first_row.trace_id.clone(), start_unix_nano, end_unix_nano);
             if let Some(service_ref) = service_ref {
                 push_unique_string_ref(&mut trace.services, service_ref);
             }
+            if let Some(service_name) = first_row.service.as_ref() {
+                push_unique_arc(&mut live_update.services, service_name.clone());
+            }
             if let Some(operation_ref) = operation_ref {
                 push_unique_string_ref(&mut trace.operations, operation_ref);
+            }
+            if let Some(operation_name) = first_row.operation.as_ref() {
+                push_unique_arc(&mut live_update.operations, operation_name.clone());
             }
             observe_prepared_row_indexed_fields(
                 first_row,
@@ -1674,10 +1659,16 @@ impl SegmentAccumulator {
                     let field_value_ref =
                         intern_cache.string_ref(&mut self.strings, field_value.as_ref());
                     push_unique_string_ref_pair(&mut trace.fields, field_name_ref, field_value_ref);
+                    push_unique_arc_pair(
+                        &mut live_update.indexed_fields,
+                        field_name.clone(),
+                        field_value.clone(),
+                    );
                 },
             );
             trace.rows.push(*first_location);
-            return;
+            live_update.row_locations.push(*first_location);
+            return Some(live_update);
         }
 
         let mut min_start_unix_nano = first_location.start_unix_nano;
@@ -1695,6 +1686,11 @@ impl SegmentAccumulator {
             SegmentTraceAccumulator::new(min_start_unix_nano, max_end_unix_nano)
         });
         trace.window.observe(min_start_unix_nano, max_end_unix_nano);
+        let mut live_update = LiveTraceUpdate::new(
+            first_row.trace_id.clone(),
+            min_start_unix_nano,
+            max_end_unix_nano,
+        );
 
         let mut batch_services = SmallVec::<[StringRef; 4]>::new();
         let mut batch_operations = SmallVec::<[StringRef; 4]>::new();
@@ -1704,6 +1700,7 @@ impl SegmentAccumulator {
                 let service_ref = intern_cache.string_ref(&mut self.strings, service_name.as_ref());
                 if !batch_services.contains(&service_ref) {
                     batch_services.push(service_ref);
+                    live_update.services.push(service_name.clone());
                 }
             }
             if let Some(operation_name) = prepared_row.operation.as_ref() {
@@ -1711,6 +1708,7 @@ impl SegmentAccumulator {
                     intern_cache.string_ref(&mut self.strings, operation_name.as_ref());
                 if !batch_operations.contains(&operation_ref) {
                     batch_operations.push(operation_ref);
+                    live_update.operations.push(operation_name.clone());
                 }
             }
             observe_prepared_row_indexed_fields(
@@ -1725,6 +1723,9 @@ impl SegmentAccumulator {
                         *existing_name == field_name_ref && *existing_value == field_value_ref
                     }) {
                         batch_fields.push((field_name_ref, field_value_ref));
+                        live_update
+                            .indexed_fields
+                            .push((field_name.clone(), field_value.clone()));
                     }
                 },
             );
@@ -1740,6 +1741,8 @@ impl SegmentAccumulator {
             push_unique_string_ref_pair(&mut trace.fields, field_name_ref, field_value_ref);
         }
         trace.rows.extend_from_slice(row_locations);
+        live_update.row_locations.extend_from_slice(row_locations);
+        Some(live_update)
     }
 
     fn observe_time_range(&mut self, start_unix_nano: i64, end_unix_nano: i64) {
@@ -2471,6 +2474,35 @@ fn push_unique_arc_pair(values: &mut SmallArcPairList, name: Arc<str>, value: Ar
         return;
     }
     values.push((name, value));
+}
+
+fn merge_live_updates(existing: &mut Vec<LiveTraceUpdate>, incoming: Vec<LiveTraceUpdate>) {
+    for mut incoming_update in incoming {
+        if let Some(existing_update) = existing
+            .iter_mut()
+            .find(|existing_update| existing_update.trace_id.as_ref() == incoming_update.trace_id.as_ref())
+        {
+            existing_update.observe_window(
+                incoming_update.start_unix_nano,
+                incoming_update.end_unix_nano,
+            );
+            for service_name in incoming_update.services.drain(..) {
+                push_unique_arc(&mut existing_update.services, service_name);
+            }
+            for operation_name in incoming_update.operations.drain(..) {
+                push_unique_arc(&mut existing_update.operations, operation_name);
+            }
+            for (field_name, field_value) in incoming_update.indexed_fields.drain(..) {
+                push_unique_arc_pair(&mut existing_update.indexed_fields, field_name, field_value);
+            }
+            merge_sorted_row_locations(
+                &mut existing_update.row_locations,
+                incoming_update.row_locations,
+            );
+        } else {
+            existing.push(incoming_update);
+        }
+    }
 }
 
 fn prepare_block_row_metadata(
@@ -4454,6 +4486,141 @@ mod tests {
                         location.end_unix_nano,
                     )
                 })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn segment_accumulator_returns_live_updates_without_rescanning_prepared_rows() {
+        let trace_shards = 4;
+        let block = TraceBlock::from_rows(vec![
+            trace_row(
+                "trace-live-1",
+                "span-1",
+                "op-a",
+                100,
+                150,
+                &[
+                    ("resource_attr:service.name", "checkout"),
+                    ("http.method", "GET"),
+                    ("http.status_code", "200"),
+                ],
+            ),
+            trace_row(
+                "trace-live-1",
+                "span-2",
+                "op-a",
+                160,
+                210,
+                &[
+                    ("resource_attr:service.name", "checkout"),
+                    ("http.method", "GET"),
+                    ("http.status_code", "200"),
+                ],
+            ),
+            trace_row(
+                "trace-live-1",
+                "span-3",
+                "op-b",
+                220,
+                260,
+                &[
+                    ("resource_attr:service.name", "checkout"),
+                    ("http.method", "POST"),
+                    ("span.kind", "server"),
+                ],
+            ),
+        ]);
+        let prepared_shared_groups = prepare_shared_group_metadata(&block);
+        let prepared_rows = prepare_block_row_metadata(&block, &prepared_shared_groups, trace_shards);
+        let row_locations = vec![
+            row(17, 0, 100, 150),
+            row(17, 1, 160, 210),
+            row(17, 2, 220, 260),
+        ];
+        let expected_updates_by_shard = collect_live_trace_updates_from_prepared_rows(
+            &prepared_rows,
+            &prepared_shared_groups,
+            row_locations.clone(),
+            trace_shards,
+        );
+        let shard_index = trace_shard_index("trace-live-1", trace_shards);
+
+        let mut accumulator = SegmentAccumulator::default();
+        let mut intern_cache = BatchInternCache::default();
+        let updates = accumulator.observe_prepared_block_rows(
+            &prepared_rows,
+            &prepared_shared_groups,
+            &row_locations,
+            &mut intern_cache,
+        );
+
+        assert_eq!(updates.len(), 1);
+        let update = &updates[0];
+        let expected = &expected_updates_by_shard[shard_index][0];
+        assert_eq!(update.trace_id.as_ref(), expected.trace_id.as_ref());
+        assert_eq!(update.start_unix_nano, expected.start_unix_nano);
+        assert_eq!(update.end_unix_nano, expected.end_unix_nano);
+        assert_eq!(
+            update
+                .row_locations
+                .iter()
+                .map(|location| {
+                    (
+                        location.segment_id,
+                        location.row_index,
+                        location.start_unix_nano,
+                        location.end_unix_nano,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            expected
+                .row_locations
+                .iter()
+                .map(|location| {
+                    (
+                        location.segment_id,
+                        location.row_index,
+                        location.start_unix_nano,
+                        location.end_unix_nano,
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            update
+                .services
+                .iter()
+                .map(|value| value.as_ref())
+                .collect::<Vec<_>>(),
+            expected
+                .services
+                .iter()
+                .map(|value| value.as_ref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            update
+                .operations
+                .iter()
+                .map(|value| value.as_ref())
+                .collect::<Vec<_>>(),
+            expected
+                .operations
+                .iter()
+                .map(|value| value.as_ref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            update
+                .indexed_fields
+                .iter()
+                .map(|(name, value)| (name.as_ref(), value.as_ref()))
+                .collect::<Vec<_>>(),
+            expected
+                .indexed_fields
+                .iter()
+                .map(|(name, value)| (name.as_ref(), value.as_ref()))
                 .collect::<Vec<_>>()
         );
     }

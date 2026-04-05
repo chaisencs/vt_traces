@@ -36,6 +36,12 @@
 - The current control plane now has explicit control peers, peer health probing, deterministic leader election, peer state anti-entropy with an epoch-bearing control snapshot, and a replicated control journal, but it is still admin-led rather than a consensus-backed metadata plane.
 - Server-side TLS and cluster HTTP clients now both support file-based hot reload, so rotated CA bundles and client identities can be picked up without process restart.
 - OTLP logs now fit the current product boundary cleanly because they can reuse the shared structured-row storage kernel without forcing a separate persistence stack; metrics still would not fit that way without a true series engine.
+- `vtbench otlp-protobuf-load` uses one trace per request with `spans-per-request` spans under that single trace id, so the single-trace prepared-row path is the dominant ingest hot path for the current benchmark shape.
+- The pure ingest benchmark does not call `drain_pending_trace_updates()` on the write path; the relevant disk hot spot is append-time live-update construction, not the later read-side drain itself.
+- Reusing `SegmentAccumulator::observe_prepared_block_rows` to emit `LiveTraceUpdate` values removed a second append-time scan over `prepared_rows` / `prepared_shared_groups` and restored the disk benchmark lead over official VictoriaTraces on the current machine.
+- Fresh same-host single run after the change: official `309768.282 spans/s` at `p99=1.132ms`, memory `323530.539 spans/s` at `p99=0.842ms`, disk `340055.678 spans/s` at `p99=0.793ms`.
+- Fresh same-host 5-round serial median after the change: official `321503.677 spans/s` at `p99=1.061ms`, memory `153990.072 spans/s` at `p99=1.819ms`, disk `346439.448 spans/s` at `p99=0.748ms`.
+- One disk round in the new 5-round run still collapsed (`159796.984 spans/s`, `p99=3.192ms`), and a post-run `/metrics` read took seconds because read-side drain still has to absorb pending live updates; the remaining performance risk is now mostly tail instability and read-path merge debt rather than average ingest throughput.
 
 ## Technical Decisions
 | Decision | Rationale |
@@ -49,6 +55,7 @@
 | Add row-oriented segments before columnar parts | It locks in recovery, rotation, and thin index behavior before optimizing the physical encoding |
 | Batch on-disk reads per segment before optimizing encodings | Avoids wasting I/O on per-row file open patterns that would distort later performance work |
 | Treat durability and backpressure as P0 before claiming production readiness | They define whether acknowledged writes are trustworthy and whether overload is survivable |
+| Reuse the append-time `SegmentAccumulator` scan to build live updates instead of rescanning prepared rows after append | It reduces duplicate work on the write hot path without changing ingest semantics or reintroducing the failed async worker experiment |
 
 ## Issues Encountered
 | Issue | Resolution |
@@ -57,6 +64,8 @@
 | Parent directory is not a git repository | Skip git actions and focus on filesystem changes/tests |
 | `cargo init` created nested repos | Remove child `.git` directories and use workspace root only |
 | `reqwest 0.12` pulled in transitive crates requiring newer Rust than 1.73 | Downgrade to `reqwest 0.11` and pin `url` / `idna` / `indexmap` in `Cargo.lock` via `cargo update --precise` |
+| The async shard-worker experiment regressed disk ingest badly compared with checkpoint `2fd0eca` | Restored the `2fd0eca` mainline first, then resumed optimization from the known-good synchronous path |
+| Earlier performance reasoning over-weighted `observe_live_updates` even though the benchmark is pure ingest | Rechecked the write path and targeted append-time live-update construction instead of the later read-side drain |
 
 ## Resources
 - Local clone from prior research:

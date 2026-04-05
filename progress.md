@@ -317,6 +317,20 @@
   - `rust_victoria_trace/crates/vtapi/src/app.rs`
   - `rust_victoria_trace/crates/vtapi/tests/http_api_tests.rs`
 
+### Phase 16: Disk Ingest Hot-Path Reuse
+- **Status:** complete
+- Actions taken:
+  - Reconfirmed that `vtbench otlp-protobuf-load` is a pure ingest benchmark and does not pay `drain_pending_trace_updates()` on the write path.
+  - Changed the disk append path to reuse the `SegmentAccumulator::observe_prepared_block_rows` scan for live-update construction instead of rescanning `prepared_rows` after append.
+  - Kept the request path synchronous and avoided reviving the rejected async shard-worker path.
+  - Added a regression test proving `SegmentAccumulator` now returns the same live updates the old rescan helper built.
+  - Re-ran fresh release builds plus same-host same-shape fresh single-run and 5-round stability benchmarks against official, memory, and disk.
+- Files created/modified:
+  - `rust_victoria_trace/crates/vtstorage/src/disk.rs`
+  - `rust_victoria_trace/progress.md`
+  - `rust_victoria_trace/task_plan.md`
+  - `rust_victoria_trace/findings.md`
+
 ## Test Results
 | Test | Input | Expected | Actual | Status |
 |------|-------|----------|--------|--------|
@@ -376,6 +390,11 @@
 | Duration bench query | `cargo run -p vtbench -- storage-query --traces=100 --spans-per-trace=3 --queries=500 --duration-secs=1` | query run prints latency percentiles | `ops_per_sec=4870.861`, `latency_p99_ms=0.630` | PASS |
 | Duration bench HTTP | `cargo run -p vtbench -- http-ingest --requests=20 --spans-per-request=2 --concurrency=4 --duration-secs=1` | HTTP run prints latency percentiles and actual completed request count | `ops_per_sec=9363.466`, `latency_p99_ms=0.756` | PASS |
 | Fault-injected bench HTTP | `cargo run -p vtbench -- http-ingest --requests=40 --spans-per-request=2 --concurrency=4 --duration-secs=2 --warmup-secs=1 --sample-interval-secs=1 --fault-after-secs=1 --fault-duration-secs=1 --report-file=./var/bench-http-fault.json` | benchmark emits p999, error count, and time-series report under an injected outage window | `ops_per_sec=16621.942`, `errors=12024`, `latency_p999_ms=1.516` | PASS |
+| Reused append-time live updates | `cargo test -p vtstorage segment_accumulator_returns_live_updates_without_rescanning_prepared_rows -- --exact --nocapture` | append-time accumulator emits the same live updates as the old rescan helper | 1 test passed | PASS |
+| Storage suite after hot-path reuse | `cargo test -p vtstorage -- --nocapture` | storage tests still pass after removing the append-time live-update rescan | all `vtstorage` tests passed | PASS |
+| Release build after hot-path reuse | `cargo build --release --target aarch64-apple-darwin -p vtapi -p vtbench` | optimized binaries build cleanly after hot-path change | build passed | PASS |
+| OTLP protobuf load benchmark (fresh single run) | `vtbench otlp-protobuf-load --duration-secs=5 --warmup-secs=1 --concurrency=32 --spans-per-request=5 --payload-variants=1024` against official/memory/disk | compare latest same-host ingest throughput and p99 after removing the append-time live-update rescan | official `309768.282 spans/s p99=1.132ms`, memory `323530.539 spans/s p99=0.842ms`, disk `340055.678 spans/s p99=0.793ms` | PASS |
+| OTLP protobuf load benchmark (5-round stability median) | same command, serial official -> memory -> disk for 5 rounds | capture stability after the hot-path change | official `321503.677 spans/s p99=1.061ms`, memory `153990.072 spans/s p99=1.819ms`, disk `346439.448 spans/s p99=0.748ms` | PASS |
 
 ## Error Log
 | Timestamp | Error | Attempt | Resolution |

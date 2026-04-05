@@ -4,7 +4,7 @@
 Build a production-oriented Rust rewrite of the VictoriaTraces core inside `rust_victoria_trace`, starting with a single-node ingest/storage/query vertical slice and an architecture that can expand to cluster mode later.
 
 ## Current Phase
-Phase 13
+Phase 14
 
 ## Phases
 
@@ -146,3 +146,4 @@ Phase 13
 - Part payloads, selective decode, operation-aware pruning, and repair/rebalance control loops are now in place.
 - The hardening pass through Phase 13 is now complete; the remaining risks are proof-level benchmark evidence and whether metrics should become a first-class series engine here.
 - Phase 14 is now focused on turning `vtbench` into a stronger soak/fault evidence path and deciding how far OTLP metrics should be brought into a trace/log-first product boundary.
+- The current disk ingest focus inside Phase 14 is hot-path reuse and tail-stability work on the synchronous mainline, not a return to the failed async shard-worker experiment.
