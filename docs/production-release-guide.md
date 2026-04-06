@@ -32,7 +32,54 @@ The GitHub Actions workflow does two different jobs on Linux:
 - native `x86_64` test + release build
 - cross-built `aarch64` release build
 
-When a tag matching `v*` is pushed, the workflow publishes tarball artifacts for both Linux targets.
+For the `x86_64` job, the workflow also builds the repository `Dockerfile` and smoke-checks `GET /healthz`.
+
+When a tag matching `v*` is pushed, the workflow publishes tarball artifacts and `.sha256` checksum files for both Linux targets.
+
+## Linux Binary Quickstart
+
+After tagging a release, GitHub Releases will publish:
+
+- `rust-victoria-trace-linux-x86_64.tar.gz`
+- `rust-victoria-trace-linux-x86_64.tar.gz.sha256`
+- `rust-victoria-trace-linux-aarch64.tar.gz`
+- `rust-victoria-trace-linux-aarch64.tar.gz.sha256`
+
+Typical `x86_64` startup:
+
+```bash
+RELEASE=v0.1.0
+curl -LO "https://github.com/chaisencs/vt_traces/releases/download/${RELEASE}/rust-victoria-trace-linux-x86_64.tar.gz"
+curl -LO "https://github.com/chaisencs/vt_traces/releases/download/${RELEASE}/rust-victoria-trace-linux-x86_64.tar.gz.sha256"
+sha256sum -c rust-victoria-trace-linux-x86_64.tar.gz.sha256
+tar -xzf rust-victoria-trace-linux-x86_64.tar.gz
+cd linux-x86_64
+VT_STORAGE_MODE=disk \
+VT_STORAGE_PATH=/var/lib/rust-victoria-trace \
+VT_STORAGE_SYNC_POLICY=data \
+VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608 \
+VT_MAX_REQUEST_BODY_BYTES=8388608 \
+VT_API_CONCURRENCY_LIMIT=1024 \
+./vtapi
+```
+
+Recommended first checks:
+
+- `curl http://127.0.0.1:13000/healthz`
+- `curl http://127.0.0.1:13000/metrics | head`
+- confirm WAL and `.part` files appear under the configured storage path
+
+## Container Quickstart
+
+The repository `Dockerfile` now runs as a non-root user and defaults to a production-biased disk configuration.
+
+```bash
+docker build -t rust-victoria-trace:local .
+docker run --rm \
+  -p 13000:13000 \
+  -v "$(pwd)/var/vt-docker:/var/lib/rust-victoria-trace" \
+  rust-victoria-trace:local
+```
 
 ## Production Runtime Recommendation
 
@@ -63,11 +110,13 @@ Before merging a formal version to `master`, require all of the following:
 2. `cargo build --release -p vtapi -p vtbench` passes
 3. GitHub Actions `linux-release` workflow is green on the branch
 4. Linux `x86_64` and `aarch64` artifacts are produced successfully
-5. Public docs are current:
+5. Docker smoke on Linux `x86_64` passes
+6. Release artifact checksums are generated successfully
+7. Public docs are current:
    - `README.md`
    - `docs/2026-04-06-otlp-ingest-performance-report.md`
    - this guide
-6. Benchmark evidence still shows disk above official on the agreed OTLP protobuf ingest shape
+8. Benchmark evidence still shows disk above official on the agreed OTLP protobuf ingest shape
 
 ## Current Validation Snapshot
 
@@ -79,14 +128,14 @@ The release-prep state for this repository has already passed these local checks
 - `docker buildx build --builder desktop-linux --platform linux/arm64 -t rust-victoria-trace:release-check-arm64 --load .`
 - `docker run --rm --platform linux/amd64 -p 13181:13000 rust-victoria-trace:release-check-amd64` + `GET /healthz`
 - `docker run --rm --platform linux/arm64 -p 13182:13000 rust-victoria-trace:release-check-arm64` + `GET /healthz`
+- branch GitHub Actions `linux-release` workflow succeeded on the release candidate branch
 
 That gives us direct evidence for:
 
 - workspace correctness on the current source tree
 - release binaries building successfully
 - the provided `Dockerfile` producing runnable Linux images for both common 64-bit targets
-
-The remaining merge gate that must still be observed after push is the branch-level GitHub Actions `linux-release` workflow result.
+- the branch-level Linux release workflow staying green with tests, release builds, Docker smoke, and artifact packaging
 
 ## Release Flow
 

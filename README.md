@@ -18,6 +18,63 @@
 - 仓库提供了开箱即用的容器构建入口：[Dockerfile](./Dockerfile)
 - merge 到 `master` 前，请按 [Production Release Guide](./docs/production-release-guide.md) 的 gate 逐项检查
 
+## 使用预构建 Linux Release
+
+打 tag 之后，GitHub Releases 会发布这四个 Linux 交付物：
+
+- `rust-victoria-trace-linux-x86_64.tar.gz`
+- `rust-victoria-trace-linux-x86_64.tar.gz.sha256`
+- `rust-victoria-trace-linux-aarch64.tar.gz`
+- `rust-victoria-trace-linux-aarch64.tar.gz.sha256`
+
+`x86_64` 节点的最小使用方式：
+
+```bash
+RELEASE=v0.1.0
+curl -LO "https://github.com/chaisencs/vt_traces/releases/download/${RELEASE}/rust-victoria-trace-linux-x86_64.tar.gz"
+curl -LO "https://github.com/chaisencs/vt_traces/releases/download/${RELEASE}/rust-victoria-trace-linux-x86_64.tar.gz.sha256"
+sha256sum -c rust-victoria-trace-linux-x86_64.tar.gz.sha256
+tar -xzf rust-victoria-trace-linux-x86_64.tar.gz
+cd linux-x86_64
+VT_STORAGE_MODE=disk \
+VT_STORAGE_PATH=/var/lib/rust-victoria-trace \
+VT_STORAGE_SYNC_POLICY=data \
+VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608 \
+VT_MAX_REQUEST_BODY_BYTES=8388608 \
+VT_API_CONCURRENCY_LIMIT=1024 \
+./vtapi
+```
+
+启动后先做两步检查：
+
+- `curl http://127.0.0.1:13000/healthz`
+- `curl http://127.0.0.1:13000/metrics | head`
+
+## 运行容器镜像
+
+仓库根目录的 `Dockerfile` 会构建一个 production-biased 的 disk-engine 运行镜像，默认启用：
+
+- `VT_STORAGE_MODE=disk`
+- `VT_STORAGE_SYNC_POLICY=data`
+- `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608`
+- `VT_MAX_REQUEST_BODY_BYTES=8388608`
+- `VT_API_CONCURRENCY_LIMIT=1024`
+
+本地构建和启动示例：
+
+```bash
+docker build -t rust-victoria-trace:local .
+docker run --rm \
+  -p 13000:13000 \
+  -v "$(pwd)/var/vt-docker:/var/lib/rust-victoria-trace" \
+  rust-victoria-trace:local
+```
+
+容器起来之后同样先检查：
+
+- `curl http://127.0.0.1:13000/healthz`
+- 确认挂载目录下出现 WAL 和 `.part` 文件
+
 ## 当前能力
 
 - 标准 OTLP/HTTP 写入路径 `POST /v1/traces`
