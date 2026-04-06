@@ -20,7 +20,7 @@ use std::{
     time::Duration,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::Barrier, task::JoinHandle};
 use tower::ServiceExt;
 use vtapi::{
     build_insert_router, build_router, build_router_with_limits, build_router_with_storage,
@@ -1118,8 +1118,16 @@ async fn background_rebalance_task_polls_select_admin_endpoint() {
     };
     let server = spawn_server(app).await;
     let task = spawn_background_rebalance_task(server.base_url.clone(), Duration::from_millis(50));
-
-    tokio::time::sleep(Duration::from_millis(220)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if rebalance_calls.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("background rebalance never polled admin endpoint");
     task.abort();
 
     assert!(rebalance_calls.load(Ordering::Relaxed) >= 1);
@@ -1127,20 +1135,32 @@ async fn background_rebalance_task_polls_select_admin_endpoint() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_insert_fanout_runs_remote_writes_in_parallel() {
-    let delay = Duration::from_millis(250);
+    let barrier = Arc::new(Barrier::new(2));
     let storage_a = spawn_server(Router::new().route(
         "/internal/v1/rows",
-        post(move || async move {
-            tokio::time::sleep(delay).await;
-            (StatusCode::OK, axum::Json(json!({ "ingested_rows": 1 })))
+        post({
+            let barrier = barrier.clone();
+            move || {
+                let barrier = barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    (StatusCode::OK, axum::Json(json!({ "ingested_rows": 1 })))
+                }
+            }
         }),
     ))
     .await;
     let storage_b = spawn_server(Router::new().route(
         "/internal/v1/rows",
-        post(move || async move {
-            tokio::time::sleep(delay).await;
-            (StatusCode::OK, axum::Json(json!({ "ingested_rows": 1 })))
+        post({
+            let barrier = barrier.clone();
+            move || {
+                let barrier = barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    (StatusCode::OK, axum::Json(json!({ "ingested_rows": 1 })))
+                }
+            }
         }),
     ))
     .await;
@@ -1151,9 +1171,9 @@ async fn cluster_insert_fanout_runs_remote_writes_in_parallel() {
     .expect("cluster config");
     let app = build_insert_router(cluster);
 
-    let started = Instant::now();
-    let response = app
-        .oneshot(
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        app.oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/traces/ingest")
@@ -1190,16 +1210,13 @@ async fn cluster_insert_fanout_runs_remote_writes_in_parallel() {
                     .to_string(),
                 ))
                 .unwrap(),
-        )
-        .await
-        .expect("parallel write request");
-    let elapsed = started.elapsed();
+        ),
+    )
+    .await
+    .expect("parallel replica writes never overlapped")
+    .expect("parallel write request");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        elapsed < Duration::from_millis(420),
-        "replica writes took too long: {elapsed:?}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3232,12 +3249,19 @@ async fn cluster_control_state_absorbs_fresher_peer_snapshot() {
 #[tokio::test]
 async fn cluster_leader_replication_exposes_control_journal() {
     let storage = spawn_server(build_storage_router(Arc::new(MemoryStorageEngine::new()))).await;
-    let local_addr = reserve_addr();
+    let first_addr = reserve_addr();
+    let second_addr = reserve_addr();
+    let (local_addr, remote_addr) = if first_addr.port() < second_addr.port() {
+        (first_addr, second_addr)
+    } else {
+        (second_addr, first_addr)
+    };
     let local_base_url = format!("http://{local_addr}");
     let appended_entries = Arc::new(Mutex::new(Vec::<Value>::new()));
     let remote_peer = {
         let appended_entries = appended_entries.clone();
-        spawn_server(
+        spawn_server_at(
+            remote_addr,
             Router::new()
                 .route("/healthz", get(|| async { "ok" }))
                 .route(
@@ -3283,6 +3307,9 @@ async fn cluster_leader_replication_exposes_control_journal() {
         .await
         .expect("leader request should succeed");
     assert_eq!(leader_response.status(), ReqwestStatusCode::OK);
+    let leader_body: Value = leader_response.json().await.expect("leader json");
+    assert_eq!(leader_body["leader"], local_base_url);
+    assert_eq!(leader_body["local"], true);
 
     let journal_response = client
         .get(select.url("/admin/v1/cluster/journal"))
