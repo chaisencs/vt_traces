@@ -320,25 +320,29 @@ fn batching_engine_trace_fast_path_preserves_all_concurrent_writes() {
 #[test]
 fn batching_engine_wait_window_coalesces_staggered_requests() {
     let inner = Arc::new(CountingEngine::default());
+    let start_barrier = Arc::new(Barrier::new(2));
     let engine = Arc::new(BatchingStorageEngine::with_config(
         inner.clone(),
         BatchingStorageConfig::default()
             .with_trace_shards(1)
             .with_max_trace_batch_blocks(64)
             .with_max_batch_rows(128)
-            .with_max_batch_wait(Duration::from_millis(25)),
+            .with_max_batch_wait(Duration::from_secs(1)),
     ));
 
     let first = {
         let engine = engine.clone();
+        let start_barrier = start_barrier.clone();
         thread::spawn(move || {
+            start_barrier.wait();
             engine
                 .append_rows(vec![make_row("trace-wait", "span-1", 100, 150)])
                 .expect("append first rows");
         })
     };
 
-    thread::sleep(Duration::from_millis(5));
+    start_barrier.wait();
+    thread::sleep(Duration::from_millis(20));
     engine
         .append_rows(vec![make_row("trace-wait", "span-2", 160, 210)])
         .expect("append second rows");

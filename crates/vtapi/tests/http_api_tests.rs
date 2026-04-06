@@ -3333,8 +3333,14 @@ async fn cluster_leader_replication_exposes_control_journal() {
 #[tokio::test]
 async fn cluster_rebalance_requires_local_control_leadership() {
     let storage = spawn_server(build_storage_router(Arc::new(MemoryStorageEngine::new()))).await;
-    let leader = spawn_server(Router::new().route("/healthz", get(|| async { "ok" }))).await;
-    let local_addr = reserve_addr();
+    let first_addr = reserve_addr();
+    let second_addr = reserve_addr();
+    let (leader_addr, local_addr) = if first_addr.port() < second_addr.port() {
+        (first_addr, second_addr)
+    } else {
+        (second_addr, first_addr)
+    };
+    let leader = spawn_server_at(leader_addr, Router::new().route("/healthz", get(|| async { "ok" }))).await;
     let local_base_url = format!("http://{local_addr}");
     let cluster = ClusterConfig::new(vec![storage.base_url.clone()], 1)
         .expect("cluster config")
