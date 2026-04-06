@@ -228,8 +228,7 @@ impl TraceBatchShard {
                 TraceBatchFlushReason::Wait
             };
             let batch_wait_micros = saturating_micros(batch[0].enqueued_at.elapsed().as_micros());
-            let (blocks, input_blocks, responders) =
-                build_trace_batch_payload(batch, payload_mode);
+            let (blocks, input_blocks, responders) = build_trace_batch_payload(batch, payload_mode);
             let output_blocks = blocks.len();
             self.stats.record_flush(
                 total_rows,
@@ -296,7 +295,8 @@ impl TraceBatchShard {
                 self.stats.record_dequeue(batch.len());
                 return Some(batch);
             }
-            self.ready.wait_for(&mut state, deadline.saturating_duration_since(now));
+            self.ready
+                .wait_for(&mut state, deadline.saturating_duration_since(now));
         }
     }
 }
@@ -344,12 +344,7 @@ impl BatchingStorageEngine {
                 enqueued_at: Instant::now(),
                 result_tx,
             };
-            self.trace_batches[shard_index].submit(
-                request,
-                &self.inner,
-                self.config,
-                payload_mode,
-            );
+            self.trace_batches[shard_index].submit(request, &self.inner, self.config, payload_mode);
             receivers.push(result_rx);
         }
 
@@ -363,12 +358,30 @@ impl BatchingStorageEngine {
         }
         Ok(())
     }
+
+    fn append_trace_blocks_direct(&self, blocks: Vec<TraceBlock>) -> Result<(), StorageError> {
+        let blocks: Vec<TraceBlock> = blocks
+            .into_iter()
+            .filter(|block| !block.is_empty())
+            .collect();
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        self.inner.append_trace_blocks(blocks)
+    }
+
+    fn bypass_trace_batching(&self) -> bool {
+        self.inner.trace_batch_payload_mode() == TraceBatchPayloadMode::Passthrough
+    }
 }
 
 impl StorageEngine for BatchingStorageEngine {
     fn append_trace_block(&self, block: TraceBlock) -> Result<(), StorageError> {
         if block.is_empty() {
             return Ok(());
+        }
+        if self.bypass_trace_batching() {
+            return self.inner.append_trace_blocks(vec![block]);
         }
         self.enqueue_trace_blocks(vec![block])
     }
@@ -461,12 +474,8 @@ impl StorageEngine for BatchingStorageEngine {
     }
 
     fn append_trace_blocks(&self, blocks: Vec<TraceBlock>) -> Result<(), StorageError> {
-        let blocks: Vec<TraceBlock> = blocks
-            .into_iter()
-            .filter(|block| !block.is_empty())
-            .collect();
-        if blocks.is_empty() {
-            return Ok(());
+        if self.bypass_trace_batching() {
+            return self.append_trace_blocks_direct(blocks);
         }
         self.enqueue_trace_blocks(blocks)
     }

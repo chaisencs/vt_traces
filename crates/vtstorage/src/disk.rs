@@ -1,11 +1,13 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
     io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    sync::mpsc,
     sync::Arc,
+    time::Instant,
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -112,6 +114,8 @@ pub struct DiskStorageEngine {
     segment_paths: RwLock<FxHashMap<u64, PathBuf>>,
     trace_shards: Vec<RwLock<DiskTraceShardState>>,
     pending_trace_updates: Mutex<Vec<(usize, Vec<LiveTraceUpdate>)>>,
+    append_combiners: Vec<Mutex<DiskTraceAppendCombinerState>>,
+    append_combiner_stats: Vec<DiskTraceAppendCombinerStats>,
     active_segments: Vec<Mutex<Option<ActiveSegment>>>,
     log_state: RwLock<LogIndexedState>,
     log_writer: Mutex<BufWriter<File>>,
@@ -282,6 +286,69 @@ impl<'a> BatchInternCache<'a> {
     }
 }
 
+#[derive(Debug)]
+struct DiskTraceAppendRequest {
+    prepared_blocks: Vec<PreparedTraceBlockAppend>,
+    input_blocks: usize,
+    row_count: usize,
+    enqueued_at: Instant,
+    result_tx: mpsc::Sender<Result<(), String>>,
+}
+
+#[derive(Debug, Default)]
+struct DiskTraceAppendCombinerState {
+    pending: VecDeque<DiskTraceAppendRequest>,
+    combining: bool,
+}
+
+#[derive(Debug, Default)]
+struct DiskTraceAppendCombinerStats {
+    queue_depth: AtomicU64,
+    max_queue_depth: AtomicU64,
+    flushes: AtomicU64,
+    rows: AtomicU64,
+    input_blocks: AtomicU64,
+    output_blocks: AtomicU64,
+    wait_micros_total: AtomicU64,
+    wait_micros_max: AtomicU64,
+    flush_due_to_wait: AtomicU64,
+}
+
+impl DiskTraceAppendCombinerStats {
+    fn record_enqueue(&self) {
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ =
+            self.max_queue_depth
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    (depth > current).then_some(depth)
+                });
+    }
+
+    fn record_dequeue(&self, count: usize) {
+        self.queue_depth.fetch_sub(count as u64, Ordering::Relaxed);
+    }
+
+    fn record_flush(&self, rows: usize, input_blocks: usize, wait_micros: u64) {
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        self.rows.fetch_add(rows as u64, Ordering::Relaxed);
+        self.input_blocks
+            .fetch_add(input_blocks as u64, Ordering::Relaxed);
+        self.output_blocks.fetch_add(1, Ordering::Relaxed);
+        self.wait_micros_total
+            .fetch_add(wait_micros, Ordering::Relaxed);
+        let _ =
+            self.wait_micros_max
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    (wait_micros > current).then_some(wait_micros)
+                });
+        self.flush_due_to_wait.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn saturating_micros(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
+}
+
 impl LiveTraceUpdate {
     fn new(trace_id: Arc<str>, start_unix_nano: i64, end_unix_nano: i64) -> Self {
         Self {
@@ -351,6 +418,57 @@ impl PreparedTraceBlockAppend {
             encoded_row_bytes,
             encoded_row_ranges,
         }
+    }
+}
+
+#[derive(Debug)]
+struct PreparedTraceShardBatch {
+    shard_index: usize,
+    prepared_shared_groups: Vec<PreparedSharedGroupMetadata>,
+    prepared_rows: Vec<PreparedBlockRowMetadata>,
+    encoded_row_bytes: Vec<u8>,
+    encoded_row_ranges: Vec<std::ops::Range<usize>>,
+}
+
+impl PreparedTraceShardBatch {
+    fn from_prepared_blocks(prepared_blocks: Vec<PreparedTraceBlockAppend>) -> Self {
+        let mut prepared_blocks = prepared_blocks.into_iter();
+        let first = prepared_blocks
+            .next()
+            .expect("prepared shard batch requires at least one block");
+        let mut batch = Self {
+            shard_index: first.shard_index,
+            prepared_shared_groups: first.prepared_shared_groups,
+            prepared_rows: first.prepared_rows,
+            encoded_row_bytes: first.encoded_row_bytes,
+            encoded_row_ranges: first.encoded_row_ranges,
+        };
+
+        for block in prepared_blocks {
+            debug_assert_eq!(block.shard_index, batch.shard_index);
+            let shared_group_base = batch.prepared_shared_groups.len();
+            let encoded_byte_base = batch.encoded_row_bytes.len();
+            batch
+                .prepared_shared_groups
+                .extend(block.prepared_shared_groups.into_iter());
+            batch
+                .prepared_rows
+                .extend(block.prepared_rows.into_iter().map(|mut prepared_row| {
+                    if let Some(shared_group_index) = prepared_row.shared_group_index {
+                        prepared_row.shared_group_index =
+                            Some(shared_group_index + shared_group_base);
+                    }
+                    prepared_row
+                }));
+            batch.encoded_row_ranges.extend(
+                block.encoded_row_ranges.into_iter().map(|range| {
+                    (range.start + encoded_byte_base)..(range.end + encoded_byte_base)
+                }),
+            );
+            batch.encoded_row_bytes.extend(block.encoded_row_bytes);
+        }
+
+        batch
     }
 }
 
@@ -485,6 +603,12 @@ impl DiskStorageEngine {
         let active_segments = (0..trace_shards)
             .map(|_| Mutex::new(None))
             .collect::<Vec<_>>();
+        let append_combiners = (0..trace_shards)
+            .map(|_| Mutex::new(DiskTraceAppendCombinerState::default()))
+            .collect::<Vec<_>>();
+        let append_combiner_stats = (0..trace_shards)
+            .map(|_| DiskTraceAppendCombinerStats::default())
+            .collect::<Vec<_>>();
         let log_writer = BufWriter::new(
             OpenOptions::new()
                 .create(true)
@@ -503,6 +627,8 @@ impl DiskStorageEngine {
                 .map(RwLock::new)
                 .collect(),
             pending_trace_updates: Mutex::new(Vec::new()),
+            append_combiners,
+            append_combiner_stats,
             active_segments,
             log_state: RwLock::new(log_state),
             log_writer: Mutex::new(log_writer),
@@ -654,16 +780,15 @@ impl DiskStorageEngine {
         }
     }
 
-    fn append_prepared_trace_block(
+    fn append_prepared_trace_rows(
         &self,
-        prepared_block: &PreparedTraceBlockAppend,
+        prepared_rows: &[PreparedBlockRowMetadata],
+        prepared_shared_groups: &[PreparedSharedGroupMetadata],
+        encoded_row_bytes: &[u8],
+        encoded_row_ranges: &[std::ops::Range<usize>],
         active_segment: &mut ActiveSegment,
         observed_segment_paths: &mut FxHashMap<u64, PathBuf>,
     ) -> Result<Vec<LiveTraceUpdate>, StorageError> {
-        let prepared_rows = &prepared_block.prepared_rows;
-        let prepared_shared_groups = &prepared_block.prepared_shared_groups;
-        let encoded_row_bytes = &prepared_block.encoded_row_bytes;
-        let encoded_row_ranges = &prepared_block.encoded_row_ranges;
         let row_count = prepared_rows.len();
         let mut live_updates = Vec::new();
 
@@ -726,6 +851,146 @@ impl DiskStorageEngine {
         Ok(live_updates)
     }
 
+    fn append_prepared_trace_shard_batch(
+        &self,
+        prepared_batch: &PreparedTraceShardBatch,
+        active_segment: &mut ActiveSegment,
+        observed_segment_paths: &mut FxHashMap<u64, PathBuf>,
+    ) -> Result<Vec<LiveTraceUpdate>, StorageError> {
+        self.append_prepared_trace_rows(
+            &prepared_batch.prepared_rows,
+            &prepared_batch.prepared_shared_groups,
+            &prepared_batch.encoded_row_bytes,
+            &prepared_batch.encoded_row_ranges,
+            active_segment,
+            observed_segment_paths,
+        )
+    }
+
+    fn append_prepared_trace_shard_batch_once(
+        &self,
+        prepared_batch: PreparedTraceShardBatch,
+    ) -> Result<(), StorageError> {
+        let mut observed_segment_paths = FxHashMap::default();
+        let mut flush_count = 0u64;
+        let mut active_segment_slot = self.active_segments[prepared_batch.shard_index].lock();
+        let active_segment = self.ensure_active_segment(&mut active_segment_slot)?;
+        let live_updates = self.append_prepared_trace_shard_batch(
+            &prepared_batch,
+            active_segment,
+            &mut observed_segment_paths,
+        )?;
+        if self.config.sync_policy.requires_sync()
+            && active_segment.flush(self.config.sync_policy)?
+        {
+            flush_count += 1;
+        }
+        drop(active_segment_slot);
+
+        self.publish_live_segment_paths(observed_segment_paths);
+        self.enqueue_live_trace_updates_for_shard(prepared_batch.shard_index, live_updates);
+        if flush_count > 0 {
+            self.fsync_operations
+                .fetch_add(flush_count, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn submit_prepared_trace_shard_blocks(
+        &self,
+        shard_index: usize,
+        prepared_blocks: Vec<PreparedTraceBlockAppend>,
+    ) -> Result<(), StorageError> {
+        if prepared_blocks.is_empty() {
+            return Ok(());
+        }
+        let input_blocks = prepared_blocks.len();
+        let row_count = prepared_blocks
+            .iter()
+            .map(|prepared_block| prepared_block.prepared_rows.len())
+            .sum();
+        let (result_tx, result_rx) = mpsc::channel();
+        let request = DiskTraceAppendRequest {
+            prepared_blocks,
+            input_blocks,
+            row_count,
+            enqueued_at: Instant::now(),
+            result_tx,
+        };
+        self.append_combiner_stats[shard_index].record_enqueue();
+        let should_combine = {
+            let mut state = self.append_combiners[shard_index].lock();
+            state.pending.push_back(request);
+            if state.combining {
+                false
+            } else {
+                state.combining = true;
+                true
+            }
+        };
+        if should_combine {
+            self.run_trace_append_combiner(shard_index);
+        }
+        result_rx
+            .recv()
+            .map_err(|error| {
+                StorageError::Message(format!("disk trace combiner dropped: {error}"))
+            })?
+            .map_err(StorageError::Message)
+    }
+
+    fn run_trace_append_combiner(&self, shard_index: usize) {
+        loop {
+            let requests = {
+                let mut state = self.append_combiners[shard_index].lock();
+                if state.pending.is_empty() {
+                    state.combining = false;
+                    return;
+                }
+                let mut requests = Vec::with_capacity(state.pending.len());
+                while let Some(request) = state.pending.pop_front() {
+                    requests.push(request);
+                }
+                self.append_combiner_stats[shard_index].record_dequeue(requests.len());
+                requests
+            };
+
+            let wait_micros = requests
+                .first()
+                .map(|request| saturating_micros(request.enqueued_at.elapsed().as_micros()))
+                .unwrap_or(0);
+            let input_blocks = requests
+                .iter()
+                .map(|request| request.input_blocks)
+                .sum::<usize>();
+            let row_count = requests
+                .iter()
+                .map(|request| request.row_count)
+                .sum::<usize>();
+            self.append_combiner_stats[shard_index].record_flush(
+                row_count,
+                input_blocks,
+                wait_micros,
+            );
+
+            let mut prepared_blocks = Vec::with_capacity(input_blocks);
+            let mut responders = Vec::with_capacity(requests.len());
+            for request in requests {
+                prepared_blocks.extend(request.prepared_blocks);
+                responders.push(request.result_tx);
+            }
+
+            let result = self
+                .append_prepared_trace_shard_batch_once(
+                    PreparedTraceShardBatch::from_prepared_blocks(prepared_blocks),
+                )
+                .map_err(|error| error.to_string());
+            for responder in responders {
+                let _ = responder.send(result.clone());
+            }
+        }
+    }
+
     fn append_prepared_trace_blocks(
         &self,
         prepared_blocks: Vec<PreparedTraceBlockAppend>,
@@ -734,35 +999,19 @@ impl DiskStorageEngine {
             return Ok(());
         }
 
-        let mut observed_segment_paths = FxHashMap::default();
-        let mut published_updates = Vec::with_capacity(prepared_blocks.len());
-        let mut flush_count = 0u64;
+        let mut prepared_blocks_by_shard = (0..self.trace_shards.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
 
-        for prepared_block in &prepared_blocks {
-            let mut active_segment_slot = self.active_segments[prepared_block.shard_index].lock();
-            let active_segment = self.ensure_active_segment(&mut active_segment_slot)?;
-            let live_updates = self.append_prepared_trace_block(
-                prepared_block,
-                active_segment,
-                &mut observed_segment_paths,
-            )?;
-            if self.config.sync_policy.requires_sync()
-                && active_segment.flush(self.config.sync_policy)?
-            {
-                flush_count += 1;
+        for prepared_block in prepared_blocks {
+            prepared_blocks_by_shard[prepared_block.shard_index].push(prepared_block);
+        }
+
+        for shard_blocks in prepared_blocks_by_shard {
+            if shard_blocks.is_empty() {
+                continue;
             }
-            drop(active_segment_slot);
-            published_updates.push(live_updates);
-        }
-
-        self.publish_live_segment_paths(observed_segment_paths);
-        for (prepared_block, live_updates) in prepared_blocks.into_iter().zip(published_updates) {
-            self.enqueue_live_trace_updates_for_shard(prepared_block.shard_index, live_updates);
-        }
-
-        if flush_count > 0 {
-            self.fsync_operations
-                .fetch_add(flush_count, Ordering::Relaxed);
+            self.submit_prepared_trace_shard_blocks(shard_blocks[0].shard_index, shard_blocks)?;
         }
         Ok(())
     }
@@ -986,6 +1235,53 @@ impl StorageEngine for DiskStorageEngine {
             segment_read_batches: self.segment_read_batches.load(Ordering::Relaxed),
             part_selective_decodes: self.part_selective_decodes.load(Ordering::Relaxed),
             fsync_operations: self.fsync_operations.load(Ordering::Relaxed),
+            trace_batch_queue_depth: self
+                .append_combiner_stats
+                .iter()
+                .map(|stats| stats.queue_depth.load(Ordering::Relaxed))
+                .sum(),
+            trace_batch_max_queue_depth: self
+                .append_combiner_stats
+                .iter()
+                .map(|stats| stats.max_queue_depth.load(Ordering::Relaxed))
+                .max()
+                .unwrap_or(0),
+            trace_batch_flushes: self
+                .append_combiner_stats
+                .iter()
+                .map(|stats| stats.flushes.load(Ordering::Relaxed))
+                .sum(),
+            trace_batch_rows: self
+                .append_combiner_stats
+                .iter()
+                .map(|stats| stats.rows.load(Ordering::Relaxed))
+                .sum(),
+            trace_batch_input_blocks: self
+                .append_combiner_stats
+                .iter()
+                .map(|stats| stats.input_blocks.load(Ordering::Relaxed))
+                .sum(),
+            trace_batch_output_blocks: self
+                .append_combiner_stats
+                .iter()
+                .map(|stats| stats.output_blocks.load(Ordering::Relaxed))
+                .sum(),
+            trace_batch_wait_micros_total: self
+                .append_combiner_stats
+                .iter()
+                .map(|stats| stats.wait_micros_total.load(Ordering::Relaxed))
+                .sum(),
+            trace_batch_wait_micros_max: self
+                .append_combiner_stats
+                .iter()
+                .map(|stats| stats.wait_micros_max.load(Ordering::Relaxed))
+                .max()
+                .unwrap_or(0),
+            trace_batch_flush_due_to_wait: self
+                .append_combiner_stats
+                .iter()
+                .map(|stats| stats.flush_due_to_wait.load(Ordering::Relaxed))
+                .sum(),
             ..StorageStatsSnapshot::default()
         }
     }
@@ -1346,76 +1642,6 @@ impl ActiveSegment {
             cached_payload_ranges: Vec::new(),
             cached_payload_bytes: Vec::new(),
         })
-    }
-
-    fn append_rows(
-        &mut self,
-        rows: &[TraceSpanRow],
-        encoded_rows: &[Vec<u8>],
-    ) -> Result<(Vec<SegmentRowLocation>, u64), StorageError> {
-        if rows.is_empty() {
-            return Ok((Vec::new(), 0));
-        }
-        if rows.len() != encoded_rows.len() {
-            return Err(StorageError::Message(
-                "row and payload batch length mismatch".to_string(),
-            ));
-        }
-
-        let first_write = self.accumulator.row_count == 0 && self.accumulator.persisted_bytes == 0;
-        let total_payload_bytes: usize = encoded_rows.iter().map(Vec::len).sum();
-        let bytes_written = wal_batch_storage_bytes(total_payload_bytes, rows.len())
-            + if first_write { WAL_HEADER_BYTES } else { 0 };
-        if first_write {
-            self.writer.write_all(WAL_MAGIC)?;
-            self.writer.write_all(&[WAL_VERSION_BATCHED_BINARY])?;
-        }
-
-        let batch_body_len: u32 = wal_batch_body_bytes(total_payload_bytes, rows.len())
-            .try_into()
-            .map_err(|_| {
-                StorageError::Message("trace wal batch body exceeds u32 length".to_string())
-            })?;
-        let row_count_bytes = (rows.len() as u32).to_le_bytes();
-        let mut checksum_hasher = crc32fast::Hasher::new();
-        checksum_hasher.update(&row_count_bytes);
-        for payload in encoded_rows {
-            checksum_hasher.update(&(payload.len() as u32).to_le_bytes());
-            checksum_hasher.update(payload);
-        }
-        self.writer.write_all(&batch_body_len.to_le_bytes())?;
-        self.writer
-            .write_all(&checksum_hasher.finalize().to_le_bytes())?;
-        self.writer.write_all(&row_count_bytes)?;
-
-        let cached_payload_base = self.cached_payload_bytes.len();
-        self.cached_payload_bytes.reserve(total_payload_bytes);
-        self.cached_payload_ranges.reserve(rows.len());
-        let mut next_cache_offset = cached_payload_base;
-
-        let mut row_locations = Vec::with_capacity(rows.len());
-        for (row, payload) in rows.iter().zip(encoded_rows.iter()) {
-            let payload_start = next_cache_offset;
-            self.cached_payload_bytes.extend_from_slice(payload);
-            next_cache_offset += payload.len();
-            self.cached_payload_ranges
-                .push(payload_start..next_cache_offset);
-            let row_location = SegmentRowLocation {
-                segment_id: self.segment_id.try_into().map_err(|_| {
-                    StorageError::Message("segment id exceeds u32 row-ref limit".to_string())
-                })?,
-                row_index: self.accumulator.row_count as u32,
-                start_unix_nano: row.start_unix_nano,
-                end_unix_nano: row.end_unix_nano,
-            };
-            self.writer
-                .write_all(&(payload.len() as u32).to_le_bytes())?;
-            self.writer.write_all(payload)?;
-            self.accumulator.observe_row(row, row_location);
-            row_locations.push(row_location);
-        }
-        self.accumulator.persisted_bytes += bytes_written;
-        Ok((row_locations, bytes_written))
     }
 
     fn append_block_rows(
@@ -2440,14 +2666,6 @@ fn partition_trace_block_by_shard(block: TraceBlock, trace_shards: usize) -> Vec
         .collect()
 }
 
-fn collect_live_indexed_fields(indexed_fields: &mut SmallArcPairList, row: &TraceSpanRow) {
-    for field in &row.fields {
-        if should_index_field(&field.name) {
-            observe_live_indexed_field(indexed_fields, field.name.clone(), field.value.clone());
-        }
-    }
-}
-
 fn observe_live_indexed_field(
     indexed_fields: &mut SmallArcPairList,
     field_name: Arc<str>,
@@ -2621,6 +2839,7 @@ fn observe_prepared_row_indexed_fields<'a>(
     }
 }
 
+#[cfg(test)]
 fn collect_live_trace_updates_from_prepared_rows(
     prepared_rows: &[PreparedBlockRowMetadata],
     prepared_shared_groups: &[PreparedSharedGroupMetadata],
@@ -2688,6 +2907,7 @@ fn collect_live_trace_updates_from_prepared_rows(
         .collect()
 }
 
+#[cfg(test)]
 fn collect_single_trace_live_update_from_prepared_rows(
     prepared_rows: &[PreparedBlockRowMetadata],
     prepared_shared_groups: &[PreparedSharedGroupMetadata],
@@ -2744,46 +2964,6 @@ fn collect_single_trace_live_update_from_prepared_rows(
     }
 
     Some((first_row.shard_index, update))
-}
-
-fn collect_live_trace_updates_from_rows(
-    rows: &[TraceSpanRow],
-    row_locations: Vec<SegmentRowLocation>,
-    trace_shards: usize,
-) -> Vec<Vec<LiveTraceUpdate>> {
-    let mut updates_by_trace: FxHashMap<Arc<str>, LiveTraceUpdate> = FxHashMap::default();
-    for (row, row_location) in rows.iter().zip(row_locations) {
-        let trace_id = Arc::<str>::from(row.trace_id.as_str());
-        let update = updates_by_trace.entry(trace_id.clone()).or_insert_with(|| {
-            LiveTraceUpdate::new(trace_id.clone(), row.start_unix_nano, row.end_unix_nano)
-        });
-        update.observe_window(row.start_unix_nano, row.end_unix_nano);
-        if let Some(service_name) = row.service_name() {
-            if !service_name.is_empty() && service_name != "-" {
-                push_unique_arc(&mut update.services, Arc::<str>::from(service_name));
-            }
-        }
-        if !row.name.is_empty() {
-            push_unique_arc(&mut update.operations, Arc::<str>::from(row.name.as_str()));
-        }
-        collect_live_indexed_fields(&mut update.indexed_fields, row);
-        update.row_locations.push(row_location);
-    }
-
-    partition_live_updates_by_shard(updates_by_trace, trace_shards)
-}
-
-fn partition_live_updates_by_shard(
-    updates_by_trace: FxHashMap<Arc<str>, LiveTraceUpdate>,
-    trace_shards: usize,
-) -> Vec<Vec<LiveTraceUpdate>> {
-    let mut updates_by_shard: Vec<Vec<LiveTraceUpdate>> =
-        (0..trace_shards.max(1)).map(|_| Vec::new()).collect();
-    for update in updates_by_trace.into_values() {
-        let shard_index = trace_shard_index(&update.trace_id, trace_shards);
-        updates_by_shard[shard_index].push(update);
-    }
-    updates_by_shard
 }
 
 fn merge_sorted_row_locations(
@@ -4098,8 +4278,8 @@ mod tests {
     use super::{
         collect_live_trace_updates_from_prepared_rows, merge_sorted_row_locations,
         prepare_block_row_metadata, prepare_shared_group_metadata, trace_block_shard_index,
-        trace_shard_index, BatchInternCache, SegmentAccumulator, SegmentRowLocation,
-        SegmentTraceAccumulator,
+        trace_shard_index, BatchInternCache, PreparedTraceBlockAppend, PreparedTraceShardBatch,
+        SegmentAccumulator, SegmentRowLocation, SegmentTraceAccumulator,
     };
     use serde_json::Value;
     use vtcore::{Field, TraceBlock, TraceSpanRow};
@@ -4358,6 +4538,96 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
+    }
+
+    #[test]
+    fn prepared_trace_shard_batch_concatenates_block_metadata_consistently() {
+        let trace_shards = 1;
+        let first = PreparedTraceBlockAppend::new(
+            TraceBlock::from_rows(vec![
+                trace_row(
+                    "trace-batch-block-1",
+                    "span-1",
+                    "op-a",
+                    100,
+                    150,
+                    &[
+                        ("resource_attr:service.name", "checkout"),
+                        ("http.method", "GET"),
+                    ],
+                ),
+                trace_row(
+                    "trace-batch-block-1",
+                    "span-2",
+                    "op-a",
+                    160,
+                    210,
+                    &[
+                        ("resource_attr:service.name", "checkout"),
+                        ("http.status_code", "200"),
+                    ],
+                ),
+            ]),
+            trace_shards,
+        );
+        let second = PreparedTraceBlockAppend::new(
+            TraceBlock::from_rows(vec![
+                trace_row(
+                    "trace-batch-block-2",
+                    "span-1",
+                    "op-b",
+                    300,
+                    350,
+                    &[
+                        ("resource_attr:service.name", "checkout"),
+                        ("http.method", "POST"),
+                    ],
+                ),
+                trace_row(
+                    "trace-batch-block-2",
+                    "span-2",
+                    "op-b",
+                    360,
+                    410,
+                    &[
+                        ("resource_attr:service.name", "checkout"),
+                        ("http.status_code", "201"),
+                    ],
+                ),
+            ]),
+            trace_shards,
+        );
+        let first_shared_groups = first.prepared_shared_groups.len();
+        let first_row_count = first.prepared_rows.len();
+        let second_row_count = second.prepared_rows.len();
+
+        let batch = PreparedTraceShardBatch::from_prepared_blocks(vec![first, second]);
+
+        assert_eq!(batch.shard_index, 0);
+        assert_eq!(
+            batch.prepared_rows.len(),
+            first_row_count + second_row_count
+        );
+        assert!(batch.prepared_shared_groups.len() >= first_shared_groups);
+        assert_eq!(
+            batch.encoded_row_ranges.len(),
+            first_row_count + second_row_count
+        );
+        assert_eq!(
+            batch
+                .encoded_row_ranges
+                .last()
+                .expect("encoded row range")
+                .end,
+            batch.encoded_row_bytes.len()
+        );
+        let second_block_first_row = &batch.prepared_rows[first_row_count];
+        if let Some(shared_group_index) = second_block_first_row.shared_group_index {
+            assert!(
+                shared_group_index >= first_shared_groups,
+                "second block shared-group indexes should be remapped behind the first block",
+            );
+        }
     }
 
     #[test]
@@ -4628,5 +4898,4 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
-
 }

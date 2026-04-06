@@ -48,6 +48,12 @@
 - Disk benefits from engine-specific passthrough batching: allowing disk to receive multi-block `append_trace_blocks(...)` batches without rebuilding one synthetic `TraceBlock` lifted fresh disk ingest into the low-`360k spans/s` range on the current host.
 - The lighter disk prepare path also benefits from dropping the retained source `TraceBlock` after `PreparedTraceBlockAppend::new`; keeping only prepared row metadata plus encoded row payloads preserved semantics while trimming work.
 - A deeper disk prepared-row-batch fusion attempt regressed hard enough to discard; the remaining gap to official is now inside the disk append kernel itself rather than in the shared batching envelope.
+- The cheap disk-local same-shard combiner works as intended: the request thread that wins the combiner lock can drain concurrent same-shard work and feed the shard-batch append kernel without reintroducing the failed async worker design.
+- Fresh clean-start single run after wiring the combiner: official `398170.042 spans/s` at `p99=0.666ms`, memory `344016.675 spans/s` at `p99=0.633ms`, disk `417535.483 spans/s` at `p99=0.422ms`.
+- Fresh clean-start 5-round serial median after wiring the combiner: official `342053.911 spans/s` at `p99=0.870ms`, memory `166741.431 spans/s` at `p99=1.713ms`, disk `354507.035 spans/s` at `p99=0.728ms`.
+- Post-run combiner metrics show only light but real coalescing on the HTTP path: input blocks `1414336`, output blocks `1409140`, and max queue depth `6`. That means the recovered lead is not coming from huge cross-request batches yet; it is coming from the cheaper handoff plus the existing shard-batch append kernel.
+- The first `/metrics` scrape after the 5-round disk run still took about `9.7s`, which is more evidence that read-side `drain_pending_trace_updates()` remains the next visible debt even though pure ingest throughput is back above official.
+- A disk-only `VT_STORAGE_TRACE_SHARDS` sweep (`4`, `8`, `16`) landed at about `336939`, `378300`, and `388392 spans/s` respectively, so reducing shard count is not the next win on this machine; the default high-shard setup is still best among the tested points.
 
 ## Technical Decisions
 | Decision | Rationale |
@@ -62,9 +68,15 @@
 | Batch on-disk reads per segment before optimizing encodings | Avoids wasting I/O on per-row file open patterns that would distort later performance work |
 | Treat durability and backpressure as P0 before claiming production readiness | They define whether acknowledged writes are trustworthy and whether overload is survivable |
 | Reuse the append-time `SegmentAccumulator` scan to build live updates instead of rescanning prepared rows after append | It reduces duplicate work on the write hot path without changing ingest semantics or reintroducing the failed async worker experiment |
-| Put the next "big leap" on batching-layer per-shard trace microbatches with worker-side coalescing | It is shared by memory and disk, matches the current benchmark shape, and has objective metrics/gates to tell us quickly whether the route is real |
+| Treat batching-layer per-shard trace microbatches as a bounded experiment, not a committed architecture | It was worth testing because it matched the benchmark shape, but the same-host A/B now shows it should not remain the primary disk direction |
 | Keep engine-specific trace batch payload modes | Memory needs coalesced blocks to reduce retained heap block count; disk performs better when it receives passthrough multi-block appends |
 | Reject positive microbatch waits on the current mainline | Measured `50us` / `100us` waits increased coalescing ratios but reduced actual ingest throughput |
+| Reject the outer trace microbatch layer as the main disk leap vehicle | Same-host A/B against `2fd0eca` and `f326503` shows the retained `816e523` path regresses disk because it adds batching overhead without changing the disk engine's physical append unit |
+| Put the next "big leap" on a disk-internal prepared shard batch writer, not another envelope rewrite | The current disk engine still appends block by block even when it receives multiple blocks, so the only high-value next step is to amortize WAL and live-update work inside the append kernel itself |
+| Recovering the direct disk path plus adding a shard-batch append kernel restores the `f326503` direct-write band, but not the end-to-end HTTP ingest lead over official | Same-host disk-only A/B put current head back near `f326503`, yet fresh HTTP ingest still landed around `302830 spans/s`, so the remaining gap is exposing bigger same-shard batches cheaply on the write path, not more inner append cleanup alone |
+| The disk kernel now shows meaningful direct multi-block scaling | The new `vtbench disk-trace-block-append` harness improved from about `1.29M spans/s` at `1 block/append` to about `1.74M spans/s` at `16 blocks/append`, which is enough evidence that larger same-shard append packets are worth feeding into disk |
+| Keep the cheap same-shard combiner on the disk mainline | It recovers disk above official on both fresh single-run and fresh 5-round median without reintroducing the async worker / positive-wait regressions |
+| Do not spend the next round lowering `trace_shards` | A fresh disk-only sweep shows `16` shards outperform `8` and `4`, so lower shard counts would reduce throughput on this host rather than unlock bigger combiner wins |
 
 ## Issues Encountered
 | Issue | Resolution |

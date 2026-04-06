@@ -1,10 +1,11 @@
 use std::{
     collections::BTreeMap,
     env, fs,
+    hash::{Hash, Hasher},
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context};
@@ -16,20 +17,24 @@ use axum::{
 };
 use bytes::Bytes;
 use reqwest::Client;
+use rustc_hash::FxHasher;
 use serde_json::json;
 use vtapi::build_router_with_storage_and_limits;
-use vtcore::{Field, TraceSearchRequest, TraceSpanRow};
+use vtcore::{Field, TraceBlock, TraceSearchRequest, TraceSpanRow};
 use vtingest::{
     encode_export_trace_service_request_protobuf, AttributeValue, ExportTraceServiceRequest,
     KeyValue, ResourceSpans, ScopeSpans, SpanRecord, Status,
 };
-use vtstorage::{BatchingStorageConfig, BatchingStorageEngine, MemoryStorageEngine, StorageEngine};
+use vtstorage::{
+    BatchingStorageConfig, BatchingStorageEngine, DiskStorageConfig, DiskStorageEngine,
+    DiskSyncPolicy, MemoryStorageEngine, StorageEngine,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
     let mode = args.next().ok_or_else(|| {
-        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load> [--key=value ...]")
+        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load|disk-trace-block-append> [--key=value ...]")
     })?;
     let options = parse_options(args)?;
 
@@ -38,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         "storage-query" => run_storage_query(options),
         "http-ingest" => run_http_ingest(options).await,
         "otlp-protobuf-load" => run_otlp_protobuf_load(options).await,
+        "disk-trace-block-append" => run_disk_trace_block_append(options),
         _ => bail!("unknown mode: {mode}"),
     }
 }
@@ -410,16 +416,108 @@ async fn run_otlp_protobuf_load(options: BenchOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_disk_trace_block_append(options: BenchOptions) -> anyhow::Result<()> {
+    let requests = options.requests.max(1);
+    let blocks_per_append = options.blocks_per_append.max(1);
+    let spans_per_block = options.spans_per_block.max(1);
+    let trace_shards = options.trace_shards.max(1);
+    let payload_variants = options.payload_variants.max(1);
+    let data_path = temp_bench_dir("disk-trace-block-append");
+    let storage = DiskStorageEngine::open_with_config(
+        &data_path,
+        DiskStorageConfig::default()
+            .with_sync_policy(DiskSyncPolicy::None)
+            .with_trace_shards(trace_shards),
+    )?;
+    let payloads = make_same_shard_trace_block_payload_variants(
+        payload_variants,
+        blocks_per_append,
+        spans_per_block,
+        trace_shards,
+        0,
+    )?;
+    let started = Instant::now();
+    let deadline = options
+        .duration_secs
+        .map(Duration::from_secs)
+        .map(|duration| started + duration);
+    let mut latencies = LatencySummary::default();
+    let mut timeline = TimelineSummary::new(sample_interval(&options));
+    let mut request_index = 0usize;
+    let operations_per_append = blocks_per_append * spans_per_block;
+    let warmup_deadline = options
+        .warmup_secs
+        .map(Duration::from_secs)
+        .map(|duration| started + duration);
+    let mut measured_started = None;
+
+    while request_index < requests
+        || deadline
+            .map(|deadline| Instant::now() < deadline)
+            .unwrap_or(false)
+    {
+        let batch = payloads[request_index % payloads.len()].clone();
+        let append_started = Instant::now();
+        storage.append_trace_blocks(batch)?;
+        if warmup_deadline
+            .map(|deadline| Instant::now() >= deadline)
+            .unwrap_or(true)
+        {
+            if measured_started.is_none() {
+                measured_started = Some(Instant::now());
+            }
+            let latency = append_started.elapsed();
+            latencies.record(latency);
+            if let Some(measured_started) = measured_started {
+                timeline.record(
+                    measured_started.elapsed(),
+                    latency,
+                    operations_per_append,
+                    true,
+                );
+            }
+        }
+        request_index += 1;
+    }
+    let elapsed = measured_started
+        .map(|started| started.elapsed())
+        .unwrap_or_else(|| started.elapsed());
+    let operations = request_index * operations_per_append;
+    drop(storage);
+    fs::remove_dir_all(&data_path).with_context(|| format!("remove {}", data_path.display()))?;
+
+    print_summary_and_report(
+        &options,
+        "disk-trace-block-append",
+        operations,
+        elapsed,
+        &[
+            ("requests", request_index.to_string()),
+            ("blocks_per_append", blocks_per_append.to_string()),
+            ("spans_per_block", spans_per_block.to_string()),
+            ("trace_shards", trace_shards.to_string()),
+            ("payload_variants", payload_variants.to_string()),
+        ],
+        Some(&latencies),
+        &timeline,
+        0,
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct BenchOptions {
     rows: usize,
     batch_size: usize,
+    blocks_per_append: usize,
     traces: usize,
     spans_per_trace: usize,
     queries: usize,
     requests: usize,
     spans_per_request: usize,
+    spans_per_block: usize,
     payload_variants: usize,
+    trace_shards: usize,
     concurrency: usize,
     url: Option<String>,
     duration_secs: Option<u64>,
@@ -435,12 +533,15 @@ impl Default for BenchOptions {
         Self {
             rows: 100_000,
             batch_size: 1_000,
+            blocks_per_append: 1,
             traces: 10_000,
             spans_per_trace: 5,
             queries: 50_000,
             requests: 2_000,
             spans_per_request: 5,
+            spans_per_block: 5,
             payload_variants: 1024,
+            trace_shards: 1,
             concurrency: 32,
             url: None,
             duration_secs: None,
@@ -463,12 +564,15 @@ fn parse_options(args: impl Iterator<Item = String>) -> anyhow::Result<BenchOpti
         match key {
             "rows" => options.rows = value.parse()?,
             "batch-size" => options.batch_size = value.parse()?,
+            "blocks-per-append" => options.blocks_per_append = value.parse()?,
             "traces" => options.traces = value.parse()?,
             "spans-per-trace" => options.spans_per_trace = value.parse()?,
             "queries" => options.queries = value.parse()?,
             "requests" => options.requests = value.parse()?,
             "spans-per-request" => options.spans_per_request = value.parse()?,
+            "spans-per-block" => options.spans_per_block = value.parse()?,
             "payload-variants" => options.payload_variants = value.parse()?,
+            "trace-shards" => options.trace_shards = value.parse()?,
             "concurrency" => options.concurrency = value.parse()?,
             "url" => options.url = Some(value.to_string()),
             "duration-secs" => options.duration_secs = Some(value.parse()?),
@@ -603,6 +707,97 @@ fn make_otlp_protobuf_payload(
     Ok(Bytes::from(encode_export_trace_service_request_protobuf(
         &request,
     )?))
+}
+
+fn make_same_shard_trace_block_payload_variants(
+    payload_variants: usize,
+    blocks_per_append: usize,
+    spans_per_block: usize,
+    trace_shards: usize,
+    shard_index: usize,
+) -> anyhow::Result<Vec<Vec<TraceBlock>>> {
+    let trace_ids = trace_ids_for_shard(
+        trace_shards,
+        shard_index,
+        payload_variants * blocks_per_append,
+    );
+    let mut next_trace = 0usize;
+    let mut payloads = Vec::with_capacity(payload_variants);
+    for request_index in 0..payload_variants {
+        let mut blocks = Vec::with_capacity(blocks_per_append);
+        for block_offset in 0..blocks_per_append {
+            blocks.push(make_same_shard_trace_block(
+                request_index,
+                block_offset,
+                blocks_per_append,
+                &trace_ids[next_trace],
+                spans_per_block,
+            )?);
+            next_trace += 1;
+        }
+        payloads.push(blocks);
+    }
+    Ok(payloads)
+}
+
+fn make_same_shard_trace_block(
+    request_index: usize,
+    block_offset: usize,
+    blocks_per_append: usize,
+    trace_id: &str,
+    spans_per_block: usize,
+) -> anyhow::Result<TraceBlock> {
+    let mut rows = Vec::with_capacity(spans_per_block);
+    let absolute_block_index = request_index * blocks_per_append + block_offset;
+    for span_offset in 0..spans_per_block {
+        let absolute_index = absolute_block_index * spans_per_block + span_offset;
+        rows.push(TraceSpanRow::new(
+            trace_id.to_string(),
+            format!("span-block-{request_index:08}-{block_offset:04}-{span_offset:04}"),
+            None,
+            "GET /checkout",
+            (absolute_index as i64) * 100,
+            (absolute_index as i64) * 100 + 75,
+            vec![
+                Field::new("resource_attr:service.name", "checkout"),
+                Field::new("span_attr:http.method", "GET"),
+                Field::new("span_attr:http.route", "/checkout"),
+            ],
+        )?);
+    }
+    Ok(TraceBlock::from_rows(rows))
+}
+
+fn trace_ids_for_shard(trace_shards: usize, shard_index: usize, count: usize) -> Vec<String> {
+    let mut trace_ids = Vec::with_capacity(count);
+    let mut candidate = 0usize;
+    while trace_ids.len() < count {
+        let trace_id = format!("trace-bench-shard-{candidate}");
+        if trace_shard_index(&trace_id, trace_shards) == shard_index {
+            trace_ids.push(trace_id);
+        }
+        candidate += 1;
+    }
+    trace_ids
+}
+
+fn trace_shard_index(trace_id: &str, trace_shards: usize) -> usize {
+    if trace_shards <= 1 {
+        return 0;
+    }
+    let mut hasher = FxHasher::default();
+    trace_id.hash(&mut hasher);
+    (hasher.finish() as usize) % trace_shards
+}
+
+fn temp_bench_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("rust-vt-bench-{name}-{nanos}"));
+    fs::create_dir_all(&path).expect("create temp dir");
+    path
 }
 
 #[derive(Debug, Default)]
@@ -823,7 +1018,10 @@ fn format_socket_addr(addr: SocketAddr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{make_otlp_protobuf_payload_variants, parse_options, LatencySummary};
+    use super::{
+        make_otlp_protobuf_payload_variants, make_same_shard_trace_block_payload_variants,
+        parse_options, trace_shard_index, LatencySummary,
+    };
     use std::time::Duration;
     use vtingest::decode_export_trace_service_request_protobuf;
 
@@ -875,6 +1073,45 @@ mod tests {
             options.url.as_deref(),
             Some("http://127.0.0.1:13000/v1/traces")
         );
+    }
+
+    #[test]
+    fn parse_options_reads_direct_disk_trace_block_knobs() {
+        let options = parse_options(
+            [
+                "--blocks-per-append=8".to_string(),
+                "--spans-per-block=5".to_string(),
+                "--trace-shards=4".to_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("options should parse");
+
+        assert_eq!(options.blocks_per_append, 8);
+        assert_eq!(options.spans_per_block, 5);
+        assert_eq!(options.trace_shards, 4);
+    }
+
+    #[test]
+    fn direct_trace_block_payload_variants_stay_on_requested_shard() {
+        let payloads = make_same_shard_trace_block_payload_variants(2, 3, 4, 4, 2)
+            .expect("trace block payloads should build");
+
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads.iter().all(|payload| payload.len() == 3));
+        assert!(payloads
+            .iter()
+            .flat_map(|payload| payload.iter())
+            .all(|block| block.row_count() == 4));
+        assert!(payloads
+            .iter()
+            .flat_map(|payload| payload.iter())
+            .all(|block| {
+                block
+                    .trace_ids
+                    .iter()
+                    .all(|trace_id| trace_shard_index(trace_id.as_ref(), 4) == 2)
+            }));
     }
 
     #[test]

@@ -454,7 +454,7 @@ fn batching_engine_trace_blocks_use_direct_inner_append_path() {
 }
 
 #[test]
-fn batching_engine_can_preserve_multiple_blocks_for_passthrough_engines() {
+fn batching_engine_bypasses_outer_trace_batch_for_passthrough_engines() {
     let inner = Arc::new(PassthroughTraceBlockEngine::default());
     let engine = Arc::new(BatchingStorageEngine::with_config(
         inner.clone(),
@@ -480,13 +480,21 @@ fn batching_engine_can_preserve_multiple_blocks_for_passthrough_engines() {
         .expect("append second rows");
     first.join().expect("join first append");
 
-    assert_eq!(inner.append_trace_blocks_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        inner.append_trace_blocks_calls.load(Ordering::Relaxed),
+        2,
+        "passthrough engines should bypass outer trace batching and append each request directly",
+    );
     assert_eq!(
         inner.appended_block_count.load(Ordering::Relaxed),
         2,
-        "passthrough engines should receive the whole batch without trace-block coalescing",
+        "passthrough engines should still preserve the caller's block boundaries",
     );
     assert_eq!(inner.appended_row_count.load(Ordering::Relaxed), 2);
+    let stats = engine.stats();
+    assert_eq!(stats.trace_batch_flushes, 0);
+    assert_eq!(stats.trace_batch_input_blocks, 0);
+    assert_eq!(stats.trace_batch_output_blocks, 0);
 }
 
 #[test]

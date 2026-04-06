@@ -154,5 +154,12 @@ Phase 17
 - The hardening pass through Phase 13 is now complete; the remaining risks are proof-level benchmark evidence and whether metrics should become a first-class series engine here.
 - Phase 14 is now focused on turning `vtbench` into a stronger soak/fault evidence path and deciding how far OTLP metrics should be brought into a trace/log-first product boundary.
 - The current disk ingest focus inside Phase 14 is hot-path reuse and tail-stability work on the synchronous mainline, not a return to the failed async shard-worker experiment.
-- The next performance push is explicitly centered on batching-layer trace microbatches with metrics-backed go/no-go gates, not another speculative disk-only async rewrite.
-- The current retained branch state keeps the batching-layer combiner, disk passthrough batches, and the lighter disk prepare path; the next unresolved bottleneck is now inside the disk append kernel rather than in outer request batching.
+- The trace-microbatch route was worth testing because it matched the request shape, but it is no longer the primary disk direction after the same-host review.
+- The remaining high-value performance path is now inside the disk append kernel itself, not in another outer request-batching rewrite.
+- Same-host review now shows the retained outer trace microbatch layer regresses disk versus both `2fd0eca` and `f326503`; the next execution plan is to recover the faster direct disk path first, then pursue a disk-internal prepared shard batch writer instead of extending the batching envelope.
+- Recovery line is now in place: passthrough engines bypass outer trace batching again, and disk-only same-host A/B puts current head back near the `f326503` direct-write band.
+- The new `vtbench disk-trace-block-append` harness now proves the disk kernel scales materially with larger same-shard append packets; the next unresolved task is exposing that gain to end-to-end HTTP ingest with a cheaper handoff than the rejected outer microbatch layer.
+- The cheap disk-local same-shard combiner is now in place and passes its dedicated concurrency regression test.
+- Fresh clean-start benchmarking now has disk back above official on both fresh single-run (`417535 spans/s` vs `398170`) and fresh 5-round median (`354507` vs `342053`) with better p99 in both cases.
+- The recovered lead is still not a large cushion because the combiner only reduced disk output blocks from `1414336` input blocks to `1409140` output blocks across the 5-round run; the next real bottleneck is still forming materially larger same-shard append packets cheaply and paying down read-side drain debt.
+- A fresh disk-only `VT_STORAGE_TRACE_SHARDS=4/8/16` sweep shows `16` shards still wins on this host, so shard-count reduction is not the next high-value move.

@@ -1392,6 +1392,7 @@ dependencies = [
  "axum",
  "bytes",
  "reqwest",
+ "rustc-hash",
  "serde_json",
  "tokio",
  "vtapi",

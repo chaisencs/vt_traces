@@ -3,6 +3,8 @@ use std::{
     fs::File,
     io::Write,
     path::PathBuf,
+    sync::{Arc, Barrier},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -88,6 +90,100 @@ fn disk_engine_accepts_trace_blocks_without_row_materialization_path() {
     assert_eq!(rows[0].span_id, "span-1");
     assert_eq!(rows[1].span_id, "span-2");
 
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_accepts_multiple_trace_blocks_in_one_append() {
+    let path = temp_test_dir("trace-block-batch-append");
+    let engine = DiskStorageEngine::open(&path).expect("open disk engine");
+    engine
+        .append_trace_blocks(vec![
+            TraceBlock::from_rows(vec![
+                make_row("trace-block-batch-1", "span-1", 100, 150),
+                make_row("trace-block-batch-1", "span-2", 160, 210),
+            ]),
+            TraceBlock::from_rows(vec![
+                make_row("trace-block-batch-2", "span-1", 300, 350),
+                make_row("trace-block-batch-2", "span-2", 360, 410),
+            ]),
+        ])
+        .expect("append trace blocks");
+
+    let first_window = engine
+        .trace_window("trace-block-batch-1")
+        .expect("first trace window exists");
+    let first_rows = engine.rows_for_trace(
+        "trace-block-batch-1",
+        first_window.start_unix_nano,
+        first_window.end_unix_nano,
+    );
+    assert_eq!(first_rows.len(), 2);
+    assert_eq!(first_rows[0].span_id, "span-1");
+    assert_eq!(first_rows[1].span_id, "span-2");
+
+    let second_window = engine
+        .trace_window("trace-block-batch-2")
+        .expect("second trace window exists");
+    let second_rows = engine.rows_for_trace(
+        "trace-block-batch-2",
+        second_window.start_unix_nano,
+        second_window.end_unix_nano,
+    );
+    assert_eq!(second_rows.len(), 2);
+    assert_eq!(second_rows[0].span_id, "span-1");
+    assert_eq!(second_rows[1].span_id, "span-2");
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_combines_concurrent_same_shard_block_appends() {
+    let path = temp_test_dir("trace-block-combiner");
+    let engine = Arc::new(
+        DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default().with_trace_shards(1),
+        )
+        .expect("open disk engine"),
+    );
+    let workers = 16;
+    let barrier = Arc::new(Barrier::new(workers));
+    let mut handles = Vec::new();
+
+    for worker in 0..workers {
+        let engine = engine.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            engine
+                .append_trace_blocks(vec![TraceBlock::from_rows(vec![
+                    make_row(&format!("trace-combiner-{worker}"), "span-1", 100, 150),
+                    make_row(&format!("trace-combiner-{worker}"), "span-2", 160, 210),
+                ])])
+                .expect("append trace blocks");
+        }));
+    }
+
+    for handle in handles {
+        handle.join().expect("join worker");
+    }
+
+    let stats = engine.stats();
+    assert!(
+        stats.trace_batch_flushes > 0,
+        "disk combiner should report at least one combined flush",
+    );
+    assert!(
+        stats.trace_batch_input_blocks >= workers as u64,
+        "disk combiner should see all input blocks",
+    );
+    assert!(
+        stats.trace_batch_output_blocks < stats.trace_batch_input_blocks,
+        "disk combiner should reduce physical append batches below input block count",
+    );
+
+    drop(engine);
     fs::remove_dir_all(path).expect("cleanup temp dir");
 }
 
