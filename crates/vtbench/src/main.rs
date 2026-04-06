@@ -18,7 +18,7 @@ use axum::{
 use bytes::Bytes;
 use reqwest::Client;
 use rustc_hash::FxHasher;
-use serde_json::json;
+use serde_json::{json, Value};
 use vtapi::build_router_with_storage_and_limits;
 use vtcore::{Field, TraceBlock, TraceSearchRequest, TraceSpanRow};
 use vtingest::{
@@ -30,31 +30,40 @@ use vtstorage::{
     DiskSyncPolicy, MemoryStorageEngine, StorageEngine,
 };
 
+mod replay;
+mod report;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut args = env::args().skip(1);
-    let mode = args.next().ok_or_else(|| {
+    let raw_args = env::args().skip(1).collect::<Vec<_>>();
+    let (mode, option_args) = raw_args.split_first().ok_or_else(|| {
         anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load|disk-trace-block-append> [--key=value ...]")
     })?;
-    let options = parse_options(args)?;
+    let options = parse_options(option_args.iter().cloned())?;
+    let replay_metadata = replay::ReplayMetadata::capture(mode, option_args)?;
+    validate_preflight(mode, &options, &replay_metadata)?;
 
     match mode.as_str() {
-        "storage-ingest" => run_storage_ingest(options),
-        "storage-query" => run_storage_query(options),
-        "http-ingest" => run_http_ingest(options).await,
-        "otlp-protobuf-load" => run_otlp_protobuf_load(options).await,
-        "disk-trace-block-append" => run_disk_trace_block_append(options),
+        "storage-ingest" => run_storage_ingest(options, &replay_metadata),
+        "storage-query" => run_storage_query(options, &replay_metadata),
+        "http-ingest" => run_http_ingest(options, &replay_metadata).await,
+        "otlp-protobuf-load" => run_otlp_protobuf_load(options, &replay_metadata).await,
+        "disk-trace-block-append" => run_disk_trace_block_append(options, &replay_metadata),
         _ => bail!("unknown mode: {mode}"),
     }
 }
 
-fn run_storage_ingest(options: BenchOptions) -> anyhow::Result<()> {
+fn run_storage_ingest(
+    options: BenchOptions,
+    replay_metadata: &replay::ReplayMetadata,
+) -> anyhow::Result<()> {
     let rows = options.rows;
     let batch_size = options.batch_size.max(1);
     let storage: Arc<dyn StorageEngine> = Arc::new(BatchingStorageEngine::with_config(
         Arc::new(MemoryStorageEngine::new()),
         BatchingStorageConfig::default(),
     ));
+    let run_started_at = SystemTime::now();
     let started = Instant::now();
     let deadline = options
         .duration_secs
@@ -108,9 +117,11 @@ fn run_storage_ingest(options: BenchOptions) -> anyhow::Result<()> {
     }
 
     print_summary_and_report(
+        replay_metadata,
         &options,
         "storage-ingest",
         generated,
+        run_started_at,
         measured_started
             .map(|started| started.elapsed())
             .unwrap_or_else(|| started.elapsed()),
@@ -125,7 +136,10 @@ fn run_storage_ingest(options: BenchOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_storage_query(options: BenchOptions) -> anyhow::Result<()> {
+fn run_storage_query(
+    options: BenchOptions,
+    replay_metadata: &replay::ReplayMetadata,
+) -> anyhow::Result<()> {
     let traces = options.traces.max(1);
     let spans_per_trace = options.spans_per_trace.max(1);
     let query_count = options.queries.max(1);
@@ -138,6 +152,7 @@ fn run_storage_query(options: BenchOptions) -> anyhow::Result<()> {
         storage.append_rows(batch)?;
     }
 
+    let run_started_at = SystemTime::now();
     let started = Instant::now();
     let deadline = options
         .duration_secs
@@ -188,9 +203,11 @@ fn run_storage_query(options: BenchOptions) -> anyhow::Result<()> {
     }
 
     print_summary_and_report(
+        replay_metadata,
         &options,
         "storage-query",
         completed_queries,
+        run_started_at,
         measured_started
             .map(|started| started.elapsed())
             .unwrap_or_else(|| started.elapsed()),
@@ -205,7 +222,10 @@ fn run_storage_query(options: BenchOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_http_ingest(options: BenchOptions) -> anyhow::Result<()> {
+async fn run_http_ingest(
+    options: BenchOptions,
+    replay_metadata: &replay::ReplayMetadata,
+) -> anyhow::Result<()> {
     let requests = options.requests.max(1);
     let spans_per_request = options.spans_per_request.max(1);
     let concurrency = options.concurrency.max(1);
@@ -224,6 +244,7 @@ async fn run_http_ingest(options: BenchOptions) -> anyhow::Result<()> {
     });
 
     let client = Client::new();
+    let run_started_at = SystemTime::now();
     let started = Instant::now();
     let deadline = options
         .duration_secs
@@ -295,9 +316,11 @@ async fn run_http_ingest(options: BenchOptions) -> anyhow::Result<()> {
     server.abort();
 
     print_summary_and_report(
+        replay_metadata,
         &options,
         "http-ingest",
         request_index * spans_per_request,
+        run_started_at,
         elapsed,
         &[
             ("requests", request_index.to_string()),
@@ -312,7 +335,10 @@ async fn run_http_ingest(options: BenchOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_otlp_protobuf_load(options: BenchOptions) -> anyhow::Result<()> {
+async fn run_otlp_protobuf_load(
+    options: BenchOptions,
+    replay_metadata: &replay::ReplayMetadata,
+) -> anyhow::Result<()> {
     let url = options
         .url
         .clone()
@@ -323,6 +349,7 @@ async fn run_otlp_protobuf_load(options: BenchOptions) -> anyhow::Result<()> {
     let payload_variants = options.payload_variants.max(1);
     let payloads = make_otlp_protobuf_payload_variants(payload_variants, spans_per_request)?;
     let client = Client::new();
+    let run_started_at = SystemTime::now();
     let started = Instant::now();
     let deadline = options
         .duration_secs
@@ -398,9 +425,11 @@ async fn run_otlp_protobuf_load(options: BenchOptions) -> anyhow::Result<()> {
         .unwrap_or_else(|| started.elapsed());
 
     print_summary_and_report(
+        replay_metadata,
         &options,
         "otlp-protobuf-load",
         request_index * spans_per_request,
+        run_started_at,
         elapsed,
         &[
             ("requests", request_index.to_string()),
@@ -416,19 +445,32 @@ async fn run_otlp_protobuf_load(options: BenchOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_disk_trace_block_append(options: BenchOptions) -> anyhow::Result<()> {
+fn run_disk_trace_block_append(
+    options: BenchOptions,
+    replay_metadata: &replay::ReplayMetadata,
+) -> anyhow::Result<()> {
     let requests = options.requests.max(1);
     let blocks_per_append = options.blocks_per_append.max(1);
     let spans_per_block = options.spans_per_block.max(1);
     let trace_shards = options.trace_shards.max(1);
     let payload_variants = options.payload_variants.max(1);
-    let data_path = temp_bench_dir("disk-trace-block-append");
+    let (data_path, owned_data_path) = match &options.storage_path {
+        Some(path) => {
+            if !path.exists() {
+                fs::create_dir_all(path)
+                    .with_context(|| format!("create {}", path.display()))?;
+            }
+            (path.clone(), false)
+        }
+        None => (temp_bench_dir("disk-trace-block-append"), true),
+    };
     let storage = DiskStorageEngine::open_with_config(
         &data_path,
         DiskStorageConfig::default()
             .with_sync_policy(DiskSyncPolicy::None)
             .with_trace_shards(trace_shards),
     )?;
+    let run_started_at = SystemTime::now();
     let payloads = make_same_shard_trace_block_payload_variants(
         payload_variants,
         blocks_per_append,
@@ -484,12 +526,16 @@ fn run_disk_trace_block_append(options: BenchOptions) -> anyhow::Result<()> {
         .unwrap_or_else(|| started.elapsed());
     let operations = request_index * operations_per_append;
     drop(storage);
-    fs::remove_dir_all(&data_path).with_context(|| format!("remove {}", data_path.display()))?;
+    if owned_data_path {
+        fs::remove_dir_all(&data_path).with_context(|| format!("remove {}", data_path.display()))?;
+    }
 
     print_summary_and_report(
+        replay_metadata,
         &options,
         "disk-trace-block-append",
         operations,
+        run_started_at,
         elapsed,
         &[
             ("requests", request_index.to_string()),
@@ -497,6 +543,7 @@ fn run_disk_trace_block_append(options: BenchOptions) -> anyhow::Result<()> {
             ("spans_per_block", spans_per_block.to_string()),
             ("trace_shards", trace_shards.to_string()),
             ("payload_variants", payload_variants.to_string()),
+            ("storage_path", data_path.display().to_string()),
         ],
         Some(&latencies),
         &timeline,
@@ -526,6 +573,11 @@ struct BenchOptions {
     fault_after_secs: Option<u64>,
     fault_duration_secs: Option<u64>,
     report_file: Option<PathBuf>,
+    artifacts_root: Option<PathBuf>,
+    storage_path: Option<PathBuf>,
+    clean_start: bool,
+    public_report: bool,
+    comparison_arms: Vec<String>,
 }
 
 impl Default for BenchOptions {
@@ -550,6 +602,11 @@ impl Default for BenchOptions {
             fault_after_secs: None,
             fault_duration_secs: None,
             report_file: None,
+            artifacts_root: None,
+            storage_path: None,
+            clean_start: false,
+            public_report: false,
+            comparison_arms: Vec::new(),
         }
     }
 }
@@ -581,10 +638,126 @@ fn parse_options(args: impl Iterator<Item = String>) -> anyhow::Result<BenchOpti
             "fault-after-secs" => options.fault_after_secs = Some(value.parse()?),
             "fault-duration-secs" => options.fault_duration_secs = Some(value.parse()?),
             "report-file" => options.report_file = Some(PathBuf::from(value)),
+            "artifacts-root" => options.artifacts_root = Some(PathBuf::from(value)),
+            "storage-path" => options.storage_path = Some(PathBuf::from(value)),
+            "clean-start" => options.clean_start = parse_bool_flag(value)?,
+            "public-report" => options.public_report = parse_bool_flag(value)?,
+            "comparison-arms" => {
+                options.comparison_arms = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+            }
             _ => bail!("unknown option: --{key}"),
         }
     }
     Ok(options)
+}
+
+impl BenchOptions {
+    fn as_metadata_map(&self) -> BTreeMap<String, Value> {
+        let mut map = BTreeMap::new();
+        map.insert("rows".to_string(), json!(self.rows));
+        map.insert("batch_size".to_string(), json!(self.batch_size));
+        map.insert("blocks_per_append".to_string(), json!(self.blocks_per_append));
+        map.insert("traces".to_string(), json!(self.traces));
+        map.insert("spans_per_trace".to_string(), json!(self.spans_per_trace));
+        map.insert("queries".to_string(), json!(self.queries));
+        map.insert("requests".to_string(), json!(self.requests));
+        map.insert(
+            "spans_per_request".to_string(),
+            json!(self.spans_per_request),
+        );
+        map.insert("spans_per_block".to_string(), json!(self.spans_per_block));
+        map.insert("payload_variants".to_string(), json!(self.payload_variants));
+        map.insert("trace_shards".to_string(), json!(self.trace_shards));
+        map.insert("concurrency".to_string(), json!(self.concurrency));
+        map.insert("url".to_string(), json!(self.url));
+        map.insert("duration_secs".to_string(), json!(self.duration_secs));
+        map.insert("warmup_secs".to_string(), json!(self.warmup_secs));
+        map.insert(
+            "sample_interval_secs".to_string(),
+            json!(self.sample_interval_secs),
+        );
+        map.insert("fault_after_secs".to_string(), json!(self.fault_after_secs));
+        map.insert(
+            "fault_duration_secs".to_string(),
+            json!(self.fault_duration_secs),
+        );
+        map.insert(
+            "report_file".to_string(),
+            json!(self.report_file.as_ref().map(|path| path.display().to_string())),
+        );
+        map.insert(
+            "artifacts_root".to_string(),
+            json!(self
+                .artifacts_root
+                .as_ref()
+                .map(|path| path.display().to_string())),
+        );
+        map.insert(
+            "storage_path".to_string(),
+            json!(self.storage_path.as_ref().map(|path| path.display().to_string())),
+        );
+        map.insert("clean_start".to_string(), json!(self.clean_start));
+        map.insert("public_report".to_string(), json!(self.public_report));
+        map.insert("comparison_arms".to_string(), json!(self.comparison_arms));
+        map
+    }
+}
+
+fn parse_bool_flag(value: &str) -> anyhow::Result<bool> {
+    match value {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => bail!("invalid boolean value: {value}"),
+    }
+}
+
+fn validate_preflight(
+    mode: &str,
+    options: &BenchOptions,
+    replay_metadata: &replay::ReplayMetadata,
+) -> anyhow::Result<()> {
+    if replay_metadata.git.sha.is_empty() {
+        bail!("missing git SHA for benchmark run");
+    }
+
+    if options.public_report {
+        if options.warmup_secs.is_none() {
+            bail!("public-report requires --warmup-secs");
+        }
+        let required = ["official", "memory", "disk"];
+        for arm in required {
+            if !options.comparison_arms.iter().any(|value| value == arm) {
+                bail!("public-report requires --comparison-arms to include {arm}");
+            }
+        }
+    }
+
+    if mode == "disk-trace-block-append" && options.clean_start {
+        let path = options
+            .storage_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("--clean-start requires --storage-path for disk mode"))?;
+        if path.exists() && !directory_is_empty(path)? {
+            bail!(
+                "clean-start disk run requires empty storage path: {}",
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn directory_is_empty(path: &std::path::Path) -> anyhow::Result<bool> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    Ok(fs::read_dir(path)?.next().is_none())
 }
 
 fn make_row(index: usize) -> Result<TraceSpanRow, vtcore::TraceModelError> {
@@ -899,9 +1072,11 @@ struct FaultInjectionConfig {
 }
 
 fn print_summary_and_report(
+    replay_metadata: &replay::ReplayMetadata,
     options: &BenchOptions,
     mode: &str,
     operations: usize,
+    started_at: SystemTime,
     elapsed: Duration,
     fields: &[(&str, String)],
     latencies: Option<&LatencySummary>,
@@ -910,22 +1085,65 @@ fn print_summary_and_report(
 ) -> anyhow::Result<()> {
     let elapsed_secs = elapsed.as_secs_f64().max(f64::EPSILON);
     let ops_per_sec = operations as f64 / elapsed_secs;
-    println!("mode={mode}");
-    println!("operations={operations}");
-    println!("errors={error_count}");
-    println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
-    println!("ops_per_sec={:.3}", ops_per_sec);
+    let ended_at = started_at
+        .checked_add(elapsed)
+        .unwrap_or_else(SystemTime::now);
+    let started_at_unix_ms = started_at
+        .duration_since(UNIX_EPOCH)
+        .expect("start time before unix epoch")
+        .as_millis();
+    let ended_at_unix_ms = ended_at
+        .duration_since(UNIX_EPOCH)
+        .expect("end time before unix epoch")
+        .as_millis();
+    let mut metrics_lines = vec![
+        format!("mode={mode}"),
+        format!("operations={operations}"),
+        format!("errors={error_count}"),
+        format!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1000.0),
+        format!("ops_per_sec={ops_per_sec:.3}"),
+    ];
     if let Some(latencies) = latencies {
-        println!("latency_samples={}", latencies.sample_count());
-        println!("latency_p50_ms={:.3}", latencies.quantile_ms(0.50));
-        println!("latency_p95_ms={:.3}", latencies.quantile_ms(0.95));
-        println!("latency_p99_ms={:.3}", latencies.quantile_ms(0.99));
-        println!("latency_p999_ms={:.3}", latencies.quantile_ms(0.999));
-        println!("latency_max_ms={:.3}", latencies.max_ms());
+        metrics_lines.push(format!("latency_samples={}", latencies.sample_count()));
+        metrics_lines.push(format!("latency_p50_ms={:.3}", latencies.quantile_ms(0.50)));
+        metrics_lines.push(format!("latency_p95_ms={:.3}", latencies.quantile_ms(0.95)));
+        metrics_lines.push(format!("latency_p99_ms={:.3}", latencies.quantile_ms(0.99)));
+        metrics_lines.push(format!(
+            "latency_p999_ms={:.3}",
+            latencies.quantile_ms(0.999)
+        ));
+        metrics_lines.push(format!("latency_max_ms={:.3}", latencies.max_ms()));
     }
     for (key, value) in fields {
-        println!("{key}={value}");
+        metrics_lines.push(format!("{key}={value}"));
     }
+    for line in &metrics_lines {
+        println!("{line}");
+    }
+
+    let report = report::CanonicalRunReport {
+        report_version: 1,
+        replay_id: replay_metadata.replay_id.clone(),
+        mode: mode.to_string(),
+        git_sha: replay_metadata.git.sha.clone(),
+        command_display: replay_metadata.command_display.clone(),
+        raw_args: replay_metadata.raw_args.clone(),
+        started_at_unix_ms,
+        ended_at_unix_ms,
+        duration_ms: report::duration_ms(elapsed),
+        operations,
+        errors: error_count,
+        ops_per_sec,
+        options: options.as_metadata_map(),
+        metadata: fields
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect(),
+        public_report: options.public_report,
+        comparison_arms: options.comparison_arms.clone(),
+        latency: latencies.and_then(report::LatencyStats::from_summary),
+        timeline: timeline.as_json(),
+    };
 
     if let Some(report_file) = &options.report_file {
         if let Some(parent) = report_file.parent() {
@@ -933,48 +1151,47 @@ fn print_summary_and_report(
                 fs::create_dir_all(parent)?;
             }
         }
-        let mut report = serde_json::Map::new();
-        report.insert("mode".to_string(), json!(mode));
-        report.insert("operations".to_string(), json!(operations));
-        report.insert("errors".to_string(), json!(error_count));
-        report.insert(
-            "elapsed_ms".to_string(),
-            json!(elapsed.as_secs_f64() * 1000.0),
-        );
-        report.insert("ops_per_sec".to_string(), json!(ops_per_sec));
-        report.insert("duration_secs".to_string(), json!(options.duration_secs));
-        report.insert("warmup_secs".to_string(), json!(options.warmup_secs));
-        for (key, value) in fields {
-            report.insert((*key).to_string(), json!(value));
-        }
-        if let Some(latencies) = latencies {
-            report.insert(
-                "latency_samples".to_string(),
-                json!(latencies.sample_count()),
-            );
-            report.insert(
-                "latency_p50_ms".to_string(),
-                json!(latencies.quantile_ms(0.50)),
-            );
-            report.insert(
-                "latency_p95_ms".to_string(),
-                json!(latencies.quantile_ms(0.95)),
-            );
-            report.insert(
-                "latency_p99_ms".to_string(),
-                json!(latencies.quantile_ms(0.99)),
-            );
-            report.insert(
-                "latency_p999_ms".to_string(),
-                json!(latencies.quantile_ms(0.999)),
-            );
-            report.insert("latency_max_ms".to_string(), json!(latencies.max_ms()));
-        }
-        if let Some(series) = timeline.as_json() {
-            report.insert("timeline".to_string(), json!(series));
-        }
-        let payload = serde_json::to_vec_pretty(&serde_json::Value::Object(report))?;
+        let payload = serde_json::to_vec_pretty(&report)?;
         fs::write(report_file, payload)?;
+    }
+
+    if let Some(artifacts_root) = &options.artifacts_root {
+        let bundle = replay::ArtifactBundle::prepare(artifacts_root, &replay_metadata.replay_id)?;
+        let manifest = report::CanonicalRunManifest {
+            replay_id: replay_metadata.replay_id.clone(),
+            mode: mode.to_string(),
+            git_sha: replay_metadata.git.sha.clone(),
+            command_display: replay_metadata.command_display.clone(),
+            raw_args: replay_metadata.raw_args.clone(),
+            cwd: replay_metadata.cwd.display().to_string(),
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            duration_ms: report::duration_ms(elapsed),
+            public_report: options.public_report,
+            comparison_arms: options.comparison_arms.clone(),
+            files: replay::manifest_files(),
+        };
+        let context = report::ContextSnapshot {
+            mode: mode.to_string(),
+            options: options.as_metadata_map(),
+            metadata: report.metadata.clone(),
+            public_report: options.public_report,
+            comparison_arms: options.comparison_arms.clone(),
+        };
+        let decision = report::DecisionSnapshot {
+            status: "success".to_string(),
+            public_report: options.public_report,
+            publishable: !options.public_report || options.comparison_arms.len() >= 3,
+            error_count,
+        };
+        bundle.write_all(
+            replay_metadata,
+            &manifest,
+            &report,
+            &context,
+            &decision,
+            &metrics_lines.join("\n"),
+        )?;
     }
     Ok(())
 }
@@ -1042,6 +1259,9 @@ mod tests {
                 "--fault-after-secs=5".to_string(),
                 "--fault-duration-secs=4".to_string(),
                 "--report-file=/tmp/vtbench.json".to_string(),
+                "--artifacts-root=/tmp/vtbench-runs".to_string(),
+                "--public-report=true".to_string(),
+                "--comparison-arms=official,memory,disk".to_string(),
             ]
             .into_iter(),
         )
@@ -1055,6 +1275,12 @@ mod tests {
             options.report_file.as_deref(),
             Some(std::path::Path::new("/tmp/vtbench.json"))
         );
+        assert_eq!(
+            options.artifacts_root.as_deref(),
+            Some(std::path::Path::new("/tmp/vtbench-runs"))
+        );
+        assert!(options.public_report);
+        assert_eq!(options.comparison_arms, vec!["official", "memory", "disk"]);
     }
 
     #[test]
@@ -1082,6 +1308,8 @@ mod tests {
                 "--blocks-per-append=8".to_string(),
                 "--spans-per-block=5".to_string(),
                 "--trace-shards=4".to_string(),
+                "--storage-path=/tmp/vtbench-disk".to_string(),
+                "--clean-start=true".to_string(),
             ]
             .into_iter(),
         )
@@ -1090,6 +1318,11 @@ mod tests {
         assert_eq!(options.blocks_per_append, 8);
         assert_eq!(options.spans_per_block, 5);
         assert_eq!(options.trace_shards, 4);
+        assert_eq!(
+            options.storage_path.as_deref(),
+            Some(std::path::Path::new("/tmp/vtbench-disk"))
+        );
+        assert!(options.clean_start);
     }
 
     #[test]
