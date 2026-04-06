@@ -1,0 +1,113 @@
+name: linux-release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
+      - codex/perf-trace-microbatch-leap
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-linux-x86_64:
+    name: test-linux-x86_64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.73.0
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        run: cargo test --workspace -- --nocapture
+
+      - name: Build release binaries
+        run: cargo build --release -p vtapi -p vtbench
+
+      - name: Package x86_64 linux artifacts
+        run: |
+          mkdir -p dist/linux-x86_64
+          cp target/release/vtapi dist/linux-x86_64/
+          cp target/release/vtbench dist/linux-x86_64/
+          cp README.md dist/linux-x86_64/
+          cp docs/2026-04-06-otlp-ingest-performance-report.md dist/linux-x86_64/
+          cp docs/production-release-guide.md dist/linux-x86_64/
+          tar -C dist -czf rust-victoria-trace-linux-x86_64.tar.gz linux-x86_64
+
+      - name: Upload x86_64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-victoria-trace-linux-x86_64
+          path: rust-victoria-trace-linux-x86_64.tar.gz
+
+      - name: Publish x86_64 release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rust-victoria-trace-linux-x86_64.tar.gz
+
+  build-linux-aarch64:
+    name: build-linux-aarch64
+    runs-on: ubuntu-22.04
+
+    env:
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+      AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.73.0
+        with:
+          components: clippy,rustfmt
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build aarch64 linux release binaries
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p vtapi -p vtbench
+
+      - name: Package aarch64 linux artifacts
+        run: |
+          mkdir -p dist/linux-aarch64
+          cp target/aarch64-unknown-linux-gnu/release/vtapi dist/linux-aarch64/
+          cp target/aarch64-unknown-linux-gnu/release/vtbench dist/linux-aarch64/
+          cp README.md dist/linux-aarch64/
+          cp docs/2026-04-06-otlp-ingest-performance-report.md dist/linux-aarch64/
+          cp docs/production-release-guide.md dist/linux-aarch64/
+          tar -C dist -czf rust-victoria-trace-linux-aarch64.tar.gz linux-aarch64
+
+      - name: Upload aarch64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-victoria-trace-linux-aarch64
+          path: rust-victoria-trace-linux-aarch64.tar.gz
+
+      - name: Publish aarch64 release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rust-victoria-trace-linux-aarch64.tar.gz

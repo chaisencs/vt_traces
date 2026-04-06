@@ -1,0 +1,132 @@
+# Production Release Guide
+
+## Scope
+
+This guide is the release gate for merging Rust Victoria Trace into `master` as a production-facing open-source version.
+
+The target is straightforward:
+
+- run on common 64-bit Linux systems
+- ship repeatable release artifacts
+- keep code, docs, and benchmark evidence in a mergeable state
+
+## Supported Release Targets
+
+The release workflow is set up to validate and publish these Linux targets:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+
+Development and benchmarking may still happen on macOS, but Linux is the release target.
+
+## Release Artifacts
+
+The repository now carries three release-friendly entry points:
+
+1. GitHub Actions workflow: `.github/workflows/linux-release.yml`
+2. Container build: `Dockerfile`
+3. Public benchmark write-up: `docs/2026-04-06-otlp-ingest-performance-report.md`
+
+The GitHub Actions workflow does two different jobs on Linux:
+
+- native `x86_64` test + release build
+- cross-built `aarch64` release build
+
+When a tag matching `v*` is pushed, the workflow publishes tarball artifacts for both Linux targets.
+
+## Production Runtime Recommendation
+
+For a first formal production release, prefer the disk engine with explicit durability and request limits:
+
+```bash
+VT_STORAGE_MODE=disk \
+VT_STORAGE_PATH=/var/lib/rust-victoria-trace \
+VT_STORAGE_SYNC_POLICY=data \
+VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608 \
+VT_MAX_REQUEST_BODY_BYTES=8388608 \
+VT_API_CONCURRENCY_LIMIT=1024 \
+vtapi
+```
+
+Recommended operational checks:
+
+- scrape `/metrics`
+- verify `GET /healthz`
+- validate WAL and `.part` files are created under the configured storage path
+- run at least one OTLP protobuf smoke test before exposing public traffic
+
+## Merge-To-Master Gate
+
+Before merging a formal version to `master`, require all of the following:
+
+1. `cargo test --workspace -- --nocapture` passes
+2. `cargo build --release -p vtapi -p vtbench` passes
+3. GitHub Actions `linux-release` workflow is green on the branch
+4. Linux `x86_64` and `aarch64` artifacts are produced successfully
+5. Public docs are current:
+   - `README.md`
+   - `docs/2026-04-06-otlp-ingest-performance-report.md`
+   - this guide
+6. Benchmark evidence still shows disk above official on the agreed OTLP protobuf ingest shape
+
+## Current Validation Snapshot
+
+The release-prep state for this repository has already passed these local checks:
+
+- `cargo test --workspace -- --nocapture`
+- `cargo build --release -p vtapi -p vtbench`
+- `docker buildx build --builder desktop-linux --platform linux/amd64 -t rust-victoria-trace:release-check-amd64 --load .`
+- `docker buildx build --builder desktop-linux --platform linux/arm64 -t rust-victoria-trace:release-check-arm64 --load .`
+- `docker run --rm --platform linux/amd64 -p 13181:13000 rust-victoria-trace:release-check-amd64` + `GET /healthz`
+- `docker run --rm --platform linux/arm64 -p 13182:13000 rust-victoria-trace:release-check-arm64` + `GET /healthz`
+
+That gives us direct evidence for:
+
+- workspace correctness on the current source tree
+- release binaries building successfully
+- the provided `Dockerfile` producing runnable Linux images for both common 64-bit targets
+
+The remaining merge gate that must still be observed after push is the branch-level GitHub Actions `linux-release` workflow result.
+
+## Release Flow
+
+Suggested release flow:
+
+1. Merge the release candidate branch into `master`
+2. Create a tag such as `v0.1.0`
+3. Let GitHub Actions publish Linux tarballs
+4. Attach the public performance report in the release notes
+
+## Current Benchmark Reference
+
+Current public reference numbers are:
+
+### Fresh Single Run
+
+| target | spans/s | p99 |
+| --- | ---: | ---: |
+| official | `396475.630` | `0.673 ms` |
+| disk | `430192.512` | `0.409 ms` |
+
+### Fresh 5-Round Median
+
+| target | spans/s | p99 |
+| --- | ---: | ---: |
+| official | `343086.506` | `0.902 ms` |
+| disk | `359315.329` | `0.713 ms` |
+
+### Metrics Visibility
+
+After the bounded stats-side live-update drain change, the first `/metrics` scrape after a 5-round disk run dropped from about `30.7s` to about `14ms`.
+
+## Known Remaining Work
+
+This release gate is strong enough for a formal version, but not the end of performance work.
+
+The next major optimization target is still on the write path:
+
+- form larger same-shard append packets cheaply on HTTP ingest
+
+The next major read-path cleanup target is:
+
+- pay down live-update drain cost on query/search paths beyond `stats()`

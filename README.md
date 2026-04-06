@@ -5,10 +5,18 @@
 ## 最新性能报告
 
 - 对外性能报告见：[2026-04-06 OTLP Ingest Performance Report](./docs/2026-04-06-otlp-ingest-performance-report.md)
+- 正式版本/生产发布说明见：[Production Release Guide](./docs/production-release-guide.md)
 - 在 commit `0019f74` 的同机同口径测试中，disk engine 在 fresh single 和 fresh 5-round median 上都高于 official VictoriaTraces
 - fresh single：official `396475.630 spans/s / p99 0.673ms`，disk `430192.512 spans/s / p99 0.409ms`
 - fresh 5-round median：official `343086.506 spans/s / p99 0.902ms`，disk `359315.329 spans/s / p99 0.713ms`
 - 这版还把 5 轮压测后的首次 `/metrics` scrape 从约 `30.7s` 压到了约 `14ms`
+
+## Linux / Production Release
+
+- 正式 release 目标平台是常见 64 位 Linux：`x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu`
+- 仓库提供了 GitHub Actions Linux release workflow：`.github/workflows/linux-release.yml`
+- 仓库提供了开箱即用的容器构建入口：[Dockerfile](./Dockerfile)
+- merge 到 `master` 前，请按 [Production Release Guide](./docs/production-release-guide.md) 的 gate 逐项检查
 
 ## 当前能力
 

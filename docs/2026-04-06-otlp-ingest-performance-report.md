@@ -17,7 +17,7 @@ Reference commit: `0019f74` (`Bound stats-side live update drain`)
 所有结果都来自同一台机器、同一组 benchmark 参数：
 
 ```bash
-target/aarch64-apple-darwin/release/vtbench otlp-protobuf-load \
+target/release/vtbench otlp-protobuf-load \
   --duration-secs=5 \
   --warmup-secs=1 \
   --concurrency=32 \
@@ -100,7 +100,7 @@ target/aarch64-apple-darwin/release/vtbench otlp-protobuf-load \
 ### 1. Build
 
 ```bash
-cargo build --release --target aarch64-apple-darwin -p vtapi -p vtbench
+cargo build --release -p vtapi -p vtbench
 ```
 
 ### 2. Start official
@@ -118,7 +118,7 @@ cargo build --release --target aarch64-apple-darwin -p vtapi -p vtbench
 RUST_LOG=error \
 VT_BIND_ADDR=127.0.0.1:13082 \
 VT_STORAGE_MODE=memory \
-target/aarch64-apple-darwin/release/vtapi
+target/release/vtapi
 ```
 
 ### 4. Start Rust disk engine
@@ -128,13 +128,13 @@ RUST_LOG=error \
 VT_BIND_ADDR=127.0.0.1:13083 \
 VT_STORAGE_MODE=disk \
 VT_STORAGE_PATH=./var/bench-disk \
-target/aarch64-apple-darwin/release/vtapi
+target/release/vtapi
 ```
 
 ### 5. Run the benchmark
 
 ```bash
-target/aarch64-apple-darwin/release/vtbench otlp-protobuf-load \
+target/release/vtbench otlp-protobuf-load \
   --url=http://127.0.0.1:13081/insert/opentelemetry/v1/traces \
   --duration-secs=5 \
   --warmup-secs=1 \
