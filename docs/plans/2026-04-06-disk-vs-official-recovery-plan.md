@@ -217,14 +217,19 @@ This is deliberately narrower than the failed async-worker route. The handoff on
 
 ### Current Execution Outcome
 
-The cheap disk-local same-shard combiner now satisfies the directional part of Gate H on this machine:
+The disk-local same-shard combiner now clears Gate H on this machine, and the stronger raw-block queue variant widens the margin further:
 
 | run | official | disk |
 | --- | ---: | ---: |
-| fresh single | `398170.042 spans/s`, `p99 0.666ms` | `417535.483 spans/s`, `p99 0.422ms` |
-| fresh 5-round median | `342053.911 spans/s`, `p99 0.870ms` | `354507.035 spans/s`, `p99 0.728ms` |
+| fresh single | `391557.761 spans/s`, `p99 0.691ms` | `430473.274 spans/s`, `p99 0.423ms` |
+| fresh 5-round median | `390899.877 spans/s`, `p99 0.674ms` | `423781.852 spans/s`, `p99 0.431ms` |
 
-But the margin is still modest rather than a large blowout. Post-run metrics also show only light cross-request coalescing on the HTTP path (`1414336` input blocks vs `1409140` output blocks), so the remaining work is not "recover the disk lead" anymore; it is "turn the current small lead into a visibly larger one without reintroducing queue overhead."
+Two follow-on conclusions are now locked in:
+
+1. Reusing the outer batching envelope for passthrough trace appends is not the next win; a fresh re-test dropped disk to about `375492 spans/s`, so that route stays rejected.
+2. The stronger disk-local variant should stay on the mainline: queue raw `TraceBlock`s before prepare, then drain one more pending same-shard wave after the first prepare pass. That change raised post-run physical append reduction from `1414336 -> 1409140` to `1681824 -> 1648770`.
+
+The margin is now real but still not a large blowout. Post-run metrics still show only light cross-request coalescing on the HTTP path, and the first `/metrics` scrape after the 5-round disk run took about `30.7s`, so the remaining work is not "recover the disk lead" anymore; it is "turn the current lead into a visibly larger one without reintroducing queue overhead, while separately paying down read-side drain debt."
 
 ## Explicitly Rejected Routes
 

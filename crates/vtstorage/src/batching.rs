@@ -359,17 +359,6 @@ impl BatchingStorageEngine {
         Ok(())
     }
 
-    fn append_trace_blocks_direct(&self, blocks: Vec<TraceBlock>) -> Result<(), StorageError> {
-        let blocks: Vec<TraceBlock> = blocks
-            .into_iter()
-            .filter(|block| !block.is_empty())
-            .collect();
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        self.inner.append_trace_blocks(blocks)
-    }
-
     fn bypass_trace_batching(&self) -> bool {
         self.inner.trace_batch_payload_mode() == TraceBatchPayloadMode::Passthrough
     }
@@ -475,7 +464,7 @@ impl StorageEngine for BatchingStorageEngine {
 
     fn append_trace_blocks(&self, blocks: Vec<TraceBlock>) -> Result<(), StorageError> {
         if self.bypass_trace_batching() {
-            return self.append_trace_blocks_direct(blocks);
+            return self.inner.append_trace_blocks(blocks);
         }
         self.enqueue_trace_blocks(blocks)
     }

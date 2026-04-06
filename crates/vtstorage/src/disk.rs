@@ -288,7 +288,7 @@ impl<'a> BatchInternCache<'a> {
 
 #[derive(Debug)]
 struct DiskTraceAppendRequest {
-    prepared_blocks: Vec<PreparedTraceBlockAppend>,
+    trace_blocks: Vec<TraceBlock>,
     input_blocks: usize,
     row_count: usize,
     enqueued_at: Instant,
@@ -896,22 +896,19 @@ impl DiskStorageEngine {
         Ok(())
     }
 
-    fn submit_prepared_trace_shard_blocks(
+    fn submit_trace_shard_blocks(
         &self,
         shard_index: usize,
-        prepared_blocks: Vec<PreparedTraceBlockAppend>,
+        trace_blocks: Vec<TraceBlock>,
     ) -> Result<(), StorageError> {
-        if prepared_blocks.is_empty() {
+        if trace_blocks.is_empty() {
             return Ok(());
         }
-        let input_blocks = prepared_blocks.len();
-        let row_count = prepared_blocks
-            .iter()
-            .map(|prepared_block| prepared_block.prepared_rows.len())
-            .sum();
+        let input_blocks = trace_blocks.len();
+        let row_count = trace_blocks.iter().map(TraceBlock::row_count).sum();
         let (result_tx, result_rx) = mpsc::channel();
         let request = DiskTraceAppendRequest {
-            prepared_blocks,
+            trace_blocks,
             input_blocks,
             row_count,
             enqueued_at: Instant::now(),
@@ -941,44 +938,44 @@ impl DiskStorageEngine {
 
     fn run_trace_append_combiner(&self, shard_index: usize) {
         loop {
-            let requests = {
-                let mut state = self.append_combiners[shard_index].lock();
-                if state.pending.is_empty() {
-                    state.combining = false;
-                    return;
-                }
-                let mut requests = Vec::with_capacity(state.pending.len());
-                while let Some(request) = state.pending.pop_front() {
-                    requests.push(request);
-                }
-                self.append_combiner_stats[shard_index].record_dequeue(requests.len());
-                requests
+            let Some(requests) = self.take_trace_append_requests(shard_index) else {
+                return;
             };
+            let mut earliest_enqueue = requests[0].enqueued_at;
+            let mut input_blocks = 0usize;
+            let mut row_count = 0usize;
+            let mut responders = Vec::new();
+            let mut prepared_blocks = Vec::new();
+            let mut pending_requests = requests;
 
-            let wait_micros = requests
-                .first()
-                .map(|request| saturating_micros(request.enqueued_at.elapsed().as_micros()))
-                .unwrap_or(0);
-            let input_blocks = requests
-                .iter()
-                .map(|request| request.input_blocks)
-                .sum::<usize>();
-            let row_count = requests
-                .iter()
-                .map(|request| request.row_count)
-                .sum::<usize>();
+            loop {
+                let mut trace_blocks = Vec::new();
+                for request in pending_requests {
+                    earliest_enqueue = earliest_enqueue.min(request.enqueued_at);
+                    input_blocks += request.input_blocks;
+                    row_count += request.row_count;
+                    trace_blocks.extend(request.trace_blocks);
+                    responders.push(request.result_tx);
+                }
+                prepared_blocks.reserve(trace_blocks.len());
+                for block in trace_blocks {
+                    prepared_blocks.push(PreparedTraceBlockAppend::new(
+                        block,
+                        self.trace_shards.len(),
+                    ));
+                }
+
+                pending_requests = self.take_pending_trace_append_requests(shard_index);
+                if pending_requests.is_empty() {
+                    break;
+                }
+            }
+            let wait_micros = saturating_micros(earliest_enqueue.elapsed().as_micros());
             self.append_combiner_stats[shard_index].record_flush(
                 row_count,
                 input_blocks,
                 wait_micros,
             );
-
-            let mut prepared_blocks = Vec::with_capacity(input_blocks);
-            let mut responders = Vec::with_capacity(requests.len());
-            for request in requests {
-                prepared_blocks.extend(request.prepared_blocks);
-                responders.push(request.result_tx);
-            }
 
             let result = self
                 .append_prepared_trace_shard_batch_once(
@@ -991,29 +988,36 @@ impl DiskStorageEngine {
         }
     }
 
-    fn append_prepared_trace_blocks(
+    fn take_trace_append_requests(
         &self,
-        prepared_blocks: Vec<PreparedTraceBlockAppend>,
-    ) -> Result<(), StorageError> {
-        if prepared_blocks.is_empty() {
-            return Ok(());
+        shard_index: usize,
+    ) -> Option<Vec<DiskTraceAppendRequest>> {
+        let mut state = self.append_combiners[shard_index].lock();
+        if state.pending.is_empty() {
+            state.combining = false;
+            return None;
         }
-
-        let mut prepared_blocks_by_shard = (0..self.trace_shards.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
-
-        for prepared_block in prepared_blocks {
-            prepared_blocks_by_shard[prepared_block.shard_index].push(prepared_block);
+        let mut requests = Vec::with_capacity(state.pending.len());
+        while let Some(request) = state.pending.pop_front() {
+            requests.push(request);
         }
+        self.append_combiner_stats[shard_index].record_dequeue(requests.len());
+        Some(requests)
+    }
 
-        for shard_blocks in prepared_blocks_by_shard {
-            if shard_blocks.is_empty() {
-                continue;
-            }
-            self.submit_prepared_trace_shard_blocks(shard_blocks[0].shard_index, shard_blocks)?;
+    fn take_pending_trace_append_requests(
+        &self,
+        shard_index: usize,
+    ) -> Vec<DiskTraceAppendRequest> {
+        let mut state = self.append_combiners[shard_index].lock();
+        let mut requests = Vec::with_capacity(state.pending.len());
+        while let Some(request) = state.pending.pop_front() {
+            requests.push(request);
         }
-        Ok(())
+        if !requests.is_empty() {
+            self.append_combiner_stats[shard_index].record_dequeue(requests.len());
+        }
+        requests
     }
 }
 
@@ -1039,26 +1043,30 @@ impl StorageEngine for DiskStorageEngine {
     }
 
     fn append_trace_blocks(&self, blocks: Vec<TraceBlock>) -> Result<(), StorageError> {
-        let mut prepared_blocks = Vec::new();
+        let mut blocks_by_shard = (0..self.trace_shards.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
         for block in blocks {
             if block.is_empty() {
                 continue;
             }
-            if trace_block_shard_index(&block, self.trace_shards.len()).is_some() {
-                prepared_blocks.push(PreparedTraceBlockAppend::new(
-                    block,
-                    self.trace_shards.len(),
-                ));
+            if let Some(shard_index) = trace_block_shard_index(&block, self.trace_shards.len()) {
+                blocks_by_shard[shard_index].push(block);
                 continue;
             }
             for block in partition_trace_block_by_shard(block, self.trace_shards.len()) {
-                prepared_blocks.push(PreparedTraceBlockAppend::new(
-                    block,
-                    self.trace_shards.len(),
-                ));
+                let shard_index =
+                    trace_block_shard_index(&block, self.trace_shards.len()).unwrap_or(0);
+                blocks_by_shard[shard_index].push(block);
             }
         }
-        self.append_prepared_trace_blocks(prepared_blocks)
+        for (shard_index, shard_blocks) in blocks_by_shard.into_iter().enumerate() {
+            if shard_blocks.is_empty() {
+                continue;
+            }
+            self.submit_trace_shard_blocks(shard_index, shard_blocks)?;
+        }
+        Ok(())
     }
 
     fn append_rows(&self, rows: Vec<TraceSpanRow>) -> Result<(), StorageError> {
