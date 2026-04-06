@@ -1,14 +1,34 @@
 # Production Release Guide
 
-## Scope
+> AI-Agent时代的Trace存储系统正式发布说明
+>
+> 这份文档不是内部发布备忘录，而是面向开源用户、运维者和合并决策者的正式 release gate。
 
-This guide is the release gate for merging Rust Victoria Trace into `master` as a production-facing open-source version.
+## 这份文档解决什么问题
 
-The target is straightforward:
+如果你准备把 `rust_victoria_trace` 作为一个正式版本发布出去，这份文档回答四个最关键的问题：
+
+- 它是否已经能跑在常见 64 位 Linux 上
+- 它是否已经具备可重复的 release artifact
+- 它是否已经有足够清楚的部署和运行说明
+- 它是否已经达到可 merge 到 `master` 的门槛
+
+当前目标很明确：
 
 - run on common 64-bit Linux systems
 - ship repeatable release artifacts
 - keep code, docs, and benchmark evidence in a mergeable state
+
+## 一眼看完当前发布状态
+
+| 项目 | 当前状态 |
+| --- | --- |
+| 目标平台 | `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu` |
+| 二进制交付 | GitHub Actions 产出 Linux tarball 和 `.sha256` |
+| 容器交付 | 仓库根目录 `Dockerfile`，non-root 运行，带 `HEALTHCHECK` |
+| 推荐运行模式 | `disk` engine，显式 durability 和请求限流 |
+| 文档入口 | `README.md`、性能报告、本指南 |
+| merge gate | workspace tests、release build、Linux workflow、artifact、Docker smoke、benchmark 证据 |
 
 ## Supported Release Targets
 
@@ -35,6 +55,21 @@ The GitHub Actions workflow does two different jobs on Linux:
 For the `x86_64` job, the workflow also builds the repository `Dockerfile` and smoke-checks `GET /healthz`.
 
 When a tag matching `v*` is pushed, the workflow publishes tarball artifacts and `.sha256` checksum files for both Linux targets.
+
+## 对外用户如何获得它
+
+正式 release 对外提供两条主路径：
+
+1. 预构建 Linux tarball
+   适合裸机、VM、传统发布流程、systemd 管理。
+2. Docker 镜像构建入口
+   适合容器环境、Kubernetes、PoC 和 CI/CD 封装。
+
+如果你是第一次上线，优先建议：
+
+- Linux 上直接跑 `disk` engine
+- 显式设置存储路径、sync 策略、segment 大小和请求限流
+- 上线前先验证 `healthz`、`metrics` 和 WAL / `.part` 文件生成
 
 ## Linux Binary Quickstart
 
@@ -80,6 +115,12 @@ docker run --rm \
   -v "$(pwd)/var/vt-docker:/var/lib/rust-victoria-trace" \
   rust-victoria-trace:local
 ```
+
+Recommended first checks for the container path:
+
+- `curl http://127.0.0.1:13000/healthz`
+- `curl http://127.0.0.1:13000/metrics | head`
+- confirm the mounted directory contains WAL and `.part` files
 
 ## Production Runtime Recommendation
 
@@ -146,9 +187,9 @@ Suggested release flow:
 3. Let GitHub Actions publish Linux tarballs
 4. Attach the public performance report in the release notes
 
-## Current Benchmark Reference
+## Public Benchmark Reference
 
-Current public reference numbers are:
+这不是“内部调优过程中的某一次截图”，而是对外可以引用的公开参考数字。
 
 ### Fresh Single Run
 
@@ -167,6 +208,20 @@ Current public reference numbers are:
 ### Metrics Visibility
 
 After the bounded stats-side live-update drain change, the first `/metrics` scrape after a 5-round disk run dropped from about `30.7s` to about `14ms`.
+
+## 对外如何表述这次发布
+
+更准确的公开说法是：
+
+- 这是一个已经具备正式 Linux 发布链路的 Rust Trace 存储系统
+- 当前公开 benchmark 下，disk engine 在 agreed OTLP protobuf ingest 口径上高于 official VictoriaTraces
+- 它不是“只会跑 benchmark”的 demo，而是已经具备二进制、容器、文档和 merge gate 的正式发布候选
+
+不建议对外说成：
+
+- “所有性能问题都已经解决”
+- “已经在所有 workload 下都全面碾压”
+- “读写两条链路已经没有剩余瓶颈”
 
 ## Known Remaining Work
 

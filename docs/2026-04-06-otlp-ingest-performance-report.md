@@ -1,9 +1,11 @@
-# Rust Victoria Trace Performance Report
+# AI-Agent时代的Trace Ingest性能报告
 
 Last updated: `2026-04-06`  
 Reference commit: `0019f74` (`Bound stats-side live update drain`)
 
 ## Headline
+
+这份报告面向的是潜在采用者，而不是调优过程日志。
 
 在同机、同口径、clean start 的 `vtbench otlp-protobuf-load` 基准下，`rust_victoria_trace` 的磁盘引擎已经稳定超过 official VictoriaTraces，同时保持更低的 `p99`。
 
@@ -11,6 +13,31 @@ Reference commit: `0019f74` (`Bound stats-side live update drain`)
 
 - fresh single run 高于 official
 - fresh 5-round median 也高于 official
+
+## 这组结果为什么和 AI-Agent 场景相关
+
+这个 benchmark 形状非常贴近今天很多 Agent 系统的 trace 写入模式：
+
+- 请求很小，但非常频繁
+- 一次 agent run 会拆成很多 tool spans / workflow spans / RPC spans
+- 调试时既关注吞吐，也关注 tail latency 和 near-realtime 可见性
+
+我们当前公开 benchmark 使用的是：
+
+- `concurrency=32`
+- `spans-per-request=5`
+- `payload-variants=1024`
+
+这不是在模拟“大批量离线导入”，而更像是在模拟“很多小 trace 请求持续打进来”。
+
+## Executive Summary
+
+| 项目 | 结论 |
+| --- | --- |
+| 吞吐 | disk engine 在公开口径下高于 official |
+| 尾延迟 | `p99` 也一起更低 |
+| 稳定性口径 | 不只看 fresh single，也看 fresh 5-round median |
+| 运维可见性 | 首次 `/metrics` scrape 已从约 `30.7s` 降到约 `14ms` |
 
 ## Benchmark Shape
 
@@ -66,7 +93,7 @@ target/release/vtbench otlp-protobuf-load \
 - disk 吞吐提升约 `4.7%`
 - disk `p99` 降低约 `20.9%`
 
-## Why This Result Matters
+## What This Means For Adopters
 
 这组数据说明的不是“某个实验分支偶然跑出一次好成绩”，而是下面三件更重要的事：
 
@@ -93,7 +120,7 @@ target/release/vtbench otlp-protobuf-load \
 
 这对真实部署很重要，因为 open-source 用户不会只看写入 benchmark，他们也会马上抓 `/metrics`、看 health、做 query。
 
-## How To Reproduce
+## Reproduce It Yourself
 
 下面是最接近我们这份报告口径的复现方式。
 
@@ -174,6 +201,20 @@ memory 和 disk 只需要把 URL 分别改成：
 
 - 当前主线已经足够强，可以公开展示
 - 但它还有继续拉开差距的空间
+
+## 如何正确解读这份报告
+
+推荐的公开解读方式是：
+
+- 这是一个已经具备正式发布候选气质的 Rust Trace 存储系统
+- 在 AI-Agent 风格的小请求 OTLP ingest 口径下，disk engine 当前公开成绩高于 official
+- 这个结果同时覆盖了吞吐、`p99` 和 metrics 可见性
+
+不推荐的解读方式是：
+
+- “在所有 trace workload 下都绝对更快”
+- “memory engine 代表最终上限”
+- “所有读路径瓶颈都已经解决”
 
 ## Bottom Line
 

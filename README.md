@@ -1,22 +1,77 @@
 # Rust Victoria Trace
 
-这是对 VictoriaTraces 核心能力的一次 Rust 重写。目前已经具备可运行的单机链路、集群角色拆分、Jaeger/Tempo 查询兼容层、logs 写入/查询垂直切片，以及可运行的 OTLP/HTTP、OTLP/gRPC、TLS/mTLS 和成员治理控制面。
+> AI-Agent时代的Trace存储系统
+>
+> 面向 Agent 工作流、工具调用链和高频小请求 OTLP ingest 的自托管 Trace 后端。
+> 标准 OpenTelemetry 接入，磁盘优先存储，兼容 Jaeger / Tempo 查询接口，可直接运行在常见 64 位 Linux 上。
 
-## 最新性能报告
+`rust_victoria_trace` 不只是对 VictoriaTraces 核心能力的一次 Rust 重写。它瞄准的是 AI-Agent 时代更常见的观测形态：大量短 trace、频繁 fan-out / fan-in、工具调用链、near-realtime 调试，以及对标准协议和自托管部署路径的更高要求。
 
-- 对外性能报告见：[2026-04-06 OTLP Ingest Performance Report](./docs/2026-04-06-otlp-ingest-performance-report.md)
-- 正式版本/生产发布说明见：[Production Release Guide](./docs/production-release-guide.md)
-- 在 commit `0019f74` 的同机同口径测试中，disk engine 在 fresh single 和 fresh 5-round median 上都高于 official VictoriaTraces
-- fresh single：official `396475.630 spans/s / p99 0.673ms`，disk `430192.512 spans/s / p99 0.409ms`
-- fresh 5-round median：official `343086.506 spans/s / p99 0.902ms`，disk `359315.329 spans/s / p99 0.713ms`
-- 这版还把 5 轮压测后的首次 `/metrics` scrape 从约 `30.7s` 压到了约 `14ms`
+如果你需要的是一套能够：
 
-## Linux / Production Release
+- 直接接 OTLP/HTTP 和 OTLP/gRPC
+- 在磁盘引擎上保持不错的 ingest 吞吐和更低的 tail latency
+- 跑在常见 `x86_64` / `aarch64` Linux 上
+- 同时兼容 Jaeger / Tempo 查询生态
 
-- 正式 release 目标平台是常见 64 位 Linux：`x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu`
-- 仓库提供了 GitHub Actions Linux release workflow：`.github/workflows/linux-release.yml`
-- 仓库提供了开箱即用的容器构建入口：[Dockerfile](./Dockerfile)
-- merge 到 `master` 前，请按 [Production Release Guide](./docs/production-release-guide.md) 的 gate 逐项检查
+的 Trace 存储系统，这个项目就是为这类场景准备的。
+
+## 快速导航
+
+- 性能报告：[2026-04-06 OTLP Ingest Performance Report](./docs/2026-04-06-otlp-ingest-performance-report.md)
+- 正式发布说明：[Production Release Guide](./docs/production-release-guide.md)
+- Linux release workflow：`.github/workflows/linux-release.yml`
+- 容器入口：[Dockerfile](./Dockerfile)
+
+## 为什么它适合 AI-Agent 时代
+
+| 典型问题 | AI-Agent 系统里的表现 | 本项目提供的能力 |
+| --- | --- | --- |
+| 高频小请求写入 | 一个 agent run 会拆成很多 tool spans、workflow spans、RPC spans | 磁盘引擎针对小请求 OTLP ingest 做了持续优化 |
+| 需要近实时可见性 | 调试 agent loop 时，trace 晚几秒可见都很难受 | `/metrics` 可见性链路已做专项优化 |
+| 生态必须标准化 | 你通常已经在用 OpenTelemetry、Jaeger、Tempo | 原生 OTLP 接入，兼容 Jaeger / Tempo 查询接口 |
+| 部署要可控 | 生产常常需要自托管、Linux、容器和二进制交付 | Linux tarball、Dockerfile、GitHub Actions release workflow 都已就位 |
+
+## 当前公开性能
+
+下面这组公开结果来自同机、同口径、clean start 的 `vtbench otlp-protobuf-load`。
+这个 benchmark 形状很贴近 AI-Agent 常见的高频小请求写入：
+
+```bash
+target/release/vtbench otlp-protobuf-load \
+  --duration-secs=5 \
+  --warmup-secs=1 \
+  --concurrency=32 \
+  --spans-per-request=5 \
+  --payload-variants=1024
+```
+
+对外完整说明见 [2026-04-06 OTLP Ingest Performance Report](./docs/2026-04-06-otlp-ingest-performance-report.md)。
+
+| target | fresh single spans/s | fresh single p99 | fresh 5-round median spans/s | fresh 5-round median p99 |
+| --- | ---: | ---: | ---: | ---: |
+| official VictoriaTraces | `396475.630` | `0.673 ms` | `343086.506` | `0.902 ms` |
+| Rust disk engine | `430192.512` | `0.409 ms` | `359315.329` | `0.713 ms` |
+
+当前公开基准里，disk engine：
+
+- fresh single 吞吐高于 official，约 `+8.5%`
+- fresh 5-round median 也高于 official，约 `+4.7%`
+- `p99` 在 single run 和 5-round median 上都更低
+- 5 轮压测后的首次 `/metrics` scrape 已从约 `30.7s` 降到约 `14ms`
+
+## 部署方式
+
+| 方式 | 适合场景 | 入口 |
+| --- | --- | --- |
+| 预构建 Linux tarball | 裸机、VM、生产发布 | GitHub Releases |
+| Docker | 容器化部署、PoC、Kubernetes 镜像封装 | [Dockerfile](./Dockerfile) |
+| 从源码构建 | 本地开发、定制编译、基准测试 | `cargo build --release -p vtapi -p vtbench` |
+
+正式 release 目标平台是常见 64 位 Linux：
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
 
 ## 使用预构建 Linux Release
 
@@ -27,7 +82,7 @@
 - `rust-victoria-trace-linux-aarch64.tar.gz`
 - `rust-victoria-trace-linux-aarch64.tar.gz.sha256`
 
-`x86_64` 节点的最小使用方式：
+`x86_64` 节点的最小启动方式：
 
 ```bash
 RELEASE=v0.1.0
@@ -52,7 +107,7 @@ VT_API_CONCURRENCY_LIMIT=1024 \
 
 ## 运行容器镜像
 
-仓库根目录的 `Dockerfile` 会构建一个 production-biased 的 disk-engine 运行镜像，默认启用：
+仓库根目录的 `Dockerfile` 会构建一个 production-biased 的 disk-engine 镜像。当前默认值包括：
 
 - `VT_STORAGE_MODE=disk`
 - `VT_STORAGE_SYNC_POLICY=data`
@@ -60,7 +115,7 @@ VT_API_CONCURRENCY_LIMIT=1024 \
 - `VT_MAX_REQUEST_BODY_BYTES=8388608`
 - `VT_API_CONCURRENCY_LIMIT=1024`
 
-本地构建和启动示例：
+容器以 non-root 用户运行，并自带 `HEALTHCHECK`。
 
 ```bash
 docker build -t rust-victoria-trace:local .
@@ -70,60 +125,162 @@ docker run --rm \
   rust-victoria-trace:local
 ```
 
-容器起来之后同样先检查：
+容器起来之后建议立即检查：
 
 - `curl http://127.0.0.1:13000/healthz`
+- `curl http://127.0.0.1:13000/metrics | head`
 - 确认挂载目录下出现 WAL 和 `.part` 文件
 
-## 当前能力
+## 从源码构建
 
-- 标准 OTLP/HTTP 写入路径 `POST /v1/traces`
-- `POST /v1/traces` 同时支持 `application/json` 和 `application/x-protobuf`
-- 标准 OTLP/HTTP logs 写入路径 `POST /v1/logs`
-- `POST /v1/logs` 同时支持 `application/json` 和 `application/x-protobuf`
-- span 扁平化为结构化行记录
-- OTLP log record 扁平化为共享存储内核上的结构化行记录
+```bash
+cargo build --release -p vtapi -p vtbench
+```
+
+启动一个磁盘模式单机节点：
+
+```bash
+VT_STORAGE_MODE=disk \
+VT_STORAGE_PATH=./var/vt-single \
+VT_STORAGE_SYNC_POLICY=data \
+VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608 \
+VT_MAX_REQUEST_BODY_BYTES=8388608 \
+VT_API_CONCURRENCY_LIMIT=1024 \
+target/release/vtapi
+```
+
+## 5 分钟接入和使用
+
+下面是一条最短可验证路径：启动单机节点、写入一个 OTLP/HTTP JSON trace、再把它查出来。
+
+先确认服务已经起来：
+
+```bash
+curl http://127.0.0.1:13000/healthz
+```
+
+写入一个示例 trace：
+
+```bash
+curl -X POST http://127.0.0.1:13000/v1/traces \
+  -H 'content-type: application/json' \
+  -d '{
+    "resource_spans": [
+      {
+        "resource_attributes": [
+          { "key": "service.name", "value": { "kind": "string", "value": "agent-runtime" } }
+        ],
+        "scope_spans": [
+          {
+            "scope_name": "demo.agent",
+            "scope_version": "1.0.0",
+            "scope_attributes": [],
+            "spans": [
+              {
+                "trace_id": "trace-agent-demo-1",
+                "span_id": "span-agent-demo-1",
+                "parent_span_id": null,
+                "name": "tool_call.search_docs",
+                "start_time_unix_nano": 100,
+                "end_time_unix_nano": 180,
+                "attributes": [
+                  { "key": "agent.name", "value": { "kind": "string", "value": "planner" } },
+                  { "key": "tool.name", "value": { "kind": "string", "value": "search_docs" } }
+                ],
+                "status": { "code": 0, "message": "OK" }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+按 trace id 查询完整 trace：
+
+```bash
+curl http://127.0.0.1:13000/api/traces/trace-agent-demo-1
+```
+
+按 service 和时间窗口搜索：
+
+```bash
+curl "http://127.0.0.1:13000/api/v1/traces/search?start_unix_nano=50&end_unix_nano=200&service_name=agent-runtime&limit=10"
+```
+
+列出当前 services：
+
+```bash
+curl http://127.0.0.1:13000/api/v1/services
+```
+
+如果你已经在用 OpenTelemetry SDK 或 Collector，也可以直接把 trace export 指向：
+
+- OTLP/HTTP traces：`POST /v1/traces`
+- OTLP/gRPC traces：`POST /opentelemetry.proto.collector.trace.v1.TraceService/Export`
+
+## 正式发布与生产可用性
+
+当前仓库已经具备正式 release 所需的基础发布链路：
+
+- GitHub Actions workflow：`.github/workflows/linux-release.yml`
+- Linux `x86_64` / `aarch64` tarball 产物
+- `.sha256` 校验文件
+- non-root Docker runtime + `HEALTHCHECK`
+- [Production Release Guide](./docs/production-release-guide.md) 中定义的 merge gate
+
+如果你准备把这版 merge 到 `master` 或发 `v*` tag，先按 [Production Release Guide](./docs/production-release-guide.md) 的 gate 逐项检查。
+
+## 能力全景
+
+### 接入与查询
+
+- 标准 OTLP/HTTP traces：`POST /v1/traces`
+- 标准 OTLP/HTTP logs：`POST /v1/logs`
+- 标准 OTLP/gRPC unary traces：`POST /opentelemetry.proto.collector.trace.v1.TraceService/Export`
+- 标准 OTLP/gRPC unary logs：`POST /opentelemetry.proto.collector.logs.v1.LogsService/Export`
+- `application/json` 和 `application/x-protobuf` 两种 OTLP/HTTP 负载
+- trace 查询、service 列表、trace 搜索、logs 搜索
+- Jaeger 兼容 services / operations / traces
+- Tempo 兼容 trace / search / tags / tag values
+
+### 存储与可见性
+
+- memory engine 和 disk engine
+- span / log record 扁平化为结构化行记录
 - 按 trace 维护时间窗口索引
-- 内存版和磁盘版本地存储引擎
-- 活动 WAL 加 sealed `.part` 文件持久化，并带 sidecar 元数据
-- WAL record checksum、坏尾部截断恢复和可配置 `fsync` 策略
-- 重启恢复和 segment 轮转后的自动小 part 压实
-- sealed `.part` trace 读取支持 part 级 selective decode
-- trace 查询、service 列表、trace 搜索
-- trace 搜索支持按时间范围、service 名称、operation 名称和通用字段过滤
-- logs 搜索支持按时间范围、service 名称、severity 和通用字段过滤
-- 每个 trace 维护 operation bloom hint 和精确 operation 索引
-- 每个 trace 维护通用字段 bloom hint 和精确 field/value 索引
-- Jaeger 兼容的 services、operations、trace 查询和 trace 搜索接口
-- Tempo 兼容的 trace 查询、search、tags 和 tag values 接口
-- 标准 OTLP/gRPC unary 写入路径 `POST /opentelemetry.proto.collector.trace.v1.TraceService/Export`
-- 标准 OTLP/gRPC unary logs 写入路径 `POST /opentelemetry.proto.collector.logs.v1.LogsService/Export`
-- `insert` / `storage` / `select` 三类集群角色
-- 基于 weighted rendezvous 的稳定副本放置，支持节点权重和拓扑域感知
-- 写入时副本并发 fan-out
-- 可配置的写 quorum
-- 可配置的读 quorum
-- trace 读取时可由快副本优先返回，避免被慢副本拖住
-- 成功读 quorum 后的 read repair
-- 用于修复目标副本缺失的管理型 cluster rebalance
-- `select` 管理面可返回 cluster members 视图并主动探测 storage 健康
-- `select` 控制面支持 control peers、稳定 leader 选举和 leader-gated rebalance
-- `select` 控制面支持 peer state anti-entropy 和 epoch 视图
-- `select` 控制面支持 journal 视图、journal append 和 leader 事件/治理事件复制
-- `select` 可配置后台 membership refresh 轮询
-- `select` 可配置后台 control refresh 轮询
-- `select` 可配置后台 rebalance 轮询
-- 故障节点的失败退避和临时隔离
-- 请求体大小限制和 fail-fast 并发保护
-- public / internal / admin 三类 bearer token 边界
-- 可选的服务端 HTTPS / mTLS
-- 服务端证书文件轮询热加载
-- `insert` / `select` 到 `storage` 的 HTTPS/mTLS cluster client
-- cluster client 的 CA / client cert / client key 文件轮询热加载
-- 每个角色都暴露 Prometheus 风格指标
-- 自带 `vtbench` 压测/基准工具，支持持续时长模式、p50/p95/p99/p999 延迟输出、时间序列报告和可注入故障窗口
+- WAL + sealed `.part` 持久化，并带 sidecar 元数据
+- checksum、坏尾部截断恢复和可配置 `fsync` 策略
+- segment 轮转、重启恢复和小 `.part` 自动压实
+- part 级 selective decode
+- operation bloom hint、operation 精确索引、field/value 精确索引
+- `/metrics` 首次 scrape 可见性链路已做专项优化
 
-## 运行单机模式
+### 集群与一致性
+
+- `insert` / `storage` / `select` 三类角色
+- weighted rendezvous 副本放置，支持节点权重和拓扑域感知
+- 写入并发 fan-out
+- 可配置 write quorum / read quorum
+- 快副本优先读、read repair、cluster rebalance
+- control peers、leader 选举、peer state anti-entropy、epoch 视图
+- journal 视图、journal append、leader 事件/治理事件复制
+- membership / control / rebalance 后台轮询
+- 故障节点失败退避和临时隔离
+
+### 安全与运维
+
+- public / internal / admin 三类 bearer token 边界
+- 服务端 HTTPS / mTLS
+- cluster client HTTPS / mTLS
+- 证书和私钥文件轮询热加载
+- 每个角色都暴露 Prometheus 风格指标
+- 自带 `vtbench`，支持持续时长模式、warmup、p50 / p95 / p99 / p999、时间序列报告和故障窗口
+
+## 详细运行与配置参考
+
+### 运行单机模式
 
 ```bash
 cargo run -p vtapi
@@ -145,7 +302,7 @@ cargo run -p vtapi
 
 - `127.0.0.1:13000`
 
-## 运行基础集群
+### 运行基础集群
 
 先启动两个 storage 节点：
 
@@ -205,7 +362,7 @@ VT_BIND_ADDR=127.0.0.1:13002 \
 cargo run -p vtapi
 ```
 
-## 启用 TLS / mTLS
+### 启用 TLS / mTLS
 
 服务端 TLS：
 
@@ -236,7 +393,7 @@ VT_CLUSTER_TLS_RELOAD_INTERVAL_SECS=30 \
 cargo run -p vtapi
 ```
 
-## 常用环境变量
+### 常用环境变量
 
 - `VT_STORAGE_SYNC_POLICY`
   - `none` 或 `data`
@@ -283,7 +440,7 @@ cargo run -p vtapi
 - `VT_CLUSTER_TLS_INSECURE_SKIP_VERIFY`
   - 仅调试用途；允许跳过服务端证书校验
 
-## 主要接口
+### 主要接口
 
 单机模式或 select 角色：
 
@@ -335,7 +492,7 @@ storage 角色：
 - `GET /internal/v1/traces/search`
 - `GET /internal/v1/traces/:trace_id`
 
-## 基准工具
+### 基准工具
 
 ```bash
 cargo run -p vtbench -- storage-ingest --rows=100000 --batch-size=1000
@@ -377,7 +534,7 @@ cargo run -p vtbench -- http-ingest --requests=40 --spans-per-request=2 --concur
 - `latency_max_ms`
 - `timeline`
 
-## 生产部署建议
+### 生产部署建议
 
 - 用至少 `3` 个 `storage` 节点，`insert` / `select` 各自多实例并放在负载均衡后面，再按副本数设置 `write_quorum` / `read_quorum`
 - 对外发布前先用 `vtbench`、真实流量回放和故障演练产出吞吐、P99、节点失效恢复和证书轮换报告
