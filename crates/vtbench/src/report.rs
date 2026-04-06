@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRunReport {
     pub report_version: u32,
     pub replay_id: String,
@@ -25,7 +25,7 @@ pub struct CanonicalRunReport {
     pub timeline: Option<Vec<Value>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyStats {
     pub samples: usize,
     pub p50_ms: f64,
@@ -52,7 +52,7 @@ impl LatencyStats {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRunManifest {
     pub replay_id: String,
     pub mode: String,
@@ -68,7 +68,7 @@ pub struct CanonicalRunManifest {
     pub files: ManifestFiles,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestFiles {
     pub report: String,
     pub env: String,
@@ -81,7 +81,7 @@ pub struct ManifestFiles {
     pub metrics: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextSnapshot {
     pub mode: String,
     pub options: BTreeMap<String, Value>,
@@ -90,14 +90,14 @@ pub struct ContextSnapshot {
     pub comparison_arms: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandTrace {
     pub tool: String,
     pub cwd: String,
     pub argv: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionSnapshot {
     pub status: String,
     pub public_report: bool,

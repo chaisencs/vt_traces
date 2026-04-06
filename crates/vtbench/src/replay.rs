@@ -24,6 +24,7 @@ pub struct ReplayMetadata {
     pub replay_id: String,
     pub cwd: PathBuf,
     pub git: GitMetadata,
+    pub executable_path: PathBuf,
     pub raw_args: Vec<String>,
     pub command_display: String,
 }
@@ -49,11 +50,13 @@ impl ReplayMetadata {
         let cwd = env::current_dir().context("resolve current directory")?;
         let git = capture_git_metadata(&cwd)?;
         let replay_id = build_replay_id(mode);
-        let command_display = build_command_display(mode, raw_args);
+        let executable_path = env::current_exe().context("resolve current executable")?;
+        let command_display = build_command_display(&executable_path, mode, raw_args);
         Ok(Self {
             replay_id,
             cwd,
             git,
+            executable_path,
             raw_args: raw_args.to_vec(),
             command_display,
         })
@@ -110,8 +113,12 @@ impl ArtifactBundle {
             .with_context(|| format!("write {}", self.run_dir.join("stderr.log").display()))?;
         fs::write(self.run_dir.join("metrics.txt"), metrics_text)
             .with_context(|| format!("write {}", self.run_dir.join("metrics.txt").display()))?;
-        fs::write(self.run_dir.join("rerun.sh"), build_rerun_script(report))
+        fs::write(self.run_dir.join("rerun.sh"), build_rerun_script(metadata, report))
             .with_context(|| format!("write {}", self.run_dir.join("rerun.sh").display()))?;
+        let targets_dir = self.run_dir.join("targets");
+        fs::create_dir_all(&targets_dir)
+            .with_context(|| format!("create {}", targets_dir.display()))?;
+        write_json(&targets_dir.join("primary.json"), report)?;
         Ok(())
     }
 }
@@ -168,8 +175,8 @@ fn build_replay_id(mode: &str) -> String {
     format!("{sanitized}-{millis}-{}", std::process::id())
 }
 
-fn build_command_display(mode: &str, raw_args: &[String]) -> String {
-    std::iter::once("vtbench".to_string())
+fn build_command_display(executable_path: &Path, mode: &str, raw_args: &[String]) -> String {
+    std::iter::once(executable_path.display().to_string())
         .chain(std::iter::once(mode.to_string()))
         .chain(raw_args.iter().cloned())
         .map(|arg| shell_escape(&arg))
@@ -177,9 +184,10 @@ fn build_command_display(mode: &str, raw_args: &[String]) -> String {
         .join(" ")
 }
 
-fn build_rerun_script(report: &CanonicalRunReport) -> String {
+fn build_rerun_script(metadata: &ReplayMetadata, report: &CanonicalRunReport) -> String {
     format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\n{}\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\ncd {}\n{}\n",
+        shell_escape(&metadata.cwd.display().to_string()),
         report.command_display
     )
 }

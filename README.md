@@ -20,6 +20,9 @@
 
 - 性能报告：[2026-04-06 OTLP Ingest Performance Report](./docs/2026-04-06-otlp-ingest-performance-report.md)
 - 正式发布说明：[Production Release Guide](./docs/production-release-guide.md)
+- Harness QA 方案：[2026-04-06 Harness QA Plan](./docs/plans/2026-04-06-harness-qa-plan.md)
+- Benchmark QA 目录：[docs/benchmarks](./docs/benchmarks/README.md)
+- Harness QA workflow：`.github/workflows/harness-qa.yml`
 - Linux release workflow：`.github/workflows/linux-release.yml`
 - 容器入口：[Dockerfile](./Dockerfile)
 
@@ -59,6 +62,26 @@ target/release/vtbench otlp-protobuf-load \
 - fresh 5-round median 也高于 official，约 `+4.7%`
 - `p99` 在 single run 和 5-round median 上都更低
 - 5 轮压测后的首次 `/metrics` scrape 已从约 `30.7s` 降到约 `14ms`
+
+## Harness QA 与可复现 benchmark
+
+这个项目现在不只是在仓库里放了一些 benchmark 命令，还开始把 benchmark 当成正式 QA 资产管理。
+
+当前已经具备的 QA 底盘包括：
+
+- `vtbench` canonical run bundle
+- replayable `rerun.sh`
+- benchmark guardrails
+- report comparator
+- benchmark scenario catalog / noise model / reference solutions
+- dedicated `.github/workflows/harness-qa.yml`
+
+这意味着后续无论是性能优化线程、发布线程还是稳定性回归，都可以用同一套证据模型来验证：
+
+- 这次结果是不是同口径
+- 这次回退是不是真的代码回退
+- 这条 public benchmark 结论能不能复现
+- 这个 incident 有没有沉淀成长期回归资产
 
 ## 部署方式
 
@@ -225,10 +248,12 @@ curl http://127.0.0.1:13000/api/v1/services
 当前仓库已经具备正式 release 所需的基础发布链路：
 
 - GitHub Actions workflow：`.github/workflows/linux-release.yml`
+- Harness QA workflow：`.github/workflows/harness-qa.yml`
 - Linux `x86_64` / `aarch64` tarball 产物
 - `.sha256` 校验文件
 - non-root Docker runtime + `HEALTHCHECK`
 - [Production Release Guide](./docs/production-release-guide.md) 中定义的 merge gate
+- [docs/benchmarks](./docs/benchmarks/README.md) 中定义的 benchmark QA 资产和 incident-to-eval 流程
 
 如果你准备把这版 merge 到 `master` 或发 `v*` tag，先按 [Production Release Guide](./docs/production-release-guide.md) 的 gate 逐项检查。
 

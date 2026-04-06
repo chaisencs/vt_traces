@@ -32,12 +32,13 @@ use vtstorage::{
 
 mod replay;
 mod report;
+mod compare;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
     let (mode, option_args) = raw_args.split_first().ok_or_else(|| {
-        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load|disk-trace-block-append> [--key=value ...]")
+        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load|disk-trace-block-append|compare-report> [--key=value ...]")
     })?;
     let options = parse_options(option_args.iter().cloned())?;
     let replay_metadata = replay::ReplayMetadata::capture(mode, option_args)?;
@@ -49,8 +50,32 @@ async fn main() -> anyhow::Result<()> {
         "http-ingest" => run_http_ingest(options, &replay_metadata).await,
         "otlp-protobuf-load" => run_otlp_protobuf_load(options, &replay_metadata).await,
         "disk-trace-block-append" => run_disk_trace_block_append(options, &replay_metadata),
+        "compare-report" => run_compare_report(options),
         _ => bail!("unknown mode: {mode}"),
     }
+}
+
+fn run_compare_report(options: BenchOptions) -> anyhow::Result<()> {
+    let baseline_file = options
+        .baseline_file
+        .as_ref()
+        .ok_or_else(|| anyhow!("--baseline-file is required for compare-report"))?;
+    let candidate_file = options
+        .candidate_file
+        .as_ref()
+        .ok_or_else(|| anyhow!("--candidate-file is required for compare-report"))?;
+    let config = compare::CompareConfig {
+        throughput_regression_pct: options.throughput_regression_pct.unwrap_or(5.0),
+        p99_regression_pct: options.p99_regression_pct.unwrap_or(10.0),
+    };
+    let outcome = compare::compare_reports(baseline_file, candidate_file, &config)?;
+    println!("comparison_status=pass");
+    println!("within_noise_budget={}", outcome.within_noise_budget);
+    println!("throughput_delta_pct={:.3}", outcome.throughput_delta_pct);
+    if let Some(delta) = outcome.p99_delta_pct {
+        println!("p99_delta_pct={delta:.3}");
+    }
+    Ok(())
 }
 
 fn run_storage_ingest(
@@ -575,6 +600,10 @@ struct BenchOptions {
     report_file: Option<PathBuf>,
     artifacts_root: Option<PathBuf>,
     storage_path: Option<PathBuf>,
+    baseline_file: Option<PathBuf>,
+    candidate_file: Option<PathBuf>,
+    throughput_regression_pct: Option<f64>,
+    p99_regression_pct: Option<f64>,
     clean_start: bool,
     public_report: bool,
     comparison_arms: Vec<String>,
@@ -604,6 +633,10 @@ impl Default for BenchOptions {
             report_file: None,
             artifacts_root: None,
             storage_path: None,
+            baseline_file: None,
+            candidate_file: None,
+            throughput_regression_pct: None,
+            p99_regression_pct: None,
             clean_start: false,
             public_report: false,
             comparison_arms: Vec::new(),
@@ -640,6 +673,12 @@ fn parse_options(args: impl Iterator<Item = String>) -> anyhow::Result<BenchOpti
             "report-file" => options.report_file = Some(PathBuf::from(value)),
             "artifacts-root" => options.artifacts_root = Some(PathBuf::from(value)),
             "storage-path" => options.storage_path = Some(PathBuf::from(value)),
+            "baseline-file" => options.baseline_file = Some(PathBuf::from(value)),
+            "candidate-file" => options.candidate_file = Some(PathBuf::from(value)),
+            "throughput-regression-pct" => {
+                options.throughput_regression_pct = Some(value.parse()?)
+            }
+            "p99-regression-pct" => options.p99_regression_pct = Some(value.parse()?),
             "clean-start" => options.clean_start = parse_bool_flag(value)?,
             "public-report" => options.public_report = parse_bool_flag(value)?,
             "comparison-arms" => {
@@ -701,6 +740,25 @@ impl BenchOptions {
             "storage_path".to_string(),
             json!(self.storage_path.as_ref().map(|path| path.display().to_string())),
         );
+        map.insert(
+            "baseline_file".to_string(),
+            json!(self
+                .baseline_file
+                .as_ref()
+                .map(|path| path.display().to_string())),
+        );
+        map.insert(
+            "candidate_file".to_string(),
+            json!(self
+                .candidate_file
+                .as_ref()
+                .map(|path| path.display().to_string())),
+        );
+        map.insert(
+            "throughput_regression_pct".to_string(),
+            json!(self.throughput_regression_pct),
+        );
+        map.insert("p99_regression_pct".to_string(), json!(self.p99_regression_pct));
         map.insert("clean_start".to_string(), json!(self.clean_start));
         map.insert("public_report".to_string(), json!(self.public_report));
         map.insert("comparison_arms".to_string(), json!(self.comparison_arms));

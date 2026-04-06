@@ -1,0 +1,153 @@
+name: harness-qa
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
+      - "codex/**"
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fast-pr-smoke:
+    name: fast-pr-smoke
+    runs-on: ubuntu-22.04
+    if: github.event_name != 'schedule'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.73.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        run: cargo test --workspace -- --nocapture
+
+  harness-integrity:
+    name: harness-integrity
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.73.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run vtbench tests
+        run: cargo test -p vtbench -- --nocapture
+
+      - name: Run reference scenarios
+        run: |
+          mkdir -p "$RUNNER_TEMP/harness-runs"
+          cargo run -p vtbench -- storage-ingest \
+            --rows=20 \
+            --batch-size=5 \
+            --artifacts-root="$RUNNER_TEMP/harness-runs/storage"
+          cargo run -p vtbench -- disk-trace-block-append \
+            --requests=2 \
+            --blocks-per-append=1 \
+            --spans-per-block=2 \
+            --storage-path="$RUNNER_TEMP/harness-disk" \
+            --clean-start=true \
+            --artifacts-root="$RUNNER_TEMP/harness-runs/disk"
+
+      - name: Upload harness artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-runs
+          path: ${{ runner.temp }}/harness-runs
+
+  nightly-reference-matrix:
+    name: nightly-reference-matrix
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.73.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build vtbench
+        run: cargo build -p vtbench
+
+      - name: Run nightly reference scenarios
+        run: |
+          mkdir -p "$RUNNER_TEMP/nightly-harness"
+          cargo run -p vtbench -- storage-ingest \
+            --rows=100 \
+            --batch-size=10 \
+            --artifacts-root="$RUNNER_TEMP/nightly-harness/storage"
+          cargo run -p vtbench -- http-ingest \
+            --requests=16 \
+            --spans-per-request=2 \
+            --concurrency=4 \
+            --artifacts-root="$RUNNER_TEMP/nightly-harness/http"
+          cargo run -p vtbench -- disk-trace-block-append \
+            --requests=4 \
+            --blocks-per-append=1 \
+            --spans-per-block=2 \
+            --storage-path="$RUNNER_TEMP/nightly-harness/disk-data" \
+            --clean-start=true \
+            --artifacts-root="$RUNNER_TEMP/nightly-harness/disk"
+
+      - name: Upload nightly harness artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-harness-runs
+          path: ${{ runner.temp }}/nightly-harness
+
+  release-evidence:
+    name: release-evidence
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.73.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify release evidence docs exist
+        run: |
+          test -f docs/benchmarks/incident-to-eval.md
+          test -f docs/benchmarks/transcript-review-template.md
+          test -f docs/production-release-guide.md
+
+      - name: Generate replayable release evidence bundle
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-evidence"
+          cargo run -p vtbench -- storage-ingest \
+            --rows=20 \
+            --batch-size=5 \
+            --artifacts-root="$RUNNER_TEMP/release-evidence"
+          run_dir="$(find "$RUNNER_TEMP/release-evidence" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+          bash "$run_dir/rerun.sh"
+
+      - name: Upload release evidence artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence
+          path: ${{ runner.temp }}/release-evidence

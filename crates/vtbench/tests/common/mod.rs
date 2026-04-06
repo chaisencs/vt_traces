@@ -74,3 +74,11 @@ pub fn read_json(path: &Path) -> Value {
 pub fn path_string(path: &Path) -> String {
     path.display().to_string()
 }
+
+pub fn write_json(path: &Path, value: &Value) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent");
+    }
+    fs::write(path, serde_json::to_vec_pretty(value).expect("json"))
+        .expect("write json");
+}

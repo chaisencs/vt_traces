@@ -1,12 +1,11 @@
 name: linux-release
 
 on:
-  pull_request:
   push:
     branches:
       - master
       - main
-      - codex/perf-trace-microbatch-leap
+      - "codex/**"
     tags:
       - "v*"
   workflow_dispatch:

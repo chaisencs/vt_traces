@@ -27,8 +27,8 @@
 | 二进制交付 | GitHub Actions 产出 Linux tarball 和 `.sha256` |
 | 容器交付 | 仓库根目录 `Dockerfile`，non-root 运行，带 `HEALTHCHECK` |
 | 推荐运行模式 | `disk` engine，显式 durability 和请求限流 |
-| 文档入口 | `README.md`、性能报告、本指南 |
-| merge gate | workspace tests、release build、Linux workflow、artifact、Docker smoke、benchmark 证据 |
+| 文档入口 | `README.md`、性能报告、`docs/benchmarks/`、本指南 |
+| merge gate | workspace tests、harness QA workflow、release build、Linux workflow、artifact、Docker smoke、benchmark 证据 |
 
 ## Supported Release Targets
 
@@ -41,16 +41,25 @@ Development and benchmarking may still happen on macOS, but Linux is the release
 
 ## Release Artifacts
 
-The repository now carries three release-friendly entry points:
+The repository now carries five release-friendly entry points:
 
-1. GitHub Actions workflow: `.github/workflows/linux-release.yml`
-2. Container build: `Dockerfile`
-3. Public benchmark write-up: `docs/2026-04-06-otlp-ingest-performance-report.md`
+1. GitHub Actions harness workflow: `.github/workflows/harness-qa.yml`
+2. GitHub Actions release workflow: `.github/workflows/linux-release.yml`
+3. Container build: `Dockerfile`
+4. Public benchmark write-up: `docs/2026-04-06-otlp-ingest-performance-report.md`
+5. Benchmark QA catalog: `docs/benchmarks/README.md`
 
 The GitHub Actions workflow does two different jobs on Linux:
 
 - native `x86_64` test + release build
 - cross-built `aarch64` release build
+
+The dedicated harness workflow adds a separate quality lane for:
+
+- workspace smoke correctness
+- `vtbench` harness integrity
+- nightly reference scenarios
+- release evidence replay
 
 For the `x86_64` job, the workflow also builds the repository `Dockerfile` and smoke-checks `GET /healthz`.
 
@@ -148,16 +157,21 @@ Recommended operational checks:
 Before merging a formal version to `master`, require all of the following:
 
 1. `cargo test --workspace -- --nocapture` passes
-2. `cargo build --release -p vtapi -p vtbench` passes
-3. GitHub Actions `linux-release` workflow is green on the branch
-4. Linux `x86_64` and `aarch64` artifacts are produced successfully
-5. Docker smoke on Linux `x86_64` passes
-6. Release artifact checksums are generated successfully
-7. Public docs are current:
+2. `cargo test -p vtbench -- --nocapture` passes
+3. `cargo build --release -p vtapi -p vtbench` passes
+4. GitHub Actions `harness-qa` workflow is green on the branch
+5. GitHub Actions `linux-release` workflow is green on the branch
+6. Release-facing benchmark runs have replay bundles and transcript review assets
+7. `docs/benchmarks/incident-to-eval.md` policy has no unresolved blocker for the release claim
+8. Linux `x86_64` and `aarch64` artifacts are produced successfully
+9. Docker smoke on Linux `x86_64` passes
+10. Release artifact checksums are generated successfully
+11. Public docs are current:
    - `README.md`
    - `docs/2026-04-06-otlp-ingest-performance-report.md`
+   - `docs/benchmarks/README.md`
    - this guide
-8. Benchmark evidence still shows disk above official on the agreed OTLP protobuf ingest shape
+12. Benchmark evidence still shows disk above official on the agreed OTLP protobuf ingest shape
 
 ## Current Validation Snapshot
 
