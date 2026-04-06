@@ -2,6 +2,14 @@
 
 这是对 VictoriaTraces 核心能力的一次 Rust 重写。目前已经具备可运行的单机链路、集群角色拆分、Jaeger/Tempo 查询兼容层、logs 写入/查询垂直切片，以及可运行的 OTLP/HTTP、OTLP/gRPC、TLS/mTLS 和成员治理控制面。
 
+## 最新性能报告
+
+- 对外性能报告见：[2026-04-06 OTLP Ingest Performance Report](./docs/2026-04-06-otlp-ingest-performance-report.md)
+- 在 commit `0019f74` 的同机同口径测试中，disk engine 在 fresh single 和 fresh 5-round median 上都高于 official VictoriaTraces
+- fresh single：official `396475.630 spans/s / p99 0.673ms`，disk `430192.512 spans/s / p99 0.409ms`
+- fresh 5-round median：official `343086.506 spans/s / p99 0.902ms`，disk `359315.329 spans/s / p99 0.713ms`
+- 这版还把 5 轮压测后的首次 `/metrics` scrape 从约 `30.7s` 压到了约 `14ms`
+
 ## 当前能力
 
 - 标准 OTLP/HTTP 写入路径 `POST /v1/traces`
