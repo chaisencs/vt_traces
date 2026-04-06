@@ -45,6 +45,7 @@ const WAL_HEADER_BYTES: u64 = (WAL_MAGIC.len() + 1) as u64;
 const LOG_WAL_HEADER_BYTES: u64 = (LOG_WAL_MAGIC.len() + 1) as u64;
 const DEFAULT_TARGET_SEGMENT_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 const COMPACTION_TARGET_MULTIPLIER: u64 = 16;
+const STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT: usize = 8192;
 const TRACE_WAL_WRITER_CAPACITY_BYTES: usize = 1024 * 1024;
 const PART_FIELD_TYPE_STRING: u8 = 0;
 const PART_FIELD_TYPE_I64: u8 = 1;
@@ -113,7 +114,7 @@ pub struct DiskStorageEngine {
     segments_path: PathBuf,
     segment_paths: RwLock<FxHashMap<u64, PathBuf>>,
     trace_shards: Vec<RwLock<DiskTraceShardState>>,
-    pending_trace_updates: Mutex<Vec<(usize, Vec<LiveTraceUpdate>)>>,
+    pending_trace_updates: Mutex<VecDeque<(usize, Vec<LiveTraceUpdate>)>>,
     append_combiners: Vec<Mutex<DiskTraceAppendCombinerState>>,
     append_combiner_stats: Vec<DiskTraceAppendCombinerStats>,
     active_segments: Vec<Mutex<Option<ActiveSegment>>>,
@@ -626,7 +627,7 @@ impl DiskStorageEngine {
                 .into_iter()
                 .map(RwLock::new)
                 .collect(),
-            pending_trace_updates: Mutex::new(Vec::new()),
+            pending_trace_updates: Mutex::new(VecDeque::new()),
             append_combiners,
             append_combiner_stats,
             active_segments,
@@ -762,16 +763,24 @@ impl DiskStorageEngine {
             return;
         }
         let mut pending = self.pending_trace_updates.lock();
-        pending.push((shard_index, updates));
+        pending.push_back((shard_index, updates));
     }
 
     fn drain_pending_trace_updates(&self) {
-        let pending = {
+        self.drain_pending_trace_updates_with_limit(usize::MAX);
+    }
+
+    fn drain_pending_trace_updates_with_limit(&self, max_batches: usize) {
+        if max_batches == 0 {
+            return;
+        }
+        let pending: Vec<_> = {
             let mut pending = self.pending_trace_updates.lock();
             if pending.is_empty() {
                 return;
             }
-            std::mem::take(&mut *pending)
+            let take = pending.len().min(max_batches);
+            pending.drain(..take).collect()
         };
         for (shard_index, updates) in pending {
             self.trace_shards[shard_index]
@@ -1216,7 +1225,7 @@ impl StorageEngine for DiskStorageEngine {
     }
 
     fn stats(&self) -> StorageStatsSnapshot {
-        self.drain_pending_trace_updates();
+        self.drain_pending_trace_updates_with_limit(STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT);
         let segment_paths = self.segment_paths.read();
         let (rows_ingested, traces_tracked) =
             self.trace_shards
@@ -4286,10 +4295,17 @@ mod tests {
     use super::{
         collect_live_trace_updates_from_prepared_rows, merge_sorted_row_locations,
         prepare_block_row_metadata, prepare_shared_group_metadata, trace_block_shard_index,
-        trace_shard_index, BatchInternCache, PreparedTraceBlockAppend, PreparedTraceShardBatch,
-        SegmentAccumulator, SegmentRowLocation, SegmentTraceAccumulator,
+        trace_shard_index, BatchInternCache, DiskStorageConfig, DiskStorageEngine, LiveTraceUpdate,
+        PreparedTraceBlockAppend, PreparedTraceShardBatch, SegmentAccumulator, SegmentRowLocation,
+        SegmentTraceAccumulator, STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT,
     };
+    use crate::StorageEngine;
     use serde_json::Value;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
     use vtcore::{Field, TraceBlock, TraceSpanRow};
 
     fn row(segment_id: u64, row_index: u32, start: i64, end: i64) -> SegmentRowLocation {
@@ -4335,6 +4351,16 @@ mod tests {
             candidate += 1;
         }
         trace_ids
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rust-vt-disk-unit-{name}-{nanos}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
     }
 
     #[test]
@@ -4636,6 +4662,51 @@ mod tests {
                 "second block shared-group indexes should be remapped behind the first block",
             );
         }
+    }
+
+    #[test]
+    fn disk_stats_only_drain_a_bounded_number_of_pending_trace_update_batches() {
+        let path = temp_test_dir("stats-bounded-drain");
+        let engine = DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default().with_trace_shards(1),
+        )
+        .expect("open disk engine");
+
+        for index in 0..(STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT + 1) {
+            engine.enqueue_live_trace_updates_for_shard(
+                0,
+                vec![LiveTraceUpdate {
+                    trace_id: format!("trace-stats-bounded-{index}").into(),
+                    start_unix_nano: index as i64,
+                    end_unix_nano: index as i64 + 1,
+                    services: Vec::new().into(),
+                    operations: Vec::new().into(),
+                    indexed_fields: Vec::new().into(),
+                    row_locations: vec![row(1, index as u32, index as i64, index as i64 + 1)],
+                }],
+            );
+        }
+
+        let stats = engine.stats();
+        let pending_after_stats = engine.pending_trace_updates.lock().len();
+
+        assert_eq!(
+            stats.rows_ingested,
+            STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT as u64
+        );
+        assert_eq!(pending_after_stats, 1);
+        assert!(
+            engine
+                .trace_window(&format!(
+                    "trace-stats-bounded-{}",
+                    STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT
+                ))
+                .is_some(),
+            "query paths should still fully drain pending trace updates for visibility",
+        );
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
     }
 
     #[test]

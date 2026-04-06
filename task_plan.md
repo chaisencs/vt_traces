@@ -160,7 +160,8 @@ Phase 17
 - Recovery line is now in place: passthrough engines bypass outer trace batching again, and disk-only same-host A/B puts current head back near the `f326503` direct-write band.
 - The new `vtbench disk-trace-block-append` harness now proves the disk kernel scales materially with larger same-shard append packets; the next unresolved task is exposing that gain to end-to-end HTTP ingest with a cheaper handoff than the rejected outer microbatch layer.
 - Reusing the outer batching envelope for passthrough trace appends has now been re-tested and rejected; it regressed disk to about `375492 spans/s`, so the next gain must stay disk-local.
-- The disk-local same-shard combiner is now in its stronger form: it queues raw `TraceBlock`s before prepare, picks up one more pending same-shard wave after the first prepare pass, and still passes its dedicated concurrency regression test.
-- Fresh clean-start benchmarking now has disk clearly above official on both fresh single-run (`430473 spans/s` vs `391557`) and fresh 5-round median (`423781` vs `390899`) with better p99 in both cases.
-- The lead is materially better than the earlier combiner checkpoint, but the combiner still only reduced disk output blocks from `1681824` input blocks to `1648770` output blocks across the 5-round run, so the next real bottleneck remains forming materially larger same-shard append packets cheaply and paying down read-side drain debt.
+- The disk-local same-shard combiner should stay in its raw-queue / late-pickup form; an extra pre-prepare raw-block fusion attempt regressed disk throughput and has been dropped.
+- Read-side bounded drain is now in place for `stats()`, so `/metrics` no longer blocks on the full live-update backlog.
+- Fresh clean-start benchmarking after keeping only the bounded stats-side drain still has disk above official on both fresh single-run (`430192 spans/s` vs `396475`) and fresh 5-round median (`359315` vs `343086`) with better p99 in both cases.
+- The next real bottleneck is still forming materially larger same-shard append packets cheaply on the write path, while query/read paths beyond `stats()` still carry the full live-update drain debt.
 - A fresh disk-only `VT_STORAGE_TRACE_SHARDS=4/8/16` sweep shows `16` shards still wins on this host, so shard-count reduction is not the next high-value move.

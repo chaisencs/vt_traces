@@ -217,19 +217,20 @@ This is deliberately narrower than the failed async-worker route. The handoff on
 
 ### Current Execution Outcome
 
-The disk-local same-shard combiner now clears Gate H on this machine, and the stronger raw-block queue variant widens the margin further:
+The disk-local same-shard combiner clears Gate H on this machine, but one follow-on write-path idea has already been rejected and one read-path debt has now been paid down:
 
 | run | official | disk |
 | --- | ---: | ---: |
-| fresh single | `391557.761 spans/s`, `p99 0.691ms` | `430473.274 spans/s`, `p99 0.423ms` |
-| fresh 5-round median | `390899.877 spans/s`, `p99 0.674ms` | `423781.852 spans/s`, `p99 0.431ms` |
+| fresh single | `396475.630 spans/s`, `p99 0.673ms` | `430192.512 spans/s`, `p99 0.409ms` |
+| fresh 5-round median | `343086.506 spans/s`, `p99 0.902ms` | `359315.329 spans/s`, `p99 0.713ms` |
 
 Two follow-on conclusions are now locked in:
 
 1. Reusing the outer batching envelope for passthrough trace appends is not the next win; a fresh re-test dropped disk to about `375492 spans/s`, so that route stays rejected.
-2. The stronger disk-local variant should stay on the mainline: queue raw `TraceBlock`s before prepare, then drain one more pending same-shard wave after the first prepare pass. That change raised post-run physical append reduction from `1414336 -> 1409140` to `1681824 -> 1648770`.
+2. Extra pre-prepare raw-block fusion is also not the next win; a fresh re-test dropped disk to about `420970 spans/s` fresh single and `407471` fresh 5-round median, so that route stays rejected too.
+3. Bounded `stats()`-side drain is worth keeping; it cut the first post-run `/metrics` scrape from about `30.7s` to about `14ms` without giving back the ingest lead over official.
 
-The margin is now real but still not a large blowout. Post-run metrics still show only light cross-request coalescing on the HTTP path, and the first `/metrics` scrape after the 5-round disk run took about `30.7s`, so the remaining work is not "recover the disk lead" anymore; it is "turn the current lead into a visibly larger one without reintroducing queue overhead, while separately paying down read-side drain debt."
+The margin is still real but not a large blowout. Post-run metrics still show only light cross-request coalescing on the HTTP path (`1442528` input blocks vs `1416916` output blocks on the latest clean 5-round run), so the remaining work is not "recover the disk lead" anymore; it is "turn the current lead into a visibly larger one on the write path without reintroducing queue overhead, while query/read paths beyond `stats()` still need separate live-update drain cleanup."
 
 ## Explicitly Rejected Routes
 
