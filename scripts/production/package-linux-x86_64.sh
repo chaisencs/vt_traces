@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: package-linux-x86_64.sh [--output-dir <dir>] [--skip-build]
+usage: package-linux-x86_64.sh [--output-dir <dir>] [--skip-build] [--disable-mimalloc]
 
 Builds a Linux x86_64 release bundle containing:
 - vtapi
@@ -19,6 +19,7 @@ EOF
 
 OUTPUT_DIR=""
 SKIP_BUILD=0
+DISABLE_MIMALLOC=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,6 +29,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-build)
       SKIP_BUILD=1
+      shift
+      ;;
+    --disable-mimalloc)
+      DISABLE_MIMALLOC=1
       shift
       ;;
     -h|--help)
@@ -68,7 +73,11 @@ mkdir -p "$STAGE_DIR"
 cd "$REPO_ROOT"
 
 if (( ! SKIP_BUILD )); then
-  cargo build --release -p vtapi -p vtbench
+  BUILD_ARGS=(cargo build --release -p vtapi -p vtbench)
+  if (( DISABLE_MIMALLOC )); then
+    BUILD_ARGS+=(--no-default-features)
+  fi
+  "${BUILD_ARGS[@]}"
 fi
 
 install -m 0755 target/release/vtapi "$STAGE_DIR/vtapi"

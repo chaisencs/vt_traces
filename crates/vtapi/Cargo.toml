@@ -3,11 +3,15 @@ name = "vtapi"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["mimalloc_allocator"]
+mimalloc_allocator = ["dep:mimalloc"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 hyper-util.workspace = true
-mimalloc.workspace = true
+mimalloc = { workspace = true, optional = true }
 reqwest.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true

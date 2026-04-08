@@ -29,6 +29,12 @@ If you need a release bundle from a Linux `x86_64` build machine, use:
 ./scripts/production/package-linux-x86_64.sh
 ```
 
+On older enterprise distros such as CentOS 7, build with the system allocator instead of `mimalloc`:
+
+```bash
+./scripts/production/package-linux-x86_64.sh --disable-mimalloc
+```
+
 That produces:
 
 - `dist/rust-victoria-trace-linux-x86_64.tar.gz`

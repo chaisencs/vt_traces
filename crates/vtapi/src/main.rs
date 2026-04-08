@@ -1,5 +1,6 @@
 use std::{collections::HashMap, env, fs, net::SocketAddr, sync::Arc, time::Duration};
 
+#[cfg(feature = "mimalloc_allocator")]
 use mimalloc::MiMalloc;
 use reqwest::{Certificate, Client, Identity};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -17,6 +18,7 @@ use vtstorage::{
     DiskSyncPolicy, MemoryStorageEngine, StorageEngine,
 };
 
+#[cfg(feature = "mimalloc_allocator")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
