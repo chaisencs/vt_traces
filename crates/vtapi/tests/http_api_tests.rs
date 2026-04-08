@@ -33,9 +33,10 @@ use vtapi::{
     build_router_with_storage_and_trace_ingest_profile, build_router_with_storage_auth_and_limits,
     build_select_router, build_select_router_with_auth_and_limits,
     build_select_router_with_client_auth_and_limits, build_storage_router,
-    build_storage_router_with_auth_and_limits, build_storage_router_with_limits, serve_app,
-    spawn_background_rebalance_task, ApiLimitsConfig, AuthConfig, ClusterConfig, ClusterHttpClient,
-    ClusterHttpClientConfig, ServerTlsConfig, TraceIngestProfile,
+    build_storage_router_with_auth_and_limits, build_storage_router_with_limits,
+    build_storage_router_with_startup_auth_and_limits, serve_app, spawn_background_rebalance_task,
+    ApiLimitsConfig, AuthConfig, ClusterConfig, ClusterHttpClient, ClusterHttpClientConfig,
+    ServerTlsConfig, StorageStartupState, TraceIngestProfile,
 };
 use vtcore::{
     encode_trace_rows, LogRow, LogSearchRequest, TraceSearchHit, TraceSearchRequest, TraceSpanRow,
@@ -326,6 +327,57 @@ async fn healthz_returns_ok() {
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn storage_router_binds_and_returns_service_unavailable_until_startup_finishes() {
+    let startup = StorageStartupState::starting();
+    let server = spawn_server(build_storage_router_with_startup_auth_and_limits(
+        Arc::new(MemoryStorageEngine::new()),
+        startup.clone(),
+        AuthConfig::default(),
+        ApiLimitsConfig::default(),
+    ))
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build reqwest client");
+
+    let health_response = client
+        .get(server.url("/healthz"))
+        .send()
+        .await
+        .expect("startup healthz response");
+    assert_eq!(health_response.status(), ReqwestStatusCode::SERVICE_UNAVAILABLE);
+    let health_body: Value = health_response
+        .json()
+        .await
+        .expect("startup healthz body");
+    assert_eq!(health_body["status"], "starting");
+
+    let services_response = client
+        .get(server.url("/internal/v1/services"))
+        .send()
+        .await
+        .expect("startup services response");
+    assert_eq!(services_response.status(), ReqwestStatusCode::SERVICE_UNAVAILABLE);
+
+    startup.mark_ready();
+
+    let ready_health_response = client
+        .get(server.url("/healthz"))
+        .send()
+        .await
+        .expect("ready healthz response");
+    assert_eq!(ready_health_response.status(), ReqwestStatusCode::OK);
+
+    let ready_services_response = client
+        .get(server.url("/internal/v1/services"))
+        .send()
+        .await
+        .expect("ready services response");
+    assert_eq!(ready_services_response.status(), ReqwestStatusCode::OK);
 }
 
 #[tokio::test]

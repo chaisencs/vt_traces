@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -133,6 +133,62 @@ struct StorageState {
     storage: Arc<dyn StorageEngine>,
     query: QueryService,
     trace_ingest_profile: TraceIngestProfile,
+    startup: StorageStartupState,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageStartupState {
+    ready: Arc<AtomicBool>,
+    failed: Arc<Mutex<Option<String>>>,
+}
+
+impl Default for StorageStartupState {
+    fn default() -> Self {
+        Self::ready()
+    }
+}
+
+impl StorageStartupState {
+    pub fn ready() -> Self {
+        Self {
+            ready: Arc::new(AtomicBool::new(true)),
+            failed: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn starting() -> Self {
+        Self {
+            ready: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        self.failed
+            .lock()
+            .expect("startup state mutex poisoned")
+            .clone()
+    }
+
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Relaxed);
+        *self
+            .failed
+            .lock()
+            .expect("startup state mutex poisoned") = None;
+    }
+
+    pub fn mark_failed(&self, error: impl Into<String>) {
+        self.ready.store(false, Ordering::Relaxed);
+        *self
+            .failed
+            .lock()
+            .expect("startup state mutex poisoned") = Some(error.into());
+    }
 }
 
 struct InsertState {
@@ -1201,69 +1257,89 @@ pub fn build_router_with_storage_auth_limits_and_trace_ingest_profile(
     limits: ApiLimitsConfig,
     trace_ingest_profile: TraceIngestProfile,
 ) -> Router {
+    build_router_with_storage_startup_auth_limits_and_trace_ingest_profile(
+        storage,
+        StorageStartupState::ready(),
+        auth,
+        limits,
+        trace_ingest_profile,
+    )
+}
+
+pub fn build_router_with_storage_startup_auth_limits_and_trace_ingest_profile(
+    storage: Arc<dyn StorageEngine>,
+    startup: StorageStartupState,
+    auth: AuthConfig,
+    limits: ApiLimitsConfig,
+    trace_ingest_profile: TraceIngestProfile,
+) -> Router {
     let state = Arc::new(StorageState {
         storage: storage.clone(),
         query: QueryService::new(storage),
         trace_ingest_profile,
+        startup: startup.clone(),
     });
 
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/healthz", get(storage_healthz))
         .route("/metrics", get(storage_metrics))
         .merge(apply_optional_bearer_auth(
-            apply_api_limits(
-                Router::new()
-                    .route("/api/v1/services", get(list_services_local))
-                    .route("/api/v1/logs/search", get(search_logs_local))
-                    .route("/api/v1/traces/search", get(search_traces_local))
-                    .route("/api/v1/logs/ingest", post(ingest_logs_local))
-                    .route("/api/v1/traces/ingest", post(ingest_traces_local))
-                    .route("/v1/logs", post(ingest_logs_local))
-                    .route("/v1/traces", post(ingest_traces_local))
-                    .route(
-                        "/insert/opentelemetry/v1/traces",
-                        post(ingest_traces_local),
-                    )
-                    .route(
-                        "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-                        post(ingest_logs_grpc_local),
-                    )
-                    .route(
-                        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
-                        post(ingest_traces_grpc_local),
-                    )
-                    .route("/api/v1/traces/:trace_id", get(get_trace_local))
-                    .route("/api/traces/:trace_id", get(get_trace_tempo_local))
-                    .route("/api/v2/traces/:trace_id", get(get_trace_tempo_local))
-                    .route("/api/search", get(search_traces_tempo_local))
-                    .route("/api/search/tags", get(list_tempo_tags_local))
-                    .route("/api/v2/search/tags", get(list_tempo_tags_v2_local))
-                    .route(
-                        "/api/search/tag/:tag_name/values",
-                        get(list_tempo_tag_values_local),
-                    )
-                    .route(
-                        "/api/v2/search/tag/:tag_name/values",
-                        get(list_tempo_tag_values_v2_local),
-                    )
-                    .route(
-                        "/select/jaeger/api/services",
-                        get(list_services_jaeger_local),
-                    )
-                    .route(
-                        "/select/jaeger/api/services/:service_name/operations",
-                        get(list_operations_jaeger_local),
-                    )
-                    .route("/select/jaeger/api/traces", get(search_traces_jaeger_local))
-                    .route(
-                        "/select/jaeger/api/dependencies",
-                        get(get_jaeger_dependencies_local),
-                    )
-                    .route(
-                        "/select/jaeger/api/traces/:trace_id",
-                        get(get_trace_jaeger_local),
-                    ),
-                &limits,
+            apply_storage_startup_gate(
+                apply_api_limits(
+                    Router::new()
+                        .route("/api/v1/services", get(list_services_local))
+                        .route("/api/v1/logs/search", get(search_logs_local))
+                        .route("/api/v1/traces/search", get(search_traces_local))
+                        .route("/api/v1/logs/ingest", post(ingest_logs_local))
+                        .route("/api/v1/traces/ingest", post(ingest_traces_local))
+                        .route("/v1/logs", post(ingest_logs_local))
+                        .route("/v1/traces", post(ingest_traces_local))
+                        .route(
+                            "/insert/opentelemetry/v1/traces",
+                            post(ingest_traces_local),
+                        )
+                        .route(
+                            "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+                            post(ingest_logs_grpc_local),
+                        )
+                        .route(
+                            "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+                            post(ingest_traces_grpc_local),
+                        )
+                        .route("/api/v1/traces/:trace_id", get(get_trace_local))
+                        .route("/api/traces/:trace_id", get(get_trace_tempo_local))
+                        .route("/api/v2/traces/:trace_id", get(get_trace_tempo_local))
+                        .route("/api/search", get(search_traces_tempo_local))
+                        .route("/api/search/tags", get(list_tempo_tags_local))
+                        .route("/api/v2/search/tags", get(list_tempo_tags_v2_local))
+                        .route(
+                            "/api/search/tag/:tag_name/values",
+                            get(list_tempo_tag_values_local),
+                        )
+                        .route(
+                            "/api/v2/search/tag/:tag_name/values",
+                            get(list_tempo_tag_values_v2_local),
+                        )
+                        .route(
+                            "/select/jaeger/api/services",
+                            get(list_services_jaeger_local),
+                        )
+                        .route(
+                            "/select/jaeger/api/services/:service_name/operations",
+                            get(list_operations_jaeger_local),
+                        )
+                        .route("/select/jaeger/api/traces", get(search_traces_jaeger_local))
+                        .route(
+                            "/select/jaeger/api/dependencies",
+                            get(get_jaeger_dependencies_local),
+                        )
+                        .route(
+                            "/select/jaeger/api/traces/:trace_id",
+                            get(get_trace_jaeger_local),
+                        ),
+                    &limits,
+                ),
+                &startup,
             ),
             auth.public_bearer_token().map(ToString::to_string),
         ))
@@ -1286,31 +1362,49 @@ pub fn build_storage_router_with_auth_and_limits(
     auth: AuthConfig,
     limits: ApiLimitsConfig,
 ) -> Router {
+    build_storage_router_with_startup_auth_and_limits(
+        storage,
+        StorageStartupState::ready(),
+        auth,
+        limits,
+    )
+}
+
+pub fn build_storage_router_with_startup_auth_and_limits(
+    storage: Arc<dyn StorageEngine>,
+    startup: StorageStartupState,
+    auth: AuthConfig,
+    limits: ApiLimitsConfig,
+) -> Router {
     let state = Arc::new(StorageState {
         storage: storage.clone(),
         query: QueryService::new(storage),
         trace_ingest_profile: TraceIngestProfile::Default,
+        startup: startup.clone(),
     });
 
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/healthz", get(storage_healthz))
         .route("/metrics", get(storage_metrics))
         .merge(apply_optional_bearer_auth(
-            apply_api_limits(
-                Router::new()
-                    .route("/internal/v1/rows", post(append_rows_internal))
-                    .route("/internal/v1/logs", post(append_logs_internal))
-                    .route("/internal/v1/traces/index", get(list_trace_ids_local))
-                    .route("/internal/v1/services", get(list_services_local))
-                    .route("/internal/v1/tags", get(list_tags_local))
-                    .route(
-                        "/internal/v1/tags/:tag_name/values",
-                        get(list_tag_values_local),
-                    )
-                    .route("/internal/v1/logs/search", get(search_logs_local))
-                    .route("/internal/v1/traces/search", get(search_traces_local))
-                    .route("/internal/v1/traces/:trace_id", get(get_trace_local)),
-                &limits,
+            apply_storage_startup_gate(
+                apply_api_limits(
+                    Router::new()
+                        .route("/internal/v1/rows", post(append_rows_internal))
+                        .route("/internal/v1/logs", post(append_logs_internal))
+                        .route("/internal/v1/traces/index", get(list_trace_ids_local))
+                        .route("/internal/v1/services", get(list_services_local))
+                        .route("/internal/v1/tags", get(list_tags_local))
+                        .route(
+                            "/internal/v1/tags/:tag_name/values",
+                            get(list_tag_values_local),
+                        )
+                        .route("/internal/v1/logs/search", get(search_logs_local))
+                        .route("/internal/v1/traces/search", get(search_traces_local))
+                        .route("/internal/v1/traces/:trace_id", get(get_trace_local)),
+                    &limits,
+                ),
+                &startup,
             ),
             auth.internal_bearer_token().map(ToString::to_string),
         ))
@@ -1715,6 +1809,16 @@ where
     ))
 }
 
+fn apply_storage_startup_gate<S>(router: Router<S>, startup: &StorageStartupState) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.route_layer(middleware::from_fn_with_state(
+        Arc::new(startup.clone()),
+        enforce_storage_startup_ready,
+    ))
+}
+
 async fn enforce_concurrency_limit(
     State(semaphore): State<Arc<Semaphore>>,
     request: Request,
@@ -1740,8 +1844,48 @@ async fn enforce_bearer_token(
     }
 }
 
+async fn enforce_storage_startup_ready(
+    State(startup): State<Arc<StorageStartupState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    if startup.is_ready() {
+        return Ok(next.run(request).await);
+    }
+
+    Err(storage_startup_unavailable(&startup))
+}
+
 async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn storage_healthz(
+    State(state): State<Arc<StorageState>>,
+) -> (StatusCode, Json<HealthResponse>) {
+    if state.startup.is_ready() {
+        return (StatusCode::OK, Json(HealthResponse { status: "ok" }));
+    }
+
+    let status = if state.startup.failure().is_some() {
+        "failed"
+    } else {
+        "starting"
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(HealthResponse { status }),
+    )
+}
+
+fn storage_startup_unavailable(
+    startup: &StorageStartupState,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let error = startup
+        .failure()
+        .map(|error| format!("storage startup failed: {error}"))
+        .unwrap_or_else(|| "storage startup in progress".to_string());
+    (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error }))
 }
 
 async fn ingest_traces_local(

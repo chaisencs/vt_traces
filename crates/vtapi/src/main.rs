@@ -1,4 +1,11 @@
-use std::{collections::HashMap, env, fs, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    env, fs,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    thread,
+    time::Duration,
+};
 
 #[cfg(feature = "mimalloc_allocator")]
 use mimalloc::MiMalloc;
@@ -6,12 +13,14 @@ use reqwest::{Certificate, Client, Identity};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use vtapi::{
     build_insert_router_with_client_auth_and_limits,
-    build_router_with_storage_auth_limits_and_trace_ingest_profile,
-    build_select_router_with_client_auth_and_limits, build_storage_router_with_auth_and_limits,
+    build_router_with_storage_startup_auth_limits_and_trace_ingest_profile,
+    build_select_router_with_client_auth_and_limits,
+    build_storage_router_with_startup_auth_and_limits,
     serve_app, spawn_background_control_refresh_task_with_client_and_auth,
     spawn_background_membership_refresh_task_with_client_and_auth,
-    spawn_background_rebalance_task_with_client_and_auth, ApiLimitsConfig, AuthConfig,
-    ClusterConfig, ClusterHttpClient, ClusterHttpClientConfig, ServerTlsConfig, TraceIngestProfile,
+    spawn_background_rebalance_task_with_client_and_auth, ApiLimitsConfig, AuthConfig, ClusterConfig,
+    ClusterHttpClient, ClusterHttpClientConfig, ServerTlsConfig, StorageStartupState,
+    TraceIngestProfile,
 };
 use vtstorage::{
     BatchingStorageConfig, BatchingStorageEngine, DiskStorageConfig, DiskStorageEngine,
@@ -68,17 +77,8 @@ async fn main() -> anyhow::Result<()> {
             auth.clone(),
             limits.clone(),
         ),
-        "storage" => build_storage_router_with_auth_and_limits(
-            load_storage(trace_ingest_profile)?,
-            auth.clone(),
-            limits.clone(),
-        ),
-        _ => build_router_with_storage_auth_limits_and_trace_ingest_profile(
-            load_storage(trace_ingest_profile)?,
-            auth.clone(),
-            limits.clone(),
-            trace_ingest_profile,
-        ),
+        "storage" => build_storage_startup_app(trace_ingest_profile, auth.clone(), limits.clone()),
+        _ => build_single_startup_app(trace_ingest_profile, auth.clone(), limits.clone()),
     };
 
     if role == "select" {
@@ -204,7 +204,7 @@ fn disk_overrides_for_trace_ingest_profile(
     }
 }
 
-fn load_storage(
+fn load_storage_sync(
     trace_ingest_profile: TraceIngestProfile,
 ) -> anyhow::Result<Arc<dyn StorageEngine>> {
     let storage_mode = env::var("VT_STORAGE_MODE").unwrap_or_else(|_| "memory".to_string());
@@ -315,6 +315,171 @@ fn load_storage(
     Ok(Arc::new(BatchingStorageEngine::with_config(
         storage, batching,
     )))
+}
+
+fn build_storage_startup_app(
+    trace_ingest_profile: TraceIngestProfile,
+    auth: AuthConfig,
+    limits: ApiLimitsConfig,
+) -> axum::Router {
+    let startup = StorageStartupState::starting();
+    let deferred = Arc::new(DeferredStorageEngine::default());
+    let deferred_storage: Arc<dyn StorageEngine> = deferred.clone();
+    let loader_startup = startup.clone();
+    let loader_storage = deferred.clone();
+    thread::spawn(move || match load_storage_sync(trace_ingest_profile) {
+        Ok(storage) => {
+            loader_storage.install(storage);
+            loader_startup.mark_ready();
+        }
+        Err(error) => {
+            loader_startup.mark_failed(error.to_string());
+        }
+    });
+
+    let app = build_storage_router_with_startup_auth_and_limits(
+        deferred_storage,
+        startup,
+        auth,
+        limits,
+    );
+    app
+}
+
+fn build_single_startup_app(
+    trace_ingest_profile: TraceIngestProfile,
+    auth: AuthConfig,
+    limits: ApiLimitsConfig,
+) -> axum::Router {
+    let startup = StorageStartupState::starting();
+    let deferred = Arc::new(DeferredStorageEngine::default());
+    let deferred_storage: Arc<dyn StorageEngine> = deferred.clone();
+    let loader_startup = startup.clone();
+    let loader_storage = deferred.clone();
+    thread::spawn(move || match load_storage_sync(trace_ingest_profile) {
+        Ok(storage) => {
+            loader_storage.install(storage);
+            loader_startup.mark_ready();
+        }
+        Err(error) => {
+            loader_startup.mark_failed(error.to_string());
+        }
+    });
+
+    let app = build_router_with_storage_startup_auth_limits_and_trace_ingest_profile(
+        deferred_storage,
+        startup,
+        auth,
+        limits,
+        trace_ingest_profile,
+    );
+    app
+}
+
+#[derive(Default)]
+struct DeferredStorageEngine {
+    inner: RwLock<Option<Arc<dyn StorageEngine>>>,
+}
+
+impl DeferredStorageEngine {
+    fn install(&self, storage: Arc<dyn StorageEngine>) {
+        *self
+            .inner
+            .write()
+            .expect("deferred storage rwlock poisoned") = Some(storage);
+    }
+
+    fn ready_storage(&self) -> Result<Arc<dyn StorageEngine>, vtstorage::StorageError> {
+        self.inner
+            .read()
+            .expect("deferred storage rwlock poisoned")
+            .clone()
+            .ok_or_else(|| vtstorage::StorageError::Message("storage startup in progress".to_string()))
+    }
+}
+
+impl StorageEngine for DeferredStorageEngine {
+    fn append_rows(&self, rows: Vec<vtcore::TraceSpanRow>) -> Result<(), vtstorage::StorageError> {
+        self.ready_storage()?.append_rows(rows)
+    }
+
+    fn append_logs(&self, rows: Vec<vtcore::LogRow>) -> Result<(), vtstorage::StorageError> {
+        self.ready_storage()?.append_logs(rows)
+    }
+
+    fn trace_window(&self, trace_id: &str) -> Option<vtcore::TraceWindow> {
+        self.ready_storage()
+            .ok()
+            .and_then(|storage| storage.trace_window(trace_id))
+    }
+
+    fn list_trace_ids(&self) -> Vec<String> {
+        self.ready_storage()
+            .map(|storage| storage.list_trace_ids())
+            .unwrap_or_default()
+    }
+
+    fn list_services(&self) -> Vec<String> {
+        self.ready_storage()
+            .map(|storage| storage.list_services())
+            .unwrap_or_default()
+    }
+
+    fn list_field_names(&self) -> Vec<String> {
+        self.ready_storage()
+            .map(|storage| storage.list_field_names())
+            .unwrap_or_default()
+    }
+
+    fn list_field_values(&self, field_name: &str) -> Vec<String> {
+        self.ready_storage()
+            .map(|storage| storage.list_field_values(field_name))
+            .unwrap_or_default()
+    }
+
+    fn search_traces(
+        &self,
+        request: &vtcore::TraceSearchRequest,
+    ) -> Vec<vtcore::TraceSearchHit> {
+        self.ready_storage()
+            .map(|storage| storage.search_traces(request))
+            .unwrap_or_default()
+    }
+
+    fn search_logs(&self, request: &vtcore::LogSearchRequest) -> Vec<vtcore::LogRow> {
+        self.ready_storage()
+            .map(|storage| storage.search_logs(request))
+            .unwrap_or_default()
+    }
+
+    fn rows_for_trace(
+        &self,
+        trace_id: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+    ) -> Vec<vtcore::TraceSpanRow> {
+        self.ready_storage()
+            .map(|storage| storage.rows_for_trace(trace_id, start_unix_nano, end_unix_nano))
+            .unwrap_or_default()
+    }
+
+    fn stats(&self) -> vtstorage::StorageStatsSnapshot {
+        self.ready_storage()
+            .map(|storage| storage.stats())
+            .unwrap_or_default()
+    }
+
+    fn preferred_trace_ingest_shards(&self) -> usize {
+        self.ready_storage()
+            .map(|storage| storage.preferred_trace_ingest_shards())
+            .unwrap_or(1)
+    }
+
+    fn trace_batch_payload_mode(&self) -> vtstorage::TraceBatchPayloadMode {
+        self.ready_storage()
+            .map(|storage| storage.trace_batch_payload_mode())
+            .unwrap_or_default()
+    }
 }
 
 fn env_truthy(name: &str) -> bool {
