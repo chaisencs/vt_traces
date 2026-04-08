@@ -11,7 +11,7 @@ reqwest.workspace = true
 rustc-hash.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-vtapi = { path = "../vtapi" }
+vtapi = { path = "../vtapi", default-features = false }
 vtcore = { path = "../vtcore" }
 vtingest = { path = "../vtingest" }
 vtstorage = { path = "../vtstorage" }
