@@ -5,6 +5,10 @@
 - User explicitly wants the work pushed hard on performance and quality.
 - The target directory is currently empty, so the rewrite can establish its own project structure.
 - A literal full reimplementation of VictoriaTraces + VictoriaLogs parity is too large for one pass; we need a staged rewrite with a real working core.
+- This session must continue from `docs/handoffs/HANDOFF-2026-04-07-rust-vt-stable-throughput-query-gate.md`.
+- This session must first read `README.md`, `docs/2026-04-06-otlp-ingest-performance-report.md`, `/tmp/vt_throughput_profile_autotuned_20260407_181147/median.json`, and `/tmp/vt_throughput_autotuned_probe_20260407_181552/metrics.txt`.
+- This session may only do three things: lock the `stable` vs `throughput` release definition, run/evaluate the query gate, and produce production deployment guidance.
+- This session must not continue ingest hot-path changes, must not change the benchmark shape, and must not merge the default and high-throughput releases into one semantic tier.
 
 ## Research Findings
 - Official VictoriaTraces is built on top of VictoriaLogs rather than a standalone bespoke trace store.
@@ -54,6 +58,71 @@
 - Post-run combiner metrics show only light but real coalescing on the HTTP path: input blocks `1414336`, output blocks `1409140`, and max queue depth `6`. That means the recovered lead is not coming from huge cross-request batches yet; it is coming from the cheaper handoff plus the existing shard-batch append kernel.
 - The first `/metrics` scrape after the 5-round disk run still took about `9.7s`, which is more evidence that read-side `drain_pending_trace_updates()` remains the next visible debt even though pure ingest throughput is back above official.
 - A disk-only `VT_STORAGE_TRACE_SHARDS` sweep (`4`, `8`, `16`) landed at about `336939`, `378300`, and `388392 spans/s` respectively, so reducing shard count is not the next win on this machine; the default high-shard setup is still best among the tested points.
+- The current handoff explicitly defines the candidate release split as:
+  - `stable`: `VT_TRACE_INGEST_PROFILE=default` + `VT_STORAGE_SYNC_POLICY=data`
+  - `throughput`: `VT_TRACE_INGEST_PROFILE=throughput` + `VT_STORAGE_SYNC_POLICY=none` + `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=268435456`
+- The current strongest throughput benchmark artifact is `/tmp/vt_throughput_profile_autotuned_20260407_181147/median.json`, which reports `671273.875 spans/s` median with `p99=0.840916ms` and zero errors.
+- The associated throughput probe at `/tmp/vt_throughput_autotuned_probe_20260407_181552/metrics.txt` shows `vt_storage_trace_seal_queue_depth=0`, `vt_storage_trace_head_segments=10`, `vt_storage_trace_head_rows=2555440`, and zero `fsync` operations because the run is on `sync_policy=none`.
+- The current README already presents the project as a single-node `storage/select/insert` compatible trace backend and already documents a production-biased disk launch profile (`VT_STORAGE_MODE=disk`, `VT_STORAGE_PATH`, `VT_STORAGE_SYNC_POLICY=data`, `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608`, request/body and concurrency limits).
+- The ingest performance report is intentionally public-facing and still describes the mainline published benchmark as the disk engine beating official under a production-oriented path, not the new throughput-only release semantics.
+- The main unresolved production blocker is no longer ingest throughput; it is query performance plus near-realtime visibility for `trace-by-id`, `search`, `services`, `field-values`, and mixed read/write.
+- Local query gate root: `/tmp/vt_query_gate_20260407_200521`
+- `stable` local gate on this Apple Silicon host landed at roughly:
+  - preload write `3430.94 spans/s`, write `p99=254.20ms`
+  - static `trace-by-id` about `210.27 rps` with `p99=30ms`
+  - static `search` about `28563.76 rps`
+  - static `services` about `63489.40 rps`
+  - static `field-values` about `73174.41 rps`
+  - mixed write `3472.74 spans/s`, mixed `trace-by-id` about `244.82 rps` with `p99=13ms`
+- `throughput` local gate on this Apple Silicon host landed at roughly:
+  - preload write `418055.51 spans/s`, write `p99=1.18ms`
+  - static `trace-by-id` about `6.26 rps` with `p99=905ms`
+  - static `search` about `8662.82 rps` with a `4040ms` max outlier
+  - static `services` about `67410.34 rps`
+  - static `field-values` about `72645.28 rps`
+  - mixed write `409894.84 spans/s`, mixed `trace-by-id` about `6.92 rps` with `69` failed requests
+  - mixed `search` about `5716.42 rps` with a `5048ms` max outlier
+- Near-realtime visibility is strong for both tiers on the same host:
+  - `stable` ack-to-visible medians: `trace-by-id 0.50ms`, `search 0.52ms`, `services 0.48ms`, `field-values 0.48ms`
+  - `throughput` ack-to-visible medians: `trace-by-id 0.30ms`, `search 0.31ms`, `services 0.30ms`, `field-values 0.31ms`
+- The dominant query-plane risk on `throughput` is not ack-to-visible; it is backlog-era query / metrics instability:
+  - after the preload burst, `/metrics` timed out once at `10s` while the seal backlog was draining
+  - after the mixed read/write run, `/metrics` timed out again at `60s`
+- Root-cause split from code inspection:
+  - `list_services`, `list_field_names`, `list_field_values`, and `search_traces` still call `drain_pending_trace_updates()` directly on the request path in `crates/vtstorage/src/disk.rs`
+  - `stats()` no longer drains unbounded work, but it still applies up to `STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT=8192` update batches on the scrape path, also by taking shard write locks and calling `observe_live_updates(...)`
+  - `trace-by-id` does not drain pending live updates, but it still federates head reads by touching the active segment plus every sealing snapshot via `head_rows_for_trace(...)`; under `throughput + large segment + seal backlog`, this becomes the dominant read-path stall
+- Recommended fix split:
+  - Fix A: remove request-path live-update drain from `search/services/field-values/metrics`, and move it to an asynchronous background applier or a read overlay
+  - Fix B: keep a dedicated fast head trace-by-id index / cache so `rows_for_trace` does not pay for large sealing-snapshot federation during backlog
+- Low-value workaround to avoid: shrinking the throughput segment or reintroducing syncs just to hide the symptom would blur the release semantics and give back the ingest win
+- The dominant production risk on `stable` is not the query plane; it is that `data` sync on this host keeps ingest in a durability-first band that is orders of magnitude below the throughput tier.
+- Fresh query-plane decoupling artifacts now live under `/tmp/vt_query_gate_fix2_20260407_220316`.
+- The decoupling pass fixed the timeout part of the problem:
+  - `search/services/field-values` no longer block on request-path drain
+  - `/metrics` no longer times out after preload or mixed load
+  - post-preload `/metrics` now returns while reporting `trace_live_update_queue_depth=2677458`
+  - post-mixed `/metrics` now returns while reporting `trace_live_update_queue_depth=3921112`
+- The same pass made the remaining semantics explicit:
+  - static `throughput` after the fix:
+    - preload write `475276.74 spans/s`, `p99=0.978ms`
+    - `trace-by-id` about `75.29 rps`, `p99=756ms`, `errors=0`
+    - `search` about `28542.59 rps`, `p99=1ms`
+    - `services` about `34742.44 rps`
+    - `field-values` about `31334.15 rps`
+  - mixed `throughput` after the fix:
+    - write `335001.68 spans/s`, `p99=1.448ms`
+    - `search` about `3260.32 rps`
+    - `services` about `4590.41 rps`
+    - `field-values` about `4561.93 rps`
+    - `trace-by-id` still shows AB length-mismatch failures during concurrent writes because the probed trace keeps growing under the unchanged benchmark shape
+- Near-realtime visibility under heavy `throughput` backlog is now split by read model instead of hidden inside timeouts:
+  - `trace-by-id` stays near-realtime, with fresh visibility median about `0.48ms`
+  - `search` stayed invisible for `15s` in 5/5 backlog probes
+  - `services` and `field-values` stayed invisible for `5s` in 3/3 backlog probes, then appeared later once the background applier advanced
+- The next product decision is now clean:
+  - either ship `throughput` as an ingest-first / eventual-search SKU under backlog
+  - or add a read overlay / materially faster live-update apply path before calling `throughput` production-ready for near-realtime search/tag use
 
 ## Technical Decisions
 | Decision | Rationale |
@@ -81,6 +150,11 @@
 | Do not spend the next round lowering `trace_shards` | A fresh disk-only sweep shows `16` shards outperform `8` and `4`, so lower shard counts would reduce throughput on this host rather than unlock bigger combiner wins |
 | The current disk mainline still stays above official after keeping only the bounded stats-side drain fix | Fresh single-run is now official `396475.630 spans/s` vs disk `430192.512`, and fresh 5-round median is official `343086.506` vs disk `359315.329`; machine drift is high, but disk still keeps a real lead with better p99 |
 | Bounding `stats()`-side live-update drain pays down the largest visible read debt without hurting ingest | The first post-run `/metrics` scrape fell from about `30.7s` to about `14ms`, while fresh single and 5-round ingest both stayed above official |
+| `vtbench` now has a built-in baseline comparator | Optimization rounds can now be turned into explicit pass/fail gates with saved baseline/candidate reports instead of ad-hoc manual comparison |
+| Saved benchmark reports now carry stable comparison metadata | Schema version, git SHA, and benchmark-binary target arch / OS are now recorded so same-host comparisons can reject benchmark-shape drift and surface the exact revision being compared |
+| Production guidance should map onto VictoriaTraces' `insert` / `select` / `storage` split as directly as possible | The user wants a smooth migration path, including familiar storage path and logging controls rather than a brand-new operational model |
+| `stable` and `throughput` should stay as two separate release SKUs in docs and ops playbooks | Their write, durability, and post-burst query behavior diverge enough that one recommendation would be misleading |
+| The first production recommendation should be `stable`, not `throughput` | `throughput` keeps near-realtime visibility excellent, but its post-burst query plane and metrics endpoint still show backlog-driven stalls severe enough to require canary/soak before wider rollout |
 
 ## Issues Encountered
 | Issue | Resolution |
@@ -92,6 +166,7 @@
 | The async shard-worker experiment regressed disk ingest badly compared with checkpoint `2fd0eca` | Restored the `2fd0eca` mainline first, then resumed optimization from the known-good synchronous path |
 | Earlier performance reasoning over-weighted `observe_live_updates` even though the benchmark is pure ingest | Rechecked the write path and targeted append-time live-update construction instead of the later read-side drain |
 | A deeper disk prepared-row-batch fusion experiment regressed far below the current best branch | Reverted the experiment and kept the simpler disk passthrough / lighter prepare path on the mainline |
+| Throughput tier `/metrics` timed out during seal backlog drain and again after mixed load | Record it as a production risk; do not paper over it by measuring only after the backlog fully settles |
 
 ## Resources
 - Local clone from prior research:

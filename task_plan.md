@@ -4,7 +4,7 @@
 Build a production-oriented Rust rewrite of the VictoriaTraces core inside `rust_victoria_trace`, starting with a single-node ingest/storage/query vertical slice and an architecture that can expand to cluster mode later.
 
 ## Current Phase
-Phase 17
+Phase 19
 
 ## Phases
 
@@ -117,10 +117,27 @@ Phase 17
 - [x] Re-run same-host `vtbench otlp-protobuf-load` gates before deciding whether to keep pushing the route
 - **Status:** in_progress
 
+### Phase 18: Release Matrix & Query Gate
+- [x] Lock `stable` vs `throughput` as separate production release definitions
+- [x] Run query gate for `trace-by-id`, `search`, `services`, `field-values`, and mixed read/write
+- [x] Evaluate near-realtime query visibility and production deployment guidance
+- [x] Document results in README / release guide
+- **Status:** complete
+
+### Phase 19: Query-Plane Decoupling
+- [x] Remove request-path live-update drain from `search/services/field-values`
+- [x] Move live-update apply into a background worker and keep `/metrics` off the drain path
+- [x] Cache persisted field-column counts so `stats()` stops rereading every `.part`
+- [x] Re-run throughput static/mixed query gate and visibility probes
+- [ ] Decide whether `throughput` should ship with eventual `search/services/field-values` semantics under backlog or whether a read overlay / faster applier is required
+- **Status:** in_progress
+
 ## Key Questions
 1. Which crash-consistency guarantees can be delivered now without overcomplicating the current part lifecycle?
 2. Which overload controls protect the process fastest: per-role concurrency bounds, body-size limits, or both?
 3. How far can admin-led membership refresh and repair go before needing a fully distributed control plane?
+4. Does `default + data` preserve the right production stability semantics without collapsing into the `throughput + none` release?
+5. Are `trace-by-id`, `search`, `services`, `field-values`, and mixed read/write query paths fast enough and near-realtime enough for a production recommendation?
 
 ## Decisions Made
 | Decision | Rationale |
@@ -140,12 +157,15 @@ Phase 17
 | Add bounded overload controls before claiming high-QPS readiness | Backpressure is required before any throughput number is trustworthy |
 | Add OTLP protobuf on `/v1/traces` before broader protocol work | It closes the most visible compatibility gap without forcing OTLP gRPC into the same pass |
 | Add TLS/mTLS and a select-side membership control surface before distributed consensus | It materially improves deployability and observability while keeping the control loop simple enough to verify |
+| Treat `stable` and `throughput` as separate release contracts, not runtime aliases | Production guidance becomes incoherent if durability- and responsiveness-biased defaults are mixed with the crash-loss-tolerant benchmark profile |
+| Recommend `stable` as the first production tier and keep `throughput` behind canary/soak | The local query gate shows `throughput` preserves excellent write throughput and ack-to-visible latency, but its post-burst query/metrics behavior is materially less stable |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
 | `git status` failed because repo root is not a git repository | 1 | Continue without git assumptions; work directly in filesystem |
 | `cargo init` created nested `.git` directories for each crate | 1 | Removed generated nested repos and kept a single workspace layout |
+| `throughput` post-load `/metrics` scrape timed out while seal backlog was draining | 1 | Treat it as a real query-plane risk signal instead of waiting for the issue to disappear before measuring |
 
 ## Notes
 - This session targets a serious foundation, not fake completeness.
@@ -165,3 +185,5 @@ Phase 17
 - Fresh clean-start benchmarking after keeping only the bounded stats-side drain still has disk above official on both fresh single-run (`430192 spans/s` vs `396475`) and fresh 5-round median (`359315` vs `343086`) with better p99 in both cases.
 - The next real bottleneck is still forming materially larger same-shard append packets cheaply on the write path, while query/read paths beyond `stats()` still carry the full live-update drain debt.
 - A fresh disk-only `VT_STORAGE_TRACE_SHARDS=4/8/16` sweep shows `16` shards still wins on this host, so shard-count reduction is not the next high-value move.
+- This session is explicitly constrained to release semantics, query gate evidence, and production deployment guidance; ingest hot-path changes and benchmark-shape changes are out of scope.
+- The follow-up query-plane decoupling pass fixed the request-path drain and the `/metrics` part-reread hotspot, but it also made the remaining backlog semantics explicit: under heavy throughput backlog, `trace-by-id` stays near-realtime while `search/services/field-values` become eventual until the background applier catches up.

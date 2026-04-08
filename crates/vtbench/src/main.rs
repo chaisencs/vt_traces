@@ -1,10 +1,17 @@
+mod compare;
+mod preflight;
+
 use std::{
     collections::BTreeMap,
     env, fs,
     hash::{Hash, Hasher},
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    process::Command,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,6 +23,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
+use compare::{default_report_schema_version, run_compare, CompareOptions};
+use preflight::{validate_benchmark_preflight, validate_otlp_benchmark_target};
 use reqwest::Client;
 use rustc_hash::FxHasher;
 use serde_json::json;
@@ -34,17 +43,22 @@ use vtstorage::{
 async fn main() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
     let mode = args.next().ok_or_else(|| {
-        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load|disk-trace-block-append> [--key=value ...]")
+        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load|disk-trace-block-append|compare> [--key=value ...]")
     })?;
-    let options = parse_options(args)?;
-
+    validate_benchmark_preflight(&mode)?;
     match mode.as_str() {
-        "storage-ingest" => run_storage_ingest(options),
-        "storage-query" => run_storage_query(options),
-        "http-ingest" => run_http_ingest(options).await,
-        "otlp-protobuf-load" => run_otlp_protobuf_load(options).await,
-        "disk-trace-block-append" => run_disk_trace_block_append(options),
-        _ => bail!("unknown mode: {mode}"),
+        "compare" => run_compare(parse_compare_options(args)?),
+        _ => {
+            let options = parse_options(args)?;
+            match mode.as_str() {
+                "storage-ingest" => run_storage_ingest(options),
+                "storage-query" => run_storage_query(options),
+                "http-ingest" => run_http_ingest(options).await,
+                "otlp-protobuf-load" => run_otlp_protobuf_load(options).await,
+                "disk-trace-block-append" => run_disk_trace_block_append(options),
+                _ => bail!("unknown mode: {mode}"),
+            }
+        }
     }
 }
 
@@ -223,76 +237,98 @@ async fn run_http_ingest(options: BenchOptions) -> anyhow::Result<()> {
         axum::serve(listener, app).await.expect("vtbench server");
     });
 
-    let client = Client::new();
+    let client = Client::builder()
+        .no_proxy()
+        .build()
+        .context("build reqwest client for http-ingest")?;
     let started = Instant::now();
     let deadline = options
         .duration_secs
         .map(Duration::from_secs)
         .map(|duration| started + duration);
-    let mut latencies = LatencySummary::default();
-    let mut timeline = TimelineSummary::new(sample_interval(&options));
-    let mut request_index = 0usize;
-    let mut error_count = 0usize;
+    let latencies = Arc::new(Mutex::new(LatencySummary::default()));
+    let timeline = Arc::new(Mutex::new(TimelineSummary::new(sample_interval(&options))));
+    let completed_requests = Arc::new(AtomicUsize::new(0));
+    let next_request = Arc::new(AtomicUsize::new(0));
+    let error_count = Arc::new(AtomicUsize::new(0));
     let warmup_deadline = options
         .warmup_secs
         .map(Duration::from_secs)
         .map(|duration| started + duration);
-    let mut measured_started = None;
-    while request_index < requests
-        || deadline
-            .map(|deadline| Instant::now() < deadline)
-            .unwrap_or(false)
-    {
-        let remaining = requests.saturating_sub(request_index);
-        let wave = if deadline.is_some() {
-            concurrency
-        } else {
-            concurrency.min(remaining.max(1))
-        };
-        let mut tasks = Vec::with_capacity(wave);
-        for offset in 0..wave {
-            let client = client.clone();
-            let url = format!("http://{addr}/api/v1/traces/ingest");
-            let payload = make_http_payload(request_index + offset, spans_per_request);
-            tasks.push(tokio::spawn(async move {
+    let measured_started = Arc::new(Mutex::new(None::<Instant>));
+    let mut workers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let client = client.clone();
+        let latencies = latencies.clone();
+        let timeline = timeline.clone();
+        let completed_requests = completed_requests.clone();
+        let next_request = next_request.clone();
+        let error_count = error_count.clone();
+        let measured_started = measured_started.clone();
+        let deadline = deadline;
+        let warmup_deadline = warmup_deadline;
+        workers.push(tokio::spawn(async move {
+            loop {
+                let request_index = next_request.fetch_add(1, Ordering::Relaxed);
+                if deadline.is_none() && request_index >= requests {
+                    break;
+                }
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
+
+                let url = format!("http://{addr}/api/v1/traces/ingest");
+                let payload = make_http_payload(request_index, spans_per_request);
                 let request_started = Instant::now();
                 let response = client.post(url).json(&payload).send().await;
-                match response {
-                    Ok(response) => (response.status().is_success(), request_started.elapsed()),
-                    Err(_) => (false, request_started.elapsed()),
-                }
-            }));
-        }
-        for task in tasks {
-            let (success, latency) = task.await.expect("join http ingest task");
-            if warmup_deadline
-                .map(|deadline| Instant::now() >= deadline)
-                .unwrap_or(true)
-            {
-                if measured_started.is_none() {
-                    measured_started = Some(Instant::now());
-                }
-                if success {
-                    latencies.record(latency);
-                } else {
-                    error_count += spans_per_request;
-                }
-                if let Some(measured_started) = measured_started {
-                    timeline.record(
-                        measured_started.elapsed(),
+                let success = match response {
+                    Ok(response) => {
+                        let success = response.status().is_success();
+                        let _ = response.bytes().await;
+                        success
+                    }
+                    Err(_) => false,
+                };
+                let latency = request_started.elapsed();
+                completed_requests.fetch_add(1, Ordering::Relaxed);
+
+                if warmup_deadline
+                    .map(|deadline| Instant::now() >= deadline)
+                    .unwrap_or(true)
+                {
+                    let measured_origin = {
+                        let mut guard = measured_started.lock().expect("measured start lock");
+                        *guard.get_or_insert_with(Instant::now)
+                    };
+                    if success {
+                        latencies.lock().expect("latency lock").record(latency);
+                    } else {
+                        error_count.fetch_add(spans_per_request, Ordering::Relaxed);
+                    }
+                    timeline.lock().expect("timeline lock").record(
+                        measured_origin.elapsed(),
                         latency,
                         spans_per_request,
                         success,
                     );
                 }
             }
-        }
-        request_index += wave;
+        }));
+    }
+    for worker in workers {
+        worker.await.expect("join http ingest worker");
     }
     let elapsed = measured_started
+        .lock()
+        .expect("measured start lock")
         .map(|started| started.elapsed())
         .unwrap_or_else(|| started.elapsed());
+    let request_index = completed_requests.load(Ordering::Relaxed);
     server.abort();
+    let latencies = latencies.lock().expect("latency lock");
+    let timeline = timeline.lock().expect("timeline lock");
 
     print_summary_and_report(
         &options,
@@ -307,7 +343,7 @@ async fn run_http_ingest(options: BenchOptions) -> anyhow::Result<()> {
         ],
         Some(&latencies),
         &timeline,
-        error_count,
+        error_count.load(Ordering::Relaxed),
     )?;
     Ok(())
 }
@@ -322,80 +358,104 @@ async fn run_otlp_protobuf_load(options: BenchOptions) -> anyhow::Result<()> {
     let concurrency = options.concurrency.max(1);
     let payload_variants = options.payload_variants.max(1);
     let payloads = make_otlp_protobuf_payload_variants(payload_variants, spans_per_request)?;
-    let client = Client::new();
+    let client = Client::builder()
+        .no_proxy()
+        .build()
+        .context("build reqwest client for otlp-protobuf-load")?;
+    validate_otlp_benchmark_target(&client, &url).await?;
     let started = Instant::now();
     let deadline = options
         .duration_secs
         .map(Duration::from_secs)
         .map(|duration| started + duration);
-    let mut latencies = LatencySummary::default();
-    let mut timeline = TimelineSummary::new(sample_interval(&options));
-    let mut request_index = 0usize;
-    let mut error_count = 0usize;
+    let latencies = Arc::new(Mutex::new(LatencySummary::default()));
+    let timeline = Arc::new(Mutex::new(TimelineSummary::new(sample_interval(&options))));
+    let completed_requests = Arc::new(AtomicUsize::new(0));
+    let next_request = Arc::new(AtomicUsize::new(0));
+    let error_count = Arc::new(AtomicUsize::new(0));
     let warmup_deadline = options
         .warmup_secs
         .map(Duration::from_secs)
         .map(|duration| started + duration);
-    let mut measured_started = None;
-    while request_index < requests
-        || deadline
-            .map(|deadline| Instant::now() < deadline)
-            .unwrap_or(false)
-    {
-        let remaining = requests.saturating_sub(request_index);
-        let wave = if deadline.is_some() {
-            concurrency
-        } else {
-            concurrency.min(remaining.max(1))
-        };
-        let mut tasks = Vec::with_capacity(wave);
-        for offset in 0..wave {
-            let client = client.clone();
-            let url = url.clone();
-            let payload = payloads[(request_index + offset) % payloads.len()].clone();
-            tasks.push(tokio::spawn(async move {
+    let measured_started = Arc::new(Mutex::new(None::<Instant>));
+    let mut workers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let client = client.clone();
+        let url = url.clone();
+        let payloads = payloads.clone();
+        let latencies = latencies.clone();
+        let timeline = timeline.clone();
+        let completed_requests = completed_requests.clone();
+        let next_request = next_request.clone();
+        let error_count = error_count.clone();
+        let measured_started = measured_started.clone();
+        let deadline = deadline;
+        let warmup_deadline = warmup_deadline;
+        workers.push(tokio::spawn(async move {
+            loop {
+                let request_index = next_request.fetch_add(1, Ordering::Relaxed);
+                if deadline.is_none() && request_index >= requests {
+                    break;
+                }
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
+
+                let payload = payloads[request_index % payloads.len()].clone();
                 let request_started = Instant::now();
                 let response = client
-                    .post(url)
+                    .post(url.clone())
                     .header("content-type", "application/x-protobuf")
                     .body(payload)
                     .send()
                     .await;
-                match response {
-                    Ok(response) => (response.status().is_success(), request_started.elapsed()),
-                    Err(_) => (false, request_started.elapsed()),
-                }
-            }));
-        }
-        for task in tasks {
-            let (success, latency) = task.await.expect("join protobuf ingest task");
-            if warmup_deadline
-                .map(|deadline| Instant::now() >= deadline)
-                .unwrap_or(true)
-            {
-                if measured_started.is_none() {
-                    measured_started = Some(Instant::now());
-                }
-                if success {
-                    latencies.record(latency);
-                } else {
-                    error_count += spans_per_request;
-                }
-                if let Some(measured_started) = measured_started {
-                    timeline.record(
-                        measured_started.elapsed(),
+                let success = match response {
+                    Ok(response) => {
+                        let success = response.status().is_success();
+                        let _ = response.bytes().await;
+                        success
+                    }
+                    Err(_) => false,
+                };
+                let latency = request_started.elapsed();
+                completed_requests.fetch_add(1, Ordering::Relaxed);
+
+                if warmup_deadline
+                    .map(|deadline| Instant::now() >= deadline)
+                    .unwrap_or(true)
+                {
+                    let measured_origin = {
+                        let mut guard = measured_started.lock().expect("measured start lock");
+                        *guard.get_or_insert_with(Instant::now)
+                    };
+                    if success {
+                        latencies.lock().expect("latency lock").record(latency);
+                    } else {
+                        error_count.fetch_add(spans_per_request, Ordering::Relaxed);
+                    }
+                    timeline.lock().expect("timeline lock").record(
+                        measured_origin.elapsed(),
                         latency,
                         spans_per_request,
                         success,
                     );
                 }
             }
-        }
-        request_index += wave;
+        }));
+    }
+    for worker in workers {
+        worker.await.expect("join protobuf ingest worker");
     }
     let elapsed = measured_started
+        .lock()
+        .expect("measured start lock")
         .map(|started| started.elapsed())
         .unwrap_or_else(|| started.elapsed());
+    let request_index = completed_requests.load(Ordering::Relaxed);
+    let latencies = latencies.lock().expect("latency lock");
+    let timeline = timeline.lock().expect("timeline lock");
 
     print_summary_and_report(
         &options,
@@ -411,7 +471,7 @@ async fn run_otlp_protobuf_load(options: BenchOptions) -> anyhow::Result<()> {
         ],
         Some(&latencies),
         &timeline,
-        error_count,
+        error_count.load(Ordering::Relaxed),
     )?;
     Ok(())
 }
@@ -585,6 +645,36 @@ fn parse_options(args: impl Iterator<Item = String>) -> anyhow::Result<BenchOpti
         }
     }
     Ok(options)
+}
+
+fn parse_compare_options(args: impl Iterator<Item = String>) -> anyhow::Result<CompareOptions> {
+    let mut baseline_file = None;
+    let mut candidate_file = None;
+    let mut min_throughput_ratio = 1.0;
+    let mut max_p99_ratio = 1.0;
+
+    for arg in args {
+        let (key, value) = arg
+            .strip_prefix("--")
+            .and_then(|value| value.split_once('='))
+            .ok_or_else(|| anyhow!("invalid argument: {arg}"))?;
+        match key {
+            "baseline-file" => baseline_file = Some(PathBuf::from(value)),
+            "candidate-file" => candidate_file = Some(PathBuf::from(value)),
+            "min-throughput-ratio" => min_throughput_ratio = value.parse()?,
+            "max-p99-ratio" => max_p99_ratio = value.parse()?,
+            _ => bail!("unknown option: --{key}"),
+        }
+    }
+
+    Ok(CompareOptions {
+        baseline_file: baseline_file
+            .ok_or_else(|| anyhow!("--baseline-file is required for compare"))?,
+        candidate_file: candidate_file
+            .ok_or_else(|| anyhow!("--candidate-file is required for compare"))?,
+        min_throughput_ratio,
+        max_p99_ratio,
+    })
 }
 
 fn make_row(index: usize) -> Result<TraceSpanRow, vtcore::TraceModelError> {
@@ -934,6 +1024,10 @@ fn print_summary_and_report(
             }
         }
         let mut report = serde_json::Map::new();
+        report.insert(
+            "report_schema_version".to_string(),
+            json!(default_report_schema_version()),
+        );
         report.insert("mode".to_string(), json!(mode));
         report.insert("operations".to_string(), json!(operations));
         report.insert("errors".to_string(), json!(error_count));
@@ -944,6 +1038,26 @@ fn print_summary_and_report(
         report.insert("ops_per_sec".to_string(), json!(ops_per_sec));
         report.insert("duration_secs".to_string(), json!(options.duration_secs));
         report.insert("warmup_secs".to_string(), json!(options.warmup_secs));
+        report.insert(
+            "sample_interval_secs".to_string(),
+            json!(options.sample_interval_secs),
+        );
+        report.insert(
+            "fault_after_secs".to_string(),
+            json!(options.fault_after_secs),
+        );
+        report.insert(
+            "fault_duration_secs".to_string(),
+            json!(options.fault_duration_secs),
+        );
+        report.insert(
+            "binary_target_arch".to_string(),
+            json!(std::env::consts::ARCH),
+        );
+        report.insert("binary_target_os".to_string(), json!(std::env::consts::OS));
+        if let Some(git_sha) = current_git_sha() {
+            report.insert("git_sha".to_string(), json!(git_sha));
+        }
         for (key, value) in fields {
             report.insert((*key).to_string(), json!(value));
         }
@@ -977,6 +1091,24 @@ fn print_summary_and_report(
         fs::write(report_file, payload)?;
     }
     Ok(())
+}
+
+fn current_git_sha() -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?;
+    let sha = sha.trim();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
 }
 
 fn sample_interval(options: &BenchOptions) -> Option<Duration> {
@@ -1019,9 +1151,11 @@ fn format_socket_addr(addr: SocketAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        make_otlp_protobuf_payload_variants, make_same_shard_trace_block_payload_variants,
-        parse_options, trace_shard_index, LatencySummary,
+        current_git_sha, make_otlp_protobuf_payload_variants,
+        make_same_shard_trace_block_payload_variants, parse_compare_options, parse_options,
+        trace_shard_index, LatencySummary,
     };
+    use std::path::PathBuf;
     use std::time::Duration;
     use vtingest::decode_export_trace_service_request_protobuf;
 
@@ -1090,6 +1224,34 @@ mod tests {
         assert_eq!(options.blocks_per_append, 8);
         assert_eq!(options.spans_per_block, 5);
         assert_eq!(options.trace_shards, 4);
+    }
+
+    #[test]
+    fn parse_compare_options_reads_thresholds() {
+        let options = parse_compare_options(
+            [
+                "--baseline-file=/tmp/base.json".to_string(),
+                "--candidate-file=/tmp/candidate.json".to_string(),
+                "--min-throughput-ratio=0.97".to_string(),
+                "--max-p99-ratio=1.10".to_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("compare options should parse");
+
+        assert_eq!(options.baseline_file, PathBuf::from("/tmp/base.json"));
+        assert_eq!(options.candidate_file, PathBuf::from("/tmp/candidate.json"));
+        assert_eq!(options.min_throughput_ratio, 0.97);
+        assert_eq!(options.max_p99_ratio, 1.10);
+    }
+
+    #[test]
+    fn current_git_sha_is_available_inside_repo() {
+        let sha = current_git_sha();
+        assert!(sha
+            .as_deref()
+            .map(|value| !value.is_empty())
+            .unwrap_or(false));
     }
 
     #[test]

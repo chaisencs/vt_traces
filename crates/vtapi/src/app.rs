@@ -18,7 +18,10 @@ use axum::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+    sync::Semaphore,
+    task::{self, JoinSet},
+};
 use tracing::{debug, info, warn};
 use vtcore::{
     decode_log_rows, decode_trace_rows, encode_log_row, encode_log_rows_from_encoded_rows,
@@ -33,7 +36,7 @@ use vtingest::{
     ExportTraceServiceRequest,
 };
 use vtquery::QueryService;
-use vtstorage::{MemoryStorageEngine, StorageEngine, StorageStatsSnapshot};
+use vtstorage::{MemoryStorageEngine, StorageEngine, StorageError, StorageStatsSnapshot};
 
 use crate::{cluster::ClusterConfig, http_client::ClusterHttpClient};
 
@@ -54,6 +57,13 @@ pub struct AuthConfig {
     public_bearer_token: Option<String>,
     internal_bearer_token: Option<String>,
     admin_bearer_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TraceIngestProfile {
+    #[default]
+    Default,
+    Throughput,
 }
 
 impl Default for ApiLimitsConfig {
@@ -117,6 +127,7 @@ impl AuthConfig {
 struct StorageState {
     storage: Arc<dyn StorageEngine>,
     query: QueryService,
+    trace_ingest_profile: TraceIngestProfile,
 }
 
 struct InsertState {
@@ -1134,14 +1145,41 @@ pub fn build_router_with_storage_and_limits(
     build_router_with_storage_auth_and_limits(storage, AuthConfig::default(), limits)
 }
 
+pub fn build_router_with_storage_and_trace_ingest_profile(
+    storage: Arc<dyn StorageEngine>,
+    trace_ingest_profile: TraceIngestProfile,
+) -> Router {
+    build_router_with_storage_auth_limits_and_trace_ingest_profile(
+        storage,
+        AuthConfig::default(),
+        ApiLimitsConfig::default(),
+        trace_ingest_profile,
+    )
+}
+
 pub fn build_router_with_storage_auth_and_limits(
     storage: Arc<dyn StorageEngine>,
     auth: AuthConfig,
     limits: ApiLimitsConfig,
 ) -> Router {
+    build_router_with_storage_auth_limits_and_trace_ingest_profile(
+        storage,
+        auth,
+        limits,
+        TraceIngestProfile::Default,
+    )
+}
+
+pub fn build_router_with_storage_auth_limits_and_trace_ingest_profile(
+    storage: Arc<dyn StorageEngine>,
+    auth: AuthConfig,
+    limits: ApiLimitsConfig,
+    trace_ingest_profile: TraceIngestProfile,
+) -> Router {
     let state = Arc::new(StorageState {
         storage: storage.clone(),
         query: QueryService::new(storage),
+        trace_ingest_profile,
     });
 
     Router::new()
@@ -1218,6 +1256,7 @@ pub fn build_storage_router_with_auth_and_limits(
     let state = Arc::new(StorageState {
         storage: storage.clone(),
         query: QueryService::new(storage),
+        trace_ingest_profile: TraceIngestProfile::Default,
     });
 
     Router::new()
@@ -1675,12 +1714,17 @@ async fn ingest_traces_local(
         &body,
         state.storage.preferred_trace_ingest_shards(),
     )
-    .map_err(bad_request)?;
+    .map_err(|error| {
+        warn!(protobuf, error = %error, "trace ingest decode failed");
+        bad_request(error)
+    })?;
     let ingested_rows: usize = blocks.iter().map(TraceBlock::row_count).sum();
-    state
-        .storage
-        .append_trace_blocks(blocks)
-        .map_err(internal_server_error)?;
+    append_trace_blocks_with_profile(state.storage.clone(), blocks, state.trace_ingest_profile)
+        .await
+        .map_err(|error| {
+            warn!(protobuf, ingested_rows, error = %error, "trace ingest append failed");
+            internal_server_error(error)
+        })?;
     debug!(ingested_rows, protobuf, "ingested trace rows");
 
     Ok(otlp_http_ingest_response(protobuf, ingested_rows))
@@ -1710,11 +1754,44 @@ async fn ingest_traces_grpc_local(State(state): State<Arc<StorageState>>, body: 
             Err(error) => return grpc_error_response("3", error),
         };
     let ingested_rows: usize = blocks.iter().map(TraceBlock::row_count).sum();
-    if let Err(error) = state.storage.append_trace_blocks(blocks) {
+    if let Err(error) =
+        append_trace_blocks_with_profile(state.storage.clone(), blocks, state.trace_ingest_profile)
+            .await
+    {
         return grpc_error_response("13", error.to_string());
     }
     debug!(ingested_rows, "ingested trace rows via OTLP gRPC");
     grpc_ok_response()
+}
+
+async fn append_trace_blocks_with_profile(
+    storage: Arc<dyn StorageEngine>,
+    blocks: Vec<TraceBlock>,
+    trace_ingest_profile: TraceIngestProfile,
+) -> Result<(), StorageError> {
+    match trace_ingest_profile {
+        TraceIngestProfile::Default => append_trace_blocks_blocking(storage, blocks).await,
+        TraceIngestProfile::Throughput => storage.append_trace_blocks(blocks),
+    }
+}
+
+async fn append_trace_blocks_blocking(
+    storage: Arc<dyn StorageEngine>,
+    blocks: Vec<TraceBlock>,
+) -> Result<(), StorageError> {
+    match tokio::runtime::Handle::try_current()
+        .map(|handle| handle.runtime_flavor())
+        .ok()
+    {
+        Some(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            task::block_in_place(move || storage.append_trace_blocks(blocks))
+        }
+        _ => task::spawn_blocking(move || storage.append_trace_blocks(blocks))
+            .await
+            .map_err(|error| {
+                StorageError::Message(format!("trace append task join error: {error}"))
+            })?,
+    }
 }
 
 async fn ingest_logs_grpc_local(State(state): State<Arc<StorageState>>, body: Bytes) -> Response {
@@ -4169,6 +4246,13 @@ fn apply_limit<T>(mut values: Vec<T>, limit: Option<usize>) -> Vec<T> {
 
 fn render_storage_metrics(stats: &StorageStatsSnapshot) -> String {
     [
+        "# TYPE vt_build_info gauge".to_string(),
+        format!(
+            "vt_build_info{{version=\"{}\",target_arch=\"{}\",target_os=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        ),
         "# TYPE vt_rows_ingested_total counter".to_string(),
         format!("vt_rows_ingested_total {}", stats.rows_ingested),
         "# TYPE vt_traces_tracked gauge".to_string(),
@@ -4182,6 +4266,13 @@ fn render_storage_metrics(stats: &StorageStatsSnapshot) -> String {
         format!("vt_storage_persisted_bytes {}", stats.persisted_bytes),
         "# TYPE vt_storage_segments gauge".to_string(),
         format!("vt_storage_segments {}", stats.segment_count),
+        "# TYPE vt_storage_trace_head_segments gauge".to_string(),
+        format!(
+            "vt_storage_trace_head_segments {}",
+            stats.trace_head_segments
+        ),
+        "# TYPE vt_storage_trace_head_rows gauge".to_string(),
+        format!("vt_storage_trace_head_rows {}", stats.trace_head_rows),
         "# TYPE vt_storage_typed_field_columns gauge".to_string(),
         format!(
             "vt_storage_typed_field_columns {}",
@@ -4213,6 +4304,21 @@ fn render_storage_metrics(stats: &StorageStatsSnapshot) -> String {
         format!(
             "vt_storage_fsync_operations_total {}",
             stats.fsync_operations
+        ),
+        "# TYPE vt_storage_trace_group_commit_flushes_total counter".to_string(),
+        format!(
+            "vt_storage_trace_group_commit_flushes_total {}",
+            stats.trace_group_commit_flushes
+        ),
+        "# TYPE vt_storage_trace_group_commit_rows_total counter".to_string(),
+        format!(
+            "vt_storage_trace_group_commit_rows_total {}",
+            stats.trace_group_commit_rows
+        ),
+        "# TYPE vt_storage_trace_group_commit_bytes_total counter".to_string(),
+        format!(
+            "vt_storage_trace_group_commit_bytes_total {}",
+            stats.trace_group_commit_bytes
         ),
         "# TYPE vt_storage_trace_batch_queue_depth gauge".to_string(),
         format!(
@@ -4253,6 +4359,28 @@ fn render_storage_metrics(stats: &StorageStatsSnapshot) -> String {
         format!(
             "vt_storage_trace_batch_wait_micros_max {}",
             stats.trace_batch_wait_micros_max
+        ),
+        "# TYPE vt_storage_trace_live_update_queue_depth gauge".to_string(),
+        format!(
+            "vt_storage_trace_live_update_queue_depth {}",
+            stats.trace_live_update_queue_depth
+        ),
+        "# TYPE vt_storage_trace_seal_queue_depth gauge".to_string(),
+        format!(
+            "vt_storage_trace_seal_queue_depth {}",
+            stats.trace_seal_queue_depth
+        ),
+        "# TYPE vt_storage_trace_seal_completed_total counter".to_string(),
+        format!(
+            "vt_storage_trace_seal_completed_total {}",
+            stats.trace_seal_completed
+        ),
+        "# TYPE vt_storage_trace_seal_rows_total counter".to_string(),
+        format!("vt_storage_trace_seal_rows_total {}", stats.trace_seal_rows),
+        "# TYPE vt_storage_trace_seal_bytes_total counter".to_string(),
+        format!(
+            "vt_storage_trace_seal_bytes_total {}",
+            stats.trace_seal_bytes
         ),
         "# TYPE vt_storage_trace_batch_flush_due_to_rows_total counter".to_string(),
         format!(

@@ -1,5 +1,88 @@
 # Progress Log
 
+## Session: 2026-04-07
+
+### Phase 19: Query-Plane Decoupling
+- **Status:** in_progress
+- Actions taken:
+  - Added red tests that pin two intended properties in `vtstorage`:
+    - request paths must not synchronously drain pending live updates in manual mode
+    - `stats()` must keep cached field-column counts without rereading `.part` files
+  - Replaced request-path `drain_pending_trace_updates()` on `search/services/field-values` with a background live-update applier.
+  - Removed the `stats()`-side live-update drain entirely and added `vt_storage_trace_live_update_queue_depth` so backlog stays observable without scrape-time apply.
+  - Cached persisted typed/string field-column counts from segment metadata so `/metrics` no longer rereads every sealed `.part`.
+  - Updated query-visibility integration tests to wait for eventual background apply instead of assuming synchronous request-path merge.
+  - Rebuilt ARM64 release binaries and reran the throughput query gate on a fresh disk dataset under `/tmp/vt_query_gate_fix2_20260407_220316`.
+  - Throughput gate after the change:
+    - preload write: `475276.740 spans/s`, `p99 0.978ms`
+    - static `trace-by-id`: `75.29 rps`, `p99 756ms`, `errors=0`
+    - static `search`: `28542.59 rps`, `p99 1ms`
+    - static `services`: `34742.44 rps`
+    - static `field-values`: `31334.15 rps`
+    - post-preload `/metrics` returned immediately with `trace_live_update_queue_depth=2677458`
+    - mixed write: `335001.677 spans/s`, `p99 1.448ms`
+    - mixed `search`: `3260.32 rps`
+    - mixed `services`: `4590.41 rps`
+    - mixed `field-values`: `4561.93 rps`
+    - post-mixed `/metrics` returned immediately with `trace_live_update_queue_depth=3921112`
+  - Ran fresh backlog visibility probes:
+    - `trace-by-id` median stayed about `0.48ms`
+    - `search` stayed invisible for all 5 samples within `15s`
+    - `services` and `field-values` stayed invisible for all 3 samples within `5s`, then became visible later after backlog drain advanced
+  - Confirmed the next blocker is no longer scrape/query timeout; it is the backlog semantics split between `trace-by-id` and `search/services/field-values`.
+- Files created/modified:
+  - `rust_victoria_trace/crates/vtstorage/src/disk.rs`
+  - `rust_victoria_trace/crates/vtstorage/src/engine.rs`
+  - `rust_victoria_trace/crates/vtstorage/tests/disk_engine_tests.rs`
+  - `rust_victoria_trace/crates/vtapi/src/app.rs`
+  - `rust_victoria_trace/crates/vtapi/tests/http_api_tests.rs`
+  - `rust_victoria_trace/task_plan.md`
+  - `rust_victoria_trace/findings.md`
+  - `rust_victoria_trace/progress.md`
+
+### Phase 18: Release Matrix & Query Gate
+- **Status:** complete
+- **Started:** 2026-04-07 19:59
+- Actions taken:
+  - Read the active handoff for `stable` vs `throughput` release gating and production decision scope.
+  - Re-read `README.md`, the public ingest performance report, and the latest throughput benchmark/probe artifacts.
+  - Reconfirmed this session's guardrails: no more ingest hot-path work, no benchmark-shape change, and no collapsing the release semantics into one tier.
+  - Updated `task_plan.md` and `findings.md` to capture the release split, current throughput evidence, and the outstanding query/visibility gate.
+  - Built the current ARM64 release binaries and ran a fresh local query gate under two explicit release profiles:
+    - `stable`: `VT_TRACE_INGEST_PROFILE=default`, `VT_STORAGE_SYNC_POLICY=data`, `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608`
+    - `throughput`: `VT_TRACE_INGEST_PROFILE=throughput`, `VT_STORAGE_SYNC_POLICY=none`, `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=268435456`
+  - For each tier, ran:
+    - preload OTLP protobuf write burst
+    - static `trace-by-id`, `search`, `services`, `field-values` query benchmarks via `ab`
+    - ack-to-visible probes for `trace-by-id`, `search`, `services`, `field-values`
+    - mixed read/write with concurrent OTLP load and query traffic
+  - Captured structured outputs under `/tmp/vt_query_gate_20260407_200521`.
+  - Updated `README.md` and `docs/production-release-guide.md` to lock the two-tier release matrix and the VictoriaTraces-style role mapping.
+  - Re-ran a clean throughput ingest-only benchmark on the current head to verify the `60w+ spans/s` band still exists under the original benchmark shape; clean single landed at `693165.707 spans/s`.
+  - Inspected the current disk query paths and confirmed the throughput query issue splits into two independent root causes:
+    - request-path live-update drain for `search/services/field-values/metrics`
+    - large-head plus sealing-snapshot federation on `trace-by-id`
+- Files created/modified:
+  - `rust_victoria_trace/task_plan.md`
+  - `rust_victoria_trace/findings.md`
+  - `rust_victoria_trace/README.md`
+  - `rust_victoria_trace/docs/production-release-guide.md`
+
+### Phase 14: Benchmark Guardrails
+- **Status:** in_progress
+- Actions taken:
+  - Added `vtbench compare` so a saved candidate report can be checked against a saved baseline with explicit throughput and `p99` tolerances.
+  - Extended saved `report-file` artifacts with stable metadata: schema version, git SHA, and benchmark-binary target arch / OS.
+  - Added integration tests covering throughput regression, `p99` regression, benchmark-shape drift, and replay-id-aware output.
+  - Added a real smoke path that emits a report and immediately compares it back to itself.
+  - Documented the compare gate in the README and created `docs/benchmarks/baselines/` as the baseline artifact home.
+- Files created/modified:
+  - `rust_victoria_trace/crates/vtbench/src/compare.rs`
+  - `rust_victoria_trace/crates/vtbench/src/main.rs`
+  - `rust_victoria_trace/crates/vtbench/tests/compare_tests.rs`
+  - `rust_victoria_trace/docs/benchmarks/baselines/.gitkeep`
+  - `rust_victoria_trace/README.md`
+
 ## Session: 2026-04-04
 
 ### Phase 1: Requirements & Discovery

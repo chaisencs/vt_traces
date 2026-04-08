@@ -124,13 +124,34 @@ Recommended first checks for the container path:
 
 ## Production Runtime Recommendation
 
-For a first formal production release, prefer the disk engine with explicit durability and request limits:
+Do not treat the current runtime knobs as one fuzzy deployment mode. The release contract is now split into two explicit tiers:
+
+| release tier | goal | required config | segment behavior | recommendation |
+| --- | --- | --- | --- | --- |
+| `stable` | durability / operational stability first | `VT_TRACE_INGEST_PROFILE=default` + `VT_STORAGE_SYNC_POLICY=data` | keep the normal segment size path, default `8388608` | the default choice for first production rollout |
+| `throughput` | ingest throughput first | `VT_TRACE_INGEST_PROFILE=throughput` + `VT_STORAGE_SYNC_POLICY=none` | if `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES` is not set explicitly, it auto-raises to `268435456` | use only after canary / replay / soak confirms the query plane is acceptable for your workload |
+
+Recommended first-production `stable` runtime:
 
 ```bash
 VT_STORAGE_MODE=disk \
 VT_STORAGE_PATH=/var/lib/rust-victoria-trace \
+VT_TRACE_INGEST_PROFILE=default \
 VT_STORAGE_SYNC_POLICY=data \
 VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608 \
+VT_MAX_REQUEST_BODY_BYTES=8388608 \
+VT_API_CONCURRENCY_LIMIT=1024 \
+vtapi
+```
+
+High-throughput runtime, when you explicitly accept the durability / query tradeoff:
+
+```bash
+VT_STORAGE_MODE=disk \
+VT_STORAGE_PATH=/var/lib/rust-victoria-trace \
+VT_TRACE_INGEST_PROFILE=throughput \
+VT_STORAGE_SYNC_POLICY=none \
+VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=268435456 \
 VT_MAX_REQUEST_BODY_BYTES=8388608 \
 VT_API_CONCURRENCY_LIMIT=1024 \
 vtapi
@@ -142,6 +163,21 @@ Recommended operational checks:
 - verify `GET /healthz`
 - validate WAL and `.part` files are created under the configured storage path
 - run at least one OTLP protobuf smoke test before exposing public traffic
+
+## Topology Mapping
+
+If you are migrating from VictoriaTraces, keep the same deployment mental model:
+
+- `storage` persists data on local disks
+- `insert` receives external writes and fans them out to the storage set
+- `select` serves external queries and cluster governance
+
+That means the smoothest production path is usually:
+
+1. keep your existing data volume conventions and mount the new storage path with `VT_STORAGE_PATH`
+2. preserve your load-balancer layering as `insert` for writes and `select` for reads
+3. map each process role explicitly with `VT_ROLE=storage|insert|select`
+4. keep logging on stdout / stderr via `RUST_LOG` and let systemd, Kubernetes, or your log collector own persistence and rotation
 
 ## Merge-To-Master Gate
 
@@ -158,6 +194,10 @@ Before merging a formal version to `master`, require all of the following:
    - `docs/2026-04-06-otlp-ingest-performance-report.md`
    - this guide
 8. Benchmark evidence still shows disk above official on the agreed OTLP protobuf ingest shape
+
+For Apple Silicon local benchmark evidence, require native ARM binaries:
+- `cargo build --release --target aarch64-apple-darwin -p vtapi -p vtbench`
+- use `target/aarch64-apple-darwin/release/vtapi` and `target/aarch64-apple-darwin/release/vtbench`
 
 ## Current Validation Snapshot
 

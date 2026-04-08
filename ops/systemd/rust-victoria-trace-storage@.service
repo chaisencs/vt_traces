@@ -1,0 +1,23 @@
+[Unit]
+Description=Rust Victoria Trace storage role (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vt
+Group=vt
+EnvironmentFile=-/etc/rust-victoria-trace/common.env
+EnvironmentFile=/etc/rust-victoria-trace/storage-%i.env
+ExecStart=/usr/local/bin/vtapi
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+LimitNOFILE=1048576
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

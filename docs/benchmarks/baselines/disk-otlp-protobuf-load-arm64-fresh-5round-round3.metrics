@@ -1,0 +1,66 @@
+# TYPE vt_build_info gauge
+vt_build_info{version="0.1.0",target_arch="aarch64",target_os="macos"} 1
+# TYPE vt_rows_ingested_total counter
+vt_rows_ingested_total 1154880
+# TYPE vt_traces_tracked gauge
+vt_traces_tracked 1024
+# TYPE vt_storage_retained_trace_blocks gauge
+vt_storage_retained_trace_blocks 0
+# TYPE vt_storage_persisted_bytes gauge
+vt_storage_persisted_bytes 389349749
+# TYPE vt_storage_segments gauge
+vt_storage_segments 53
+# TYPE vt_storage_trace_head_segments gauge
+vt_storage_trace_head_segments 50
+# TYPE vt_storage_trace_head_rows gauge
+vt_storage_trace_head_rows 1082415
+# TYPE vt_storage_typed_field_columns gauge
+vt_storage_typed_field_columns 3
+# TYPE vt_storage_string_field_columns gauge
+vt_storage_string_field_columns 18
+# TYPE vt_trace_window_lookups_total counter
+vt_trace_window_lookups_total 0
+# TYPE vt_row_queries_total counter
+vt_row_queries_total 0
+# TYPE vt_storage_segment_read_batches_total counter
+vt_storage_segment_read_batches_total 0
+# TYPE vt_storage_part_selective_decodes_total counter
+vt_storage_part_selective_decodes_total 0
+# TYPE vt_storage_fsync_operations_total counter
+vt_storage_fsync_operations_total 0
+# TYPE vt_storage_trace_group_commit_flushes_total counter
+vt_storage_trace_group_commit_flushes_total 224828
+# TYPE vt_storage_trace_group_commit_rows_total counter
+vt_storage_trace_group_commit_rows_total 1154880
+# TYPE vt_storage_trace_group_commit_bytes_total counter
+vt_storage_trace_group_commit_bytes_total 401131907
+# TYPE vt_storage_trace_batch_queue_depth gauge
+vt_storage_trace_batch_queue_depth 0
+# TYPE vt_storage_trace_batch_max_queue_depth gauge
+vt_storage_trace_batch_max_queue_depth 5
+# TYPE vt_storage_trace_batch_flushes_total counter
+vt_storage_trace_batch_flushes_total 224828
+# TYPE vt_storage_trace_batch_rows_total counter
+vt_storage_trace_batch_rows_total 1154880
+# TYPE vt_storage_trace_batch_input_blocks_total counter
+vt_storage_trace_batch_input_blocks_total 230976
+# TYPE vt_storage_trace_batch_output_blocks_total counter
+vt_storage_trace_batch_output_blocks_total 224828
+# TYPE vt_storage_trace_batch_wait_micros_total counter
+vt_storage_trace_batch_wait_micros_total 1241250
+# TYPE vt_storage_trace_batch_wait_micros_max gauge
+vt_storage_trace_batch_wait_micros_max 13827
+# TYPE vt_storage_trace_seal_queue_depth gauge
+vt_storage_trace_seal_queue_depth 40
+# TYPE vt_storage_trace_seal_completed_total counter
+vt_storage_trace_seal_completed_total 3
+# TYPE vt_storage_trace_seal_rows_total counter
+vt_storage_trace_seal_rows_total 72465
+# TYPE vt_storage_trace_seal_bytes_total counter
+vt_storage_trace_seal_bytes_total 16343498
+# TYPE vt_storage_trace_batch_flush_due_to_rows_total counter
+vt_storage_trace_batch_flush_due_to_rows_total 0
+# TYPE vt_storage_trace_batch_flush_due_to_blocks_total counter
+vt_storage_trace_batch_flush_due_to_blocks_total 0
+# TYPE vt_storage_trace_batch_flush_due_to_wait_total counter
+vt_storage_trace_batch_flush_due_to_wait_total 224828

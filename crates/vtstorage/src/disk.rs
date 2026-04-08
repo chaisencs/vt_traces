@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
     io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
@@ -7,7 +7,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     sync::mpsc,
     sync::Arc,
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -45,8 +46,12 @@ const WAL_HEADER_BYTES: u64 = (WAL_MAGIC.len() + 1) as u64;
 const LOG_WAL_HEADER_BYTES: u64 = (LOG_WAL_MAGIC.len() + 1) as u64;
 const DEFAULT_TARGET_SEGMENT_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 const COMPACTION_TARGET_MULTIPLIER: u64 = 16;
+#[cfg_attr(not(test), allow(dead_code))]
 const STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT: usize = 8192;
 const TRACE_WAL_WRITER_CAPACITY_BYTES: usize = 1024 * 1024;
+const DEFAULT_TRACE_COMBINER_WAIT: Duration = Duration::ZERO;
+const DEFAULT_TRACE_GROUP_COMMIT_WAIT: Duration = Duration::ZERO;
+const TRACE_COMBINER_WAIT_POLL_SLICE: Duration = Duration::from_micros(25);
 const PART_FIELD_TYPE_STRING: u8 = 0;
 const PART_FIELD_TYPE_I64: u8 = 1;
 const PART_FIELD_TYPE_BOOL: u8 = 2;
@@ -62,6 +67,19 @@ pub enum DiskSyncPolicy {
     Data,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceLiveUpdateApplyMode {
+    Background,
+    Manual,
+}
+
+impl Default for TraceLiveUpdateApplyMode {
+    fn default() -> Self {
+        Self::Background
+    }
+}
+
 impl Default for DiskSyncPolicy {
     fn default() -> Self {
         Self::None
@@ -69,6 +87,10 @@ impl Default for DiskSyncPolicy {
 }
 
 impl DiskSyncPolicy {
+    fn requires_flush(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
     fn requires_sync(self) -> bool {
         matches!(self, Self::Data)
     }
@@ -79,6 +101,11 @@ pub struct DiskStorageConfig {
     target_segment_size_bytes: u64,
     sync_policy: DiskSyncPolicy,
     trace_shards: usize,
+    trace_combiner_wait: Duration,
+    trace_group_commit_wait: Duration,
+    trace_wal_writer_capacity_bytes: usize,
+    trace_deferred_wal_writes: bool,
+    trace_live_update_apply_mode: TraceLiveUpdateApplyMode,
 }
 
 impl Default for DiskStorageConfig {
@@ -87,6 +114,11 @@ impl Default for DiskStorageConfig {
             target_segment_size_bytes: DEFAULT_TARGET_SEGMENT_SIZE_BYTES,
             sync_policy: DiskSyncPolicy::None,
             trace_shards: default_trace_shards(),
+            trace_combiner_wait: DEFAULT_TRACE_COMBINER_WAIT,
+            trace_group_commit_wait: DEFAULT_TRACE_GROUP_COMMIT_WAIT,
+            trace_wal_writer_capacity_bytes: TRACE_WAL_WRITER_CAPACITY_BYTES,
+            trace_deferred_wal_writes: false,
+            trace_live_update_apply_mode: TraceLiveUpdateApplyMode::default(),
         }
     }
 }
@@ -106,28 +138,57 @@ impl DiskStorageConfig {
         self.trace_shards = trace_shards.max(1);
         self
     }
+
+    pub fn with_trace_combiner_wait(mut self, trace_combiner_wait: Duration) -> Self {
+        self.trace_combiner_wait = trace_combiner_wait;
+        self
+    }
+
+    pub fn with_trace_group_commit_wait(mut self, trace_group_commit_wait: Duration) -> Self {
+        self.trace_group_commit_wait = trace_group_commit_wait;
+        self
+    }
+
+    pub fn with_trace_wal_writer_capacity_bytes(
+        mut self,
+        trace_wal_writer_capacity_bytes: usize,
+    ) -> Self {
+        self.trace_wal_writer_capacity_bytes = trace_wal_writer_capacity_bytes.max(1);
+        self
+    }
+
+    pub fn with_trace_deferred_wal_writes(mut self, trace_deferred_wal_writes: bool) -> Self {
+        self.trace_deferred_wal_writes = trace_deferred_wal_writes;
+        self
+    }
 }
 
 #[derive(Debug)]
 pub struct DiskStorageEngine {
     root_path: PathBuf,
     segments_path: PathBuf,
-    segment_paths: RwLock<FxHashMap<u64, PathBuf>>,
-    trace_shards: Vec<RwLock<DiskTraceShardState>>,
-    pending_trace_updates: Mutex<VecDeque<(usize, Vec<LiveTraceUpdate>)>>,
+    segment_paths: Arc<RwLock<FxHashMap<u64, PathBuf>>>,
+    trace_shards: Vec<Arc<RwLock<DiskTraceShardState>>>,
+    pending_trace_query_shards: Vec<Arc<RwLock<PendingTraceQueryState>>>,
+    pending_trace_updates: Arc<Mutex<VecDeque<(usize, Vec<LiveTraceUpdate>)>>>,
     append_combiners: Vec<Mutex<DiskTraceAppendCombinerState>>,
     append_combiner_stats: Vec<DiskTraceAppendCombinerStats>,
     active_segments: Vec<Mutex<Option<ActiveSegment>>>,
+    sealing_segments: Vec<Arc<RwLock<Vec<Arc<HeadSegmentSnapshot>>>>>,
     log_state: RwLock<LogIndexedState>,
     log_writer: Mutex<BufWriter<File>>,
     next_segment_id: AtomicU64,
     config: DiskStorageConfig,
-    persisted_bytes: AtomicU64,
+    persisted_bytes: Arc<AtomicU64>,
     trace_window_lookups: AtomicU64,
     row_queries: AtomicU64,
     segment_read_batches: AtomicU64,
     part_selective_decodes: AtomicU64,
-    fsync_operations: AtomicU64,
+    fsync_operations: Arc<AtomicU64>,
+    head_metrics: Arc<DiskTraceHeadMetrics>,
+    field_column_counts: Arc<DiskFieldColumnCounts>,
+    live_update_runtime: DiskTraceLiveUpdateRuntime,
+    seal_runtime: DiskTraceSealRuntime,
 }
 
 #[derive(Debug, Default)]
@@ -143,6 +204,27 @@ struct DiskTraceShardState {
     field_values_by_name: FxHashMap<StringRef, Vec<StringRef>>,
     row_refs_by_trace: FxHashMap<TraceRef, Vec<SegmentRowLocation>>,
     rows_ingested: u64,
+}
+
+#[derive(Debug, Default)]
+struct PendingTraceQueryState {
+    trace_ids: StringTable,
+    strings: StringTable,
+    all_trace_refs: RoaringBitmap,
+    traces: FxHashMap<TraceRef, PendingTraceQueryEntry>,
+    trace_refs_by_service: FxHashMap<StringRef, RoaringBitmap>,
+    trace_refs_by_operation: FxHashMap<StringRef, RoaringBitmap>,
+    trace_refs_by_field_name_value: FxHashMap<StringRef, FxHashMap<StringRef, RoaringBitmap>>,
+    field_values_by_name: FxHashMap<StringRef, FxHashMap<StringRef, u32>>,
+}
+
+#[derive(Debug, Default)]
+struct PendingTraceQueryEntry {
+    start_unix_nanos: BTreeMap<i64, u32>,
+    end_unix_nanos: BTreeMap<i64, u32>,
+    services: FxHashMap<StringRef, u32>,
+    operations: FxHashMap<StringRef, u32>,
+    indexed_fields: FxHashMap<(StringRef, StringRef), u32>,
 }
 
 #[derive(Debug, Default)]
@@ -204,6 +286,8 @@ struct RecoveredDiskState {
     segment_paths: FxHashMap<u64, PathBuf>,
     trace_shards: Vec<DiskTraceShardState>,
     persisted_bytes: u64,
+    typed_field_columns: u64,
+    string_field_columns: u64,
     next_segment_id: u64,
 }
 
@@ -211,11 +295,345 @@ struct RecoveredDiskState {
 struct ActiveSegment {
     segment_id: u64,
     wal_path: PathBuf,
-    writer: BufWriter<File>,
+    wal_sink: TraceWalSink,
     accumulator: SegmentAccumulator,
     cached_row_length_prefixes: Vec<u8>,
     cached_payload_ranges: Vec<std::ops::Range<usize>>,
     cached_payload_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum TraceWalSink {
+    Immediate(BufWriter<File>),
+    Deferred(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct HeadSegmentSnapshot {
+    shard_index: usize,
+    segment_id: u64,
+    wal_path: PathBuf,
+    staged_wal_bytes: Vec<u8>,
+    accumulator: SegmentAccumulator,
+    cached_payload_ranges: Vec<std::ops::Range<usize>>,
+    cached_payload_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct DiskTraceHeadMetrics {
+    group_commit_flushes: AtomicU64,
+    group_commit_rows: AtomicU64,
+    group_commit_bytes: AtomicU64,
+    seal_queue_depth: AtomicU64,
+    seal_completed: AtomicU64,
+    seal_rows: AtomicU64,
+    seal_bytes: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct DiskFieldColumnCounts {
+    typed: AtomicU64,
+    string: AtomicU64,
+}
+
+#[derive(Clone)]
+struct DiskTraceSealShared {
+    segments_path: PathBuf,
+    segment_paths: Arc<RwLock<FxHashMap<u64, PathBuf>>>,
+    trace_shards: Vec<Arc<RwLock<DiskTraceShardState>>>,
+    sealing_segments: Vec<Arc<RwLock<Vec<Arc<HeadSegmentSnapshot>>>>>,
+    config: DiskStorageConfig,
+    persisted_bytes: Arc<AtomicU64>,
+    fsync_operations: Arc<AtomicU64>,
+    head_metrics: Arc<DiskTraceHeadMetrics>,
+    field_column_counts: Arc<DiskFieldColumnCounts>,
+}
+
+#[derive(Clone)]
+struct DiskTraceLiveUpdateShared {
+    trace_shards: Vec<Arc<RwLock<DiskTraceShardState>>>,
+    pending_trace_query_shards: Vec<Arc<RwLock<PendingTraceQueryState>>>,
+    pending_trace_updates: Arc<Mutex<VecDeque<(usize, Vec<LiveTraceUpdate>)>>>,
+}
+
+struct DiskTraceSealRuntime {
+    sender: mpsc::Sender<DiskTraceSealCommand>,
+    handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+enum DiskTraceLiveUpdateRuntime {
+    Background {
+        sender: mpsc::Sender<DiskTraceLiveUpdateCommand>,
+        handle: Mutex<Option<thread::JoinHandle<()>>>,
+    },
+    Manual,
+}
+
+enum DiskTraceSealCommand {
+    Seal(Arc<HeadSegmentSnapshot>),
+    Shutdown,
+}
+
+enum DiskTraceLiveUpdateCommand {
+    Apply,
+    Shutdown,
+}
+
+impl std::fmt::Debug for DiskTraceSealRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiskTraceSealRuntime")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for DiskTraceLiveUpdateRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiskTraceLiveUpdateRuntime")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiskTraceSealRuntime {
+    fn spawn(shared: DiskTraceSealShared) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || run_trace_seal_worker(shared, receiver));
+        Self {
+            sender,
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+
+    fn schedule(&self, snapshot: Arc<HeadSegmentSnapshot>) -> Result<(), StorageError> {
+        self.sender
+            .send(DiskTraceSealCommand::Seal(snapshot))
+            .map_err(|error| {
+                StorageError::Message(format!("disk trace seal worker dropped: {error}"))
+            })
+    }
+
+    fn shutdown(&self) {
+        let _ = self.sender.send(DiskTraceSealCommand::Shutdown);
+        if let Some(handle) = self.handle.lock().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl DiskTraceLiveUpdateRuntime {
+    fn spawn(shared: DiskTraceLiveUpdateShared, mode: TraceLiveUpdateApplyMode) -> Self {
+        match mode {
+            TraceLiveUpdateApplyMode::Background => {
+                let (sender, receiver) = mpsc::channel();
+                let handle = thread::spawn(move || run_trace_live_update_worker(shared, receiver));
+                Self::Background {
+                    sender,
+                    handle: Mutex::new(Some(handle)),
+                }
+            }
+            TraceLiveUpdateApplyMode::Manual => Self::Manual,
+        }
+    }
+
+    fn schedule_apply(&self) -> Result<(), StorageError> {
+        match self {
+            Self::Background { sender, .. } => sender
+                .send(DiskTraceLiveUpdateCommand::Apply)
+                .map_err(|error| {
+                    StorageError::Message(format!("disk live-update worker dropped: {error}"))
+                }),
+            Self::Manual => Ok(()),
+        }
+    }
+
+    fn shutdown(&self) {
+        match self {
+            Self::Background { sender, handle } => {
+                let _ = sender.send(DiskTraceLiveUpdateCommand::Shutdown);
+                if let Some(handle) = handle.lock().take() {
+                    let _ = handle.join();
+                }
+            }
+            Self::Manual => {}
+        }
+    }
+}
+
+fn run_trace_seal_worker(
+    shared: DiskTraceSealShared,
+    receiver: mpsc::Receiver<DiskTraceSealCommand>,
+) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            DiskTraceSealCommand::Seal(snapshot) => {
+                if let Err(error) = seal_head_segment_snapshot(&shared, snapshot) {
+                    eprintln!("disk trace seal failed: {error}");
+                }
+            }
+            DiskTraceSealCommand::Shutdown => break,
+        }
+    }
+}
+
+fn run_trace_live_update_worker(
+    shared: DiskTraceLiveUpdateShared,
+    receiver: mpsc::Receiver<DiskTraceLiveUpdateCommand>,
+) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            DiskTraceLiveUpdateCommand::Apply => {
+                apply_pending_trace_updates(&shared, usize::MAX);
+                loop {
+                    match receiver.try_recv() {
+                        Ok(DiskTraceLiveUpdateCommand::Apply) => continue,
+                        Ok(DiskTraceLiveUpdateCommand::Shutdown) => return,
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+            }
+            DiskTraceLiveUpdateCommand::Shutdown => break,
+        }
+    }
+}
+
+fn apply_pending_trace_updates(shared: &DiskTraceLiveUpdateShared, max_batches: usize) {
+    if max_batches == 0 {
+        return;
+    }
+    let pending: Vec<_> = {
+        let mut pending = shared.pending_trace_updates.lock();
+        if pending.is_empty() {
+            return;
+        }
+        let take = pending.len().min(max_batches);
+        pending.drain(..take).collect()
+    };
+    for (shard_index, updates) in pending {
+        shared.trace_shards[shard_index]
+            .write()
+            .observe_live_updates(updates.clone());
+        shared.pending_trace_query_shards[shard_index]
+            .write()
+            .remove_live_updates(&updates);
+    }
+}
+
+fn seal_head_segment_snapshot(
+    shared: &DiskTraceSealShared,
+    snapshot: Arc<HeadSegmentSnapshot>,
+) -> Result<(), StorageError> {
+    persist_snapshot_wal(&snapshot)?;
+    let part_path = segment_part_path(&shared.segments_path, snapshot.segment_id);
+    let (old_segment_bytes, new_segment_bytes, part_synced) =
+        seal_rows_file_to_part(&snapshot.wal_path, &part_path, shared.config.sync_policy)?;
+    if part_synced {
+        shared.fsync_operations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let sealed_bytes = if new_segment_bytes == 0 {
+        0
+    } else {
+        let meta = snapshot.build_meta(&part_path)?;
+        let typed_field_columns = meta.typed_field_columns;
+        let string_field_columns = meta.string_field_columns;
+        let meta_path = segment_meta_path(&shared.segments_path, snapshot.segment_id);
+        let (meta_bytes, meta_synced) =
+            write_segment_meta(&meta_path, &meta, shared.config.sync_policy)?;
+        if meta_synced {
+            shared.fsync_operations.fetch_add(1, Ordering::Relaxed);
+        }
+        replace_persisted_bytes_atomic(
+            shared.persisted_bytes.as_ref(),
+            old_segment_bytes,
+            new_segment_bytes,
+            meta_bytes,
+        );
+        shared
+            .segment_paths
+            .write()
+            .insert(snapshot.segment_id, part_path);
+        {
+            let mut shard_state = shared.trace_shards[snapshot.shard_index].write();
+            for trace in meta.traces {
+                shard_state.observe_persisted_trace(trace);
+            }
+        }
+        shared
+            .field_column_counts
+            .typed
+            .fetch_add(typed_field_columns, Ordering::Relaxed);
+        shared
+            .field_column_counts
+            .string
+            .fetch_add(string_field_columns, Ordering::Relaxed);
+        new_segment_bytes + meta_bytes
+    };
+
+    let mut sealing_segments = shared.sealing_segments[snapshot.shard_index].write();
+    if let Some(position) = sealing_segments
+        .iter()
+        .position(|candidate| candidate.segment_id == snapshot.segment_id)
+    {
+        sealing_segments.remove(position);
+    }
+    drop(sealing_segments);
+
+    shared
+        .head_metrics
+        .seal_queue_depth
+        .fetch_sub(1, Ordering::Relaxed);
+    shared
+        .head_metrics
+        .seal_completed
+        .fetch_add(1, Ordering::Relaxed);
+    shared
+        .head_metrics
+        .seal_rows
+        .fetch_add(snapshot.row_count(), Ordering::Relaxed);
+    shared
+        .head_metrics
+        .seal_bytes
+        .fetch_add(sealed_bytes, Ordering::Relaxed);
+    Ok(())
+}
+
+fn persist_snapshot_wal(snapshot: &HeadSegmentSnapshot) -> Result<(), StorageError> {
+    if snapshot.staged_wal_bytes.is_empty() {
+        return Ok(());
+    }
+    let mut wal_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&snapshot.wal_path)?;
+    wal_file.write_all(&snapshot.staged_wal_bytes)?;
+    wal_file.flush()?;
+    Ok(())
+}
+
+fn replace_persisted_bytes_atomic(
+    persisted_bytes: &AtomicU64,
+    old_segment_bytes: u64,
+    new_segment_bytes: u64,
+    extra_bytes: u64,
+) {
+    let mut current = persisted_bytes.load(Ordering::Relaxed);
+    loop {
+        let updated = current
+            .saturating_sub(old_segment_bytes)
+            .saturating_add(new_segment_bytes)
+            .saturating_add(extra_bytes);
+        match persisted_bytes.compare_exchange(
+            current,
+            updated,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -226,6 +644,11 @@ struct SegmentAccumulator {
     max_time_unix_nano: Option<i64>,
     trace_ids: StringTable,
     strings: StringTable,
+    all_trace_refs: RoaringBitmap,
+    trace_refs_by_service: FxHashMap<StringRef, RoaringBitmap>,
+    trace_refs_by_operation: FxHashMap<StringRef, RoaringBitmap>,
+    trace_refs_by_field_name_value: FxHashMap<StringRef, FxHashMap<StringRef, RoaringBitmap>>,
+    field_values_by_name: FxHashMap<StringRef, Vec<StringRef>>,
     traces: FxHashMap<TraceRef, SegmentTraceAccumulator>,
 }
 
@@ -250,7 +673,7 @@ impl SegmentTraceAccumulator {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LiveTraceUpdate {
     trace_id: Arc<str>,
     start_unix_nano: i64,
@@ -259,6 +682,12 @@ struct LiveTraceUpdate {
     operations: SmallArcList,
     indexed_fields: SmallArcPairList,
     row_locations: Vec<SegmentRowLocation>,
+}
+
+#[derive(Debug, Default)]
+struct TraceAppendRowsResult {
+    bytes_written: u64,
+    live_updates: Vec<LiveTraceUpdate>,
 }
 
 #[derive(Default)]
@@ -473,6 +902,32 @@ impl PreparedTraceShardBatch {
     }
 }
 
+fn coalesce_trace_blocks_for_shard(blocks: Vec<TraceBlock>) -> TraceBlock {
+    let mut blocks = blocks.into_iter();
+    let first = blocks
+        .next()
+        .expect("coalesced shard block requires at least one input block");
+    let mut total_rows = first.row_count();
+    let mut total_fields = first.stored_field_count();
+    let mut remaining = Vec::new();
+    for block in blocks {
+        total_rows += block.row_count();
+        total_fields += block.stored_field_count();
+        remaining.push(block);
+    }
+    if remaining.is_empty() {
+        return first;
+    }
+
+    let mut builder = TraceBlockBuilder::with_capacity(total_rows);
+    builder.reserve_fields(total_fields);
+    builder.extend_block(first);
+    for block in remaining {
+        builder.extend_block(block);
+    }
+    builder.finish()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SegmentMeta {
     segment_id: u64,
@@ -481,6 +936,10 @@ struct SegmentMeta {
     persisted_bytes: u64,
     min_time_unix_nano: i64,
     max_time_unix_nano: i64,
+    #[serde(default)]
+    typed_field_columns: u64,
+    #[serde(default)]
+    string_field_columns: u64,
     services: Vec<String>,
     traces: Vec<SegmentTraceMeta>,
 }
@@ -604,12 +1063,51 @@ impl DiskStorageEngine {
         let active_segments = (0..trace_shards)
             .map(|_| Mutex::new(None))
             .collect::<Vec<_>>();
+        let sealing_segments = (0..trace_shards)
+            .map(|_| Arc::new(RwLock::new(Vec::new())))
+            .collect::<Vec<_>>();
         let append_combiners = (0..trace_shards)
             .map(|_| Mutex::new(DiskTraceAppendCombinerState::default()))
             .collect::<Vec<_>>();
         let append_combiner_stats = (0..trace_shards)
             .map(|_| DiskTraceAppendCombinerStats::default())
             .collect::<Vec<_>>();
+        let segment_paths = Arc::new(RwLock::new(recovered.segment_paths));
+        let trace_shards = recovered
+            .trace_shards
+            .into_iter()
+            .map(|shard| Arc::new(RwLock::new(shard)))
+            .collect::<Vec<_>>();
+        let pending_trace_query_shards = (0..trace_shards.len())
+            .map(|_| Arc::new(RwLock::new(PendingTraceQueryState::default())))
+            .collect::<Vec<_>>();
+        let pending_trace_updates = Arc::new(Mutex::new(VecDeque::new()));
+        let persisted_bytes = Arc::new(AtomicU64::new(recovered.persisted_bytes));
+        let fsync_operations = Arc::new(AtomicU64::new(0));
+        let head_metrics = Arc::new(DiskTraceHeadMetrics::default());
+        let field_column_counts = Arc::new(DiskFieldColumnCounts {
+            typed: AtomicU64::new(recovered.typed_field_columns),
+            string: AtomicU64::new(recovered.string_field_columns),
+        });
+        let live_update_runtime = DiskTraceLiveUpdateRuntime::spawn(
+            DiskTraceLiveUpdateShared {
+                trace_shards: trace_shards.clone(),
+                pending_trace_query_shards: pending_trace_query_shards.clone(),
+                pending_trace_updates: pending_trace_updates.clone(),
+            },
+            config.trace_live_update_apply_mode,
+        );
+        let seal_runtime = DiskTraceSealRuntime::spawn(DiskTraceSealShared {
+            segments_path: segments_path.clone(),
+            segment_paths: segment_paths.clone(),
+            trace_shards: trace_shards.clone(),
+            sealing_segments: sealing_segments.clone(),
+            config: config.clone(),
+            persisted_bytes: persisted_bytes.clone(),
+            fsync_operations: fsync_operations.clone(),
+            head_metrics: head_metrics.clone(),
+            field_column_counts: field_column_counts.clone(),
+        });
         let log_writer = BufWriter::new(
             OpenOptions::new()
                 .create(true)
@@ -621,26 +1119,28 @@ impl DiskStorageEngine {
         Ok(Self {
             root_path,
             segments_path,
-            segment_paths: RwLock::new(recovered.segment_paths),
-            trace_shards: recovered
-                .trace_shards
-                .into_iter()
-                .map(RwLock::new)
-                .collect(),
-            pending_trace_updates: Mutex::new(VecDeque::new()),
+            segment_paths,
+            trace_shards,
+            pending_trace_query_shards,
+            pending_trace_updates,
             append_combiners,
             append_combiner_stats,
             active_segments,
+            sealing_segments,
             log_state: RwLock::new(log_state),
             log_writer: Mutex::new(log_writer),
             next_segment_id: AtomicU64::new(next_segment_id),
             config,
-            persisted_bytes: AtomicU64::new(recovered.persisted_bytes),
+            persisted_bytes,
             trace_window_lookups: AtomicU64::new(0),
             row_queries: AtomicU64::new(0),
             segment_read_batches: AtomicU64::new(0),
             part_selective_decodes: AtomicU64::new(0),
-            fsync_operations: AtomicU64::new(0),
+            fsync_operations,
+            head_metrics,
+            field_column_counts,
+            live_update_runtime,
+            seal_runtime,
         })
     }
 
@@ -654,57 +1154,74 @@ impl DiskStorageEngine {
     ) -> Result<&'a mut ActiveSegment, StorageError> {
         if active_segment.is_none() {
             let next_segment_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-            *active_segment = Some(ActiveSegment::open(&self.segments_path, next_segment_id)?);
+            *active_segment = Some(ActiveSegment::open(
+                &self.segments_path,
+                next_segment_id,
+                self.config.trace_wal_writer_capacity_bytes,
+                self.config.trace_deferred_wal_writes,
+            )?);
         }
         Ok(active_segment
             .as_mut()
             .expect("active segment should be initialized"))
     }
 
-    fn rotate_active_segment(
+    fn group_commit_active_segment(
         &self,
         active_segment: &mut ActiveSegment,
+        row_count: usize,
+        bytes_written: u64,
     ) -> Result<(), StorageError> {
-        if active_segment.flush(self.config.sync_policy)? {
+        if self.config.sync_policy.requires_flush() {
+            active_segment.flush()?;
+        }
+        self.head_metrics
+            .group_commit_flushes
+            .fetch_add(1, Ordering::Relaxed);
+        self.head_metrics
+            .group_commit_rows
+            .fetch_add(row_count as u64, Ordering::Relaxed);
+        self.head_metrics
+            .group_commit_bytes
+            .fetch_add(bytes_written, Ordering::Relaxed);
+        if self.config.sync_policy.requires_sync() {
+            active_segment.sync_data()?;
             self.fsync_operations.fetch_add(1, Ordering::Relaxed);
         }
-        let next_segment_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-        *active_segment = ActiveSegment::open(&self.segments_path, next_segment_id)?;
         Ok(())
     }
 
-    fn finalize_active_segment(
+    fn maybe_roll_active_segment(
         &self,
-        active_segment: &mut ActiveSegment,
+        shard_index: usize,
+        active_segment_slot: &mut Option<ActiveSegment>,
     ) -> Result<(), StorageError> {
-        if active_segment.is_empty() {
+        let should_seal = active_segment_slot.as_ref().is_some_and(|active_segment| {
+            !active_segment.is_empty()
+                && active_segment.persisted_bytes() >= self.config.target_segment_size_bytes
+        });
+        if !should_seal {
             return Ok(());
         }
-
-        if active_segment.flush(self.config.sync_policy)? {
-            self.fsync_operations.fetch_add(1, Ordering::Relaxed);
-        }
-        let part_path = segment_part_path(&self.segments_path, active_segment.segment_id);
-        let (old_segment_bytes, new_segment_bytes, part_synced) = seal_rows_file_to_part(
-            &active_segment.wal_path,
-            &part_path,
-            self.config.sync_policy,
-        )?;
-        if part_synced {
-            self.fsync_operations.fetch_add(1, Ordering::Relaxed);
-        }
-        let meta = active_segment.build_meta(&part_path)?;
-        let meta_path = segment_meta_path(&self.segments_path, active_segment.segment_id);
-        let (meta_bytes, meta_synced) =
-            write_segment_meta(&meta_path, &meta, self.config.sync_policy)?;
-        if meta_synced {
-            self.fsync_operations.fetch_add(1, Ordering::Relaxed);
-        }
-        self.replace_persisted_bytes(old_segment_bytes, new_segment_bytes, meta_bytes);
-        self.segment_paths
+        let mut sealed_head = active_segment_slot
+            .take()
+            .expect("active segment should exist when sealing");
+        sealed_head.flush()?;
+        let snapshot = Arc::new(sealed_head.into_snapshot(shard_index));
+        self.sealing_segments[shard_index]
             .write()
-            .insert(active_segment.segment_id, part_path);
-        Ok(())
+            .push(snapshot.clone());
+        self.head_metrics
+            .seal_queue_depth
+            .fetch_add(1, Ordering::Relaxed);
+        let next_segment_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
+        *active_segment_slot = Some(ActiveSegment::open(
+            &self.segments_path,
+            next_segment_id,
+            self.config.trace_wal_writer_capacity_bytes,
+            self.config.trace_deferred_wal_writes,
+        )?);
+        self.seal_runtime.schedule(snapshot)
     }
 
     fn replace_persisted_bytes(
@@ -713,22 +1230,12 @@ impl DiskStorageEngine {
         new_segment_bytes: u64,
         extra_bytes: u64,
     ) {
-        let mut current = self.persisted_bytes.load(Ordering::Relaxed);
-        loop {
-            let updated = current
-                .saturating_sub(old_segment_bytes)
-                .saturating_add(new_segment_bytes)
-                .saturating_add(extra_bytes);
-            match self.persisted_bytes.compare_exchange(
-                current,
-                updated,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
+        replace_persisted_bytes_atomic(
+            self.persisted_bytes.as_ref(),
+            old_segment_bytes,
+            new_segment_bytes,
+            extra_bytes,
+        );
     }
 
     fn flush_log_writer(&self) -> Result<(), StorageError> {
@@ -744,16 +1251,6 @@ impl DiskStorageEngine {
         trace_shard_index(trace_id, self.trace_shards.len())
     }
 
-    fn publish_live_segment_paths(&self, segment_paths: FxHashMap<u64, PathBuf>) {
-        if segment_paths.is_empty() {
-            return;
-        }
-        let mut live_segment_paths = self.segment_paths.write();
-        for (segment_id, segment_path) in segment_paths {
-            live_segment_paths.entry(segment_id).or_insert(segment_path);
-        }
-    }
-
     fn enqueue_live_trace_updates_for_shard(
         &self,
         shard_index: usize,
@@ -762,31 +1259,26 @@ impl DiskStorageEngine {
         if updates.is_empty() {
             return;
         }
-        let mut pending = self.pending_trace_updates.lock();
-        pending.push_back((shard_index, updates));
-    }
-
-    fn drain_pending_trace_updates(&self) {
-        self.drain_pending_trace_updates_with_limit(usize::MAX);
-    }
-
-    fn drain_pending_trace_updates_with_limit(&self, max_batches: usize) {
-        if max_batches == 0 {
-            return;
-        }
-        let pending: Vec<_> = {
+        let should_schedule = {
             let mut pending = self.pending_trace_updates.lock();
-            if pending.is_empty() {
-                return;
-            }
-            let take = pending.len().min(max_batches);
-            pending.drain(..take).collect()
+            let should_schedule = pending.is_empty();
+            pending.push_back((shard_index, updates));
+            should_schedule
         };
-        for (shard_index, updates) in pending {
-            self.trace_shards[shard_index]
-                .write()
-                .observe_live_updates(updates);
+        if should_schedule && self.live_update_runtime.schedule_apply().is_err() {
+            self.apply_pending_trace_updates_with_limit(usize::MAX);
         }
+    }
+
+    fn apply_pending_trace_updates_with_limit(&self, max_batches: usize) {
+        apply_pending_trace_updates(
+            &DiskTraceLiveUpdateShared {
+                trace_shards: self.trace_shards.clone(),
+                pending_trace_query_shards: self.pending_trace_query_shards.clone(),
+                pending_trace_updates: self.pending_trace_updates.clone(),
+            },
+            max_batches,
+        );
     }
 
     fn append_prepared_trace_rows(
@@ -796,112 +1288,52 @@ impl DiskStorageEngine {
         encoded_row_bytes: &[u8],
         encoded_row_ranges: &[std::ops::Range<usize>],
         active_segment: &mut ActiveSegment,
-        observed_segment_paths: &mut FxHashMap<u64, PathBuf>,
-    ) -> Result<Vec<LiveTraceUpdate>, StorageError> {
-        let row_count = prepared_rows.len();
-        let mut live_updates = Vec::new();
-
-        let mut batch_start = 0usize;
-        let mut pending_batch_bytes = 0u64;
-        let mut pending_batch_payload_bytes = 0usize;
-        let mut pending_batch_row_count = 0usize;
-        for index in 0..row_count {
-            let mut effective_segment_bytes =
-                active_segment.persisted_bytes() + pending_batch_bytes;
-            if active_segment.is_empty() && batch_start < index {
-                effective_segment_bytes += WAL_HEADER_BYTES;
-            }
-            if (batch_start < index || !active_segment.is_empty())
-                && effective_segment_bytes >= self.config.target_segment_size_bytes
-            {
-                if batch_start < index {
-                    observed_segment_paths
-                        .entry(active_segment.segment_id)
-                        .or_insert_with(|| active_segment.wal_path.clone());
-                    let (batch_updates, bytes_written) = active_segment.append_block_rows(
-                        prepared_rows,
-                        prepared_shared_groups,
-                        &encoded_row_bytes,
-                        &encoded_row_ranges,
-                        batch_start,
-                        index,
-                    )?;
-                    self.persisted_bytes
-                        .fetch_add(bytes_written, Ordering::Relaxed);
-                    merge_live_updates(&mut live_updates, batch_updates);
-                }
-                self.rotate_active_segment(active_segment)?;
-                batch_start = index;
-                pending_batch_payload_bytes = 0;
-                pending_batch_row_count = 0;
-            }
-            pending_batch_payload_bytes += encoded_row_ranges[index].len();
-            pending_batch_row_count += 1;
-            pending_batch_bytes =
-                wal_batch_storage_bytes(pending_batch_payload_bytes, pending_batch_row_count);
-        }
-        if batch_start < row_count {
-            observed_segment_paths
-                .entry(active_segment.segment_id)
-                .or_insert_with(|| active_segment.wal_path.clone());
-            let (batch_updates, bytes_written) = active_segment.append_block_rows(
-                prepared_rows,
-                prepared_shared_groups,
-                &encoded_row_bytes,
-                &encoded_row_ranges,
-                batch_start,
-                row_count,
-            )?;
-            self.persisted_bytes
-                .fetch_add(bytes_written, Ordering::Relaxed);
-            merge_live_updates(&mut live_updates, batch_updates);
-        }
-
-        Ok(live_updates)
+    ) -> Result<TraceAppendRowsResult, StorageError> {
+        active_segment.append_block_rows(
+            prepared_rows,
+            prepared_shared_groups,
+            encoded_row_bytes,
+            encoded_row_ranges,
+            0,
+            prepared_rows.len(),
+        )
     }
 
     fn append_prepared_trace_shard_batch(
         &self,
         prepared_batch: &PreparedTraceShardBatch,
         active_segment: &mut ActiveSegment,
-        observed_segment_paths: &mut FxHashMap<u64, PathBuf>,
-    ) -> Result<Vec<LiveTraceUpdate>, StorageError> {
+    ) -> Result<TraceAppendRowsResult, StorageError> {
         self.append_prepared_trace_rows(
             &prepared_batch.prepared_rows,
             &prepared_batch.prepared_shared_groups,
             &prepared_batch.encoded_row_bytes,
             &prepared_batch.encoded_row_ranges,
             active_segment,
-            observed_segment_paths,
         )
     }
 
-    fn append_prepared_trace_shard_batch_once(
+    fn append_prepared_trace_shard_batches_once(
         &self,
-        prepared_batch: PreparedTraceShardBatch,
+        shard_index: usize,
+        prepared_batches: Vec<PreparedTraceShardBatch>,
     ) -> Result<(), StorageError> {
-        let mut observed_segment_paths = FxHashMap::default();
-        let mut flush_count = 0u64;
-        let mut active_segment_slot = self.active_segments[prepared_batch.shard_index].lock();
+        debug_assert!(!prepared_batches.is_empty());
+        let mut active_segment_slot = self.active_segments[shard_index].lock();
         let active_segment = self.ensure_active_segment(&mut active_segment_slot)?;
-        let live_updates = self.append_prepared_trace_shard_batch(
-            &prepared_batch,
-            active_segment,
-            &mut observed_segment_paths,
-        )?;
-        if self.config.sync_policy.requires_sync()
-            && active_segment.flush(self.config.sync_policy)?
-        {
-            flush_count += 1;
+        let mut total_rows = 0usize;
+        let mut total_bytes = 0u64;
+        for prepared_batch in &prepared_batches {
+            debug_assert_eq!(prepared_batch.shard_index, shard_index);
+            total_rows += prepared_batch.prepared_rows.len();
+            let append_result =
+                self.append_prepared_trace_shard_batch(prepared_batch, active_segment)?;
+            total_bytes += append_result.bytes_written;
         }
-        drop(active_segment_slot);
-
-        self.publish_live_segment_paths(observed_segment_paths);
-        self.enqueue_live_trace_updates_for_shard(prepared_batch.shard_index, live_updates);
-        if flush_count > 0 {
-            self.fsync_operations
-                .fetch_add(flush_count, Ordering::Relaxed);
-        }
+        self.persisted_bytes
+            .fetch_add(total_bytes, Ordering::Relaxed);
+        self.group_commit_active_segment(active_segment, total_rows, total_bytes)?;
+        self.maybe_roll_active_segment(shard_index, &mut active_segment_slot)?;
         Ok(())
     }
 
@@ -915,6 +1347,16 @@ impl DiskStorageEngine {
         }
         let input_blocks = trace_blocks.len();
         let row_count = trace_blocks.iter().map(TraceBlock::row_count).sum();
+        self.submit_trace_shard_append_request(shard_index, trace_blocks, input_blocks, row_count)
+    }
+
+    fn submit_trace_shard_append_request(
+        &self,
+        shard_index: usize,
+        trace_blocks: Vec<TraceBlock>,
+        input_blocks: usize,
+        row_count: usize,
+    ) -> Result<(), StorageError> {
         let (result_tx, result_rx) = mpsc::channel();
         let request = DiskTraceAppendRequest {
             trace_blocks,
@@ -950,51 +1392,99 @@ impl DiskStorageEngine {
             let Some(requests) = self.take_trace_append_requests(shard_index) else {
                 return;
             };
-            let mut earliest_enqueue = requests[0].enqueued_at;
-            let mut input_blocks = 0usize;
-            let mut row_count = 0usize;
-            let mut responders = Vec::new();
-            let mut prepared_blocks = Vec::new();
-            let mut pending_requests = requests;
-
-            loop {
-                let mut trace_blocks = Vec::new();
-                for request in pending_requests {
-                    earliest_enqueue = earliest_enqueue.min(request.enqueued_at);
-                    input_blocks += request.input_blocks;
-                    row_count += request.row_count;
-                    trace_blocks.extend(request.trace_blocks);
-                    responders.push(request.result_tx);
-                }
-                prepared_blocks.reserve(trace_blocks.len());
-                for block in trace_blocks {
-                    prepared_blocks.push(PreparedTraceBlockAppend::new(
-                        block,
-                        self.trace_shards.len(),
-                    ));
-                }
-
-                pending_requests = self.take_pending_trace_append_requests(shard_index);
-                if pending_requests.is_empty() {
-                    break;
-                }
-            }
-            let wait_micros = saturating_micros(earliest_enqueue.elapsed().as_micros());
-            self.append_combiner_stats[shard_index].record_flush(
-                row_count,
-                input_blocks,
-                wait_micros,
-            );
+            let (prepared_batches, responders) =
+                self.collect_prepared_trace_shard_batches_for_commit(shard_index, requests);
 
             let result = self
-                .append_prepared_trace_shard_batch_once(
-                    PreparedTraceShardBatch::from_prepared_blocks(prepared_blocks),
-                )
+                .append_prepared_trace_shard_batches_once(shard_index, prepared_batches)
                 .map_err(|error| error.to_string());
             for responder in responders {
                 let _ = responder.send(result.clone());
             }
         }
+    }
+
+    fn collect_prepared_trace_shard_batches_for_commit(
+        &self,
+        shard_index: usize,
+        requests: Vec<DiskTraceAppendRequest>,
+    ) -> (
+        Vec<PreparedTraceShardBatch>,
+        Vec<mpsc::Sender<Result<(), String>>>,
+    ) {
+        let mut prepared_batches = Vec::new();
+        let mut responders = Vec::new();
+        let mut pending_requests = requests;
+        let mut wait_for_additional_batch = self.config.trace_group_commit_wait > Duration::ZERO;
+        let mut commit_deadline = None;
+
+        loop {
+            let (prepared_batch, batch_responders, earliest_enqueue) =
+                self.prepare_trace_append_batch(shard_index, pending_requests);
+            if commit_deadline.is_none() {
+                commit_deadline = Some(earliest_enqueue + self.config.trace_group_commit_wait);
+            }
+            prepared_batches.push(prepared_batch);
+            responders.extend(batch_responders);
+            pending_requests = if wait_for_additional_batch {
+                wait_for_additional_batch = false;
+                self.take_pending_trace_append_requests_until(
+                    shard_index,
+                    commit_deadline.expect("commit deadline initialized"),
+                )
+            } else {
+                self.take_pending_trace_append_requests(shard_index)
+            };
+            if pending_requests.is_empty() {
+                break;
+            }
+        }
+
+        (prepared_batches, responders)
+    }
+
+    fn prepare_trace_append_batch(
+        &self,
+        shard_index: usize,
+        requests: Vec<DiskTraceAppendRequest>,
+    ) -> (
+        PreparedTraceShardBatch,
+        Vec<mpsc::Sender<Result<(), String>>>,
+        Instant,
+    ) {
+        let mut earliest_enqueue = requests[0].enqueued_at;
+        let mut input_blocks = 0usize;
+        let mut row_count = 0usize;
+        let mut responders = Vec::new();
+        let mut pending_requests = requests;
+        let mut trace_blocks = Vec::new();
+        let combine_deadline = earliest_enqueue + self.config.trace_combiner_wait;
+
+        loop {
+            for request in pending_requests {
+                earliest_enqueue = earliest_enqueue.min(request.enqueued_at);
+                input_blocks += request.input_blocks;
+                row_count += request.row_count;
+                trace_blocks.extend(request.trace_blocks);
+                responders.push(request.result_tx);
+            }
+            pending_requests =
+                self.take_pending_trace_append_requests_until(shard_index, combine_deadline);
+            if pending_requests.is_empty() {
+                break;
+            }
+        }
+        let wait_micros = saturating_micros(earliest_enqueue.elapsed().as_micros());
+        self.append_combiner_stats[shard_index].record_flush(row_count, input_blocks, wait_micros);
+
+        (
+            PreparedTraceShardBatch::from_prepared_blocks(vec![PreparedTraceBlockAppend::new(
+                coalesce_trace_blocks_for_shard(trace_blocks),
+                self.trace_shards.len(),
+            )]),
+            responders,
+            earliest_enqueue,
+        )
     }
 
     fn take_trace_append_requests(
@@ -1028,16 +1518,204 @@ impl DiskStorageEngine {
         }
         requests
     }
+
+    fn take_pending_trace_append_requests_until(
+        &self,
+        shard_index: usize,
+        deadline: Instant,
+    ) -> Vec<DiskTraceAppendRequest> {
+        loop {
+            let requests = self.take_pending_trace_append_requests(shard_index);
+            if !requests.is_empty() {
+                return requests;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Vec::new();
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining > TRACE_COMBINER_WAIT_POLL_SLICE {
+                thread::sleep(TRACE_COMBINER_WAIT_POLL_SLICE);
+            } else if remaining > Duration::ZERO {
+                thread::yield_now();
+            }
+        }
+    }
+
+    fn head_trace_window_bounds(
+        &self,
+        shard_index: usize,
+        trace_id: &str,
+    ) -> Option<TraceWindowBounds> {
+        let mut bounds = None;
+        {
+            let active_segment = self.active_segments[shard_index].lock();
+            if let Some(active_segment) = active_segment.as_ref() {
+                if let Some(active_bounds) = active_segment.trace_window_bounds(trace_id) {
+                    bounds = Some(active_bounds);
+                }
+            }
+        }
+        for snapshot in self.sealing_segments[shard_index].read().iter() {
+            if let Some(snapshot_bounds) = snapshot.trace_window_bounds(trace_id) {
+                bounds.get_or_insert(snapshot_bounds).observe(
+                    snapshot_bounds.start_unix_nano,
+                    snapshot_bounds.end_unix_nano,
+                );
+            }
+        }
+        bounds
+    }
+
+    fn head_rows_for_trace(
+        &self,
+        shard_index: usize,
+        trace_id: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+    ) -> Vec<TraceSpanRow> {
+        let mut rows = Vec::new();
+        {
+            let active_segment = self.active_segments[shard_index].lock();
+            if let Some(active_segment) = active_segment.as_ref() {
+                if let Ok(mut active_rows) =
+                    active_segment.read_rows_for_trace(trace_id, start_unix_nano, end_unix_nano)
+                {
+                    rows.append(&mut active_rows);
+                }
+            }
+        }
+        for snapshot in self.sealing_segments[shard_index].read().iter() {
+            if let Ok(mut snapshot_rows) =
+                snapshot.read_rows_for_trace(trace_id, start_unix_nano, end_unix_nano)
+            {
+                rows.append(&mut snapshot_rows);
+            }
+        }
+        rows
+    }
+
+    fn head_stats(&self) -> (u64, u64, BTreeSet<String>) {
+        let mut segments = 0u64;
+        let mut rows = 0u64;
+        let mut trace_ids = BTreeSet::new();
+
+        for shard_index in 0..self.trace_shards.len() {
+            {
+                let active_segment = self.active_segments[shard_index].lock();
+                if let Some(active_segment) = active_segment.as_ref() {
+                    if !active_segment.is_empty() {
+                        segments += 1;
+                        rows += active_segment.row_count();
+                        trace_ids.extend(active_segment.list_trace_ids());
+                    }
+                }
+            }
+            for snapshot in self.sealing_segments[shard_index].read().iter() {
+                segments += 1;
+                rows += snapshot.row_count();
+                trace_ids.extend(snapshot.list_trace_ids());
+            }
+        }
+
+        (segments, rows, trace_ids)
+    }
+
+    fn head_list_services(&self) -> BTreeSet<String> {
+        let mut services = BTreeSet::new();
+        for shard_index in 0..self.trace_shards.len() {
+            {
+                let active_segment = self.active_segments[shard_index].lock();
+                if let Some(active_segment) = active_segment.as_ref() {
+                    services.extend(active_segment.list_services());
+                }
+            }
+            for snapshot in self.sealing_segments[shard_index].read().iter() {
+                services.extend(snapshot.list_services());
+            }
+        }
+        services
+    }
+
+    fn head_list_field_names(&self) -> BTreeSet<String> {
+        let mut field_names = BTreeSet::new();
+        for shard_index in 0..self.trace_shards.len() {
+            {
+                let active_segment = self.active_segments[shard_index].lock();
+                if let Some(active_segment) = active_segment.as_ref() {
+                    field_names.extend(active_segment.list_field_names());
+                }
+            }
+            for snapshot in self.sealing_segments[shard_index].read().iter() {
+                field_names.extend(snapshot.list_field_names());
+            }
+        }
+        field_names
+    }
+
+    fn head_list_field_values(&self, field_name: &str) -> BTreeSet<String> {
+        let mut field_values = BTreeSet::new();
+        for shard_index in 0..self.trace_shards.len() {
+            {
+                let active_segment = self.active_segments[shard_index].lock();
+                if let Some(active_segment) = active_segment.as_ref() {
+                    field_values.extend(active_segment.list_field_values(field_name));
+                }
+            }
+            for snapshot in self.sealing_segments[shard_index].read().iter() {
+                field_values.extend(snapshot.list_field_values(field_name));
+            }
+        }
+        field_values
+    }
+
+    fn head_search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
+        let mut hits_by_trace = FxHashMap::default();
+        for shard_index in 0..self.trace_shards.len() {
+            {
+                let active_segment = self.active_segments[shard_index].lock();
+                if let Some(active_segment) = active_segment.as_ref() {
+                    for hit in active_segment.search_traces(request) {
+                        merge_trace_search_hit(&mut hits_by_trace, hit);
+                    }
+                }
+            }
+            for snapshot in self.sealing_segments[shard_index].read().iter() {
+                for hit in snapshot.search_traces(request) {
+                    merge_trace_search_hit(&mut hits_by_trace, hit);
+                }
+            }
+        }
+        hits_by_trace.into_values().collect()
+    }
 }
 
 impl Drop for DiskStorageEngine {
     fn drop(&mut self) {
-        for active_segment in &self.active_segments {
+        self.live_update_runtime.shutdown();
+        for (shard_index, active_segment) in self.active_segments.iter().enumerate() {
             let mut active_segment = active_segment.lock();
-            if let Some(active_segment) = active_segment.as_mut() {
-                let _ = self.finalize_active_segment(active_segment);
+            if let Some(mut active_segment) = active_segment.take() {
+                if active_segment.is_empty() {
+                    continue;
+                }
+                let _ = active_segment.flush();
+                if self.config.sync_policy.requires_sync() {
+                    if active_segment.sync_data().is_ok() {
+                        self.fsync_operations.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let snapshot = Arc::new(active_segment.into_snapshot(shard_index));
+                self.sealing_segments[shard_index]
+                    .write()
+                    .push(snapshot.clone());
+                self.head_metrics
+                    .seal_queue_depth
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = self.seal_runtime.schedule(snapshot);
             }
         }
+        self.seal_runtime.shutdown();
         let _ = self.flush_log_writer();
     }
 }
@@ -1048,31 +1726,18 @@ impl StorageEngine for DiskStorageEngine {
             return Ok(());
         }
 
-        self.append_trace_blocks(vec![block])
+        for (shard_index, shard_blocks) in
+            route_trace_blocks_for_append(vec![block], self.trace_shards.len())
+        {
+            self.submit_trace_shard_blocks(shard_index, shard_blocks)?;
+        }
+        Ok(())
     }
 
     fn append_trace_blocks(&self, blocks: Vec<TraceBlock>) -> Result<(), StorageError> {
-        let mut blocks_by_shard = (0..self.trace_shards.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
-        for block in blocks {
-            if block.is_empty() {
-                continue;
-            }
-            if let Some(shard_index) = trace_block_shard_index(&block, self.trace_shards.len()) {
-                blocks_by_shard[shard_index].push(block);
-                continue;
-            }
-            for block in partition_trace_block_by_shard(block, self.trace_shards.len()) {
-                let shard_index =
-                    trace_block_shard_index(&block, self.trace_shards.len()).unwrap_or(0);
-                blocks_by_shard[shard_index].push(block);
-            }
-        }
-        for (shard_index, shard_blocks) in blocks_by_shard.into_iter().enumerate() {
-            if shard_blocks.is_empty() {
-                continue;
-            }
+        for (shard_index, shard_blocks) in
+            route_trace_blocks_for_append(blocks, self.trace_shards.len())
+        {
             self.submit_trace_shard_blocks(shard_index, shard_blocks)?;
         }
         Ok(())
@@ -1108,55 +1773,73 @@ impl StorageEngine for DiskStorageEngine {
     }
 
     fn trace_window(&self, trace_id: &str) -> Option<TraceWindow> {
-        self.drain_pending_trace_updates();
         self.trace_window_lookups.fetch_add(1, Ordering::Relaxed);
-        self.trace_shards[self.trace_shard_index(trace_id)]
+        let shard_index = self.trace_shard_index(trace_id);
+        let mut bounds = self.trace_shards[shard_index]
             .read()
-            .trace_window(trace_id)
+            .trace_window_bounds(trace_id);
+        if let Some(head_bounds) = self.head_trace_window_bounds(shard_index, trace_id) {
+            bounds
+                .get_or_insert(head_bounds)
+                .observe(head_bounds.start_unix_nano, head_bounds.end_unix_nano);
+        }
+        bounds.map(|bounds| {
+            TraceWindow::new(
+                trace_id.to_string(),
+                bounds.start_unix_nano,
+                bounds.end_unix_nano,
+            )
+        })
     }
 
     fn list_trace_ids(&self) -> Vec<String> {
-        self.drain_pending_trace_updates();
         let mut trace_ids = BTreeSet::new();
         for shard in &self.trace_shards {
             trace_ids.extend(shard.read().list_trace_ids());
         }
+        let (_, _, head_trace_ids) = self.head_stats();
+        trace_ids.extend(head_trace_ids);
         trace_ids.into_iter().collect()
     }
 
     fn list_services(&self) -> Vec<String> {
-        self.drain_pending_trace_updates();
         let mut services = BTreeSet::new();
-        for shard in &self.trace_shards {
-            services.extend(shard.read().list_services());
+        for trace_shard in &self.trace_shards {
+            services.extend(trace_shard.read().list_services());
         }
+        services.extend(self.head_list_services());
         services.into_iter().collect()
     }
 
     fn list_field_names(&self) -> Vec<String> {
-        self.drain_pending_trace_updates();
         let mut field_names = BTreeSet::new();
-        for shard in &self.trace_shards {
-            field_names.extend(shard.read().list_field_names());
+        for trace_shard in &self.trace_shards {
+            field_names.extend(trace_shard.read().list_field_names());
         }
+        field_names.extend(self.head_list_field_names());
         field_names.into_iter().collect()
     }
 
     fn list_field_values(&self, field_name: &str) -> Vec<String> {
-        self.drain_pending_trace_updates();
         let mut field_values = BTreeSet::new();
-        for shard in &self.trace_shards {
-            field_values.extend(shard.read().list_field_values(field_name));
+        for trace_shard in &self.trace_shards {
+            field_values.extend(trace_shard.read().list_field_values(field_name));
         }
+        field_values.extend(self.head_list_field_values(field_name));
         field_values.into_iter().collect()
     }
 
     fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
-        self.drain_pending_trace_updates();
-        let mut hits = Vec::new();
-        for shard in &self.trace_shards {
-            hits.extend(shard.read().search_traces(request));
+        let mut hits_by_trace = FxHashMap::default();
+        for trace_shard in &self.trace_shards {
+            for hit in trace_shard.read().search_traces(request) {
+                merge_trace_search_hit(&mut hits_by_trace, hit);
+            }
         }
+        for hit in self.head_search_traces(request) {
+            merge_trace_search_hit(&mut hits_by_trace, hit);
+        }
+        let mut hits: Vec<_> = hits_by_trace.into_values().collect();
         hits.sort_by(|left, right| {
             right
                 .end_unix_nano
@@ -1177,12 +1860,14 @@ impl StorageEngine for DiskStorageEngine {
         start_unix_nano: i64,
         end_unix_nano: i64,
     ) -> Vec<TraceSpanRow> {
-        self.drain_pending_trace_updates();
         self.row_queries.fetch_add(1, Ordering::Relaxed);
 
-        let row_refs = self.trace_shards[self.trace_shard_index(trace_id)]
-            .read()
-            .row_refs_for_trace(trace_id, start_unix_nano, end_unix_nano);
+        let shard_index = self.trace_shard_index(trace_id);
+        let row_refs = self.trace_shards[shard_index].read().row_refs_for_trace(
+            trace_id,
+            start_unix_nano,
+            end_unix_nano,
+        );
         let segment_paths = self.segment_paths.read().clone();
 
         let mut rows = Vec::with_capacity(row_refs.len());
@@ -1202,17 +1887,6 @@ impl StorageEngine for DiskStorageEngine {
                 continue;
             };
             segment_refs.sort_by_key(|row| row.row_index);
-            {
-                let active_segment = self.active_segments[self.trace_shard_index(trace_id)].lock();
-                if let Some(active_segment) = active_segment.as_ref() {
-                    if active_segment.segment_id == segment_id {
-                        if let Ok(mut segment_rows) = active_segment.read_rows(&segment_refs) {
-                            rows.append(&mut segment_rows);
-                        }
-                        continue;
-                    }
-                }
-            }
             if path.extension().and_then(|value| value.to_str()) == Some("part") {
                 self.part_selective_decodes.fetch_add(1, Ordering::Relaxed);
             }
@@ -1220,38 +1894,49 @@ impl StorageEngine for DiskStorageEngine {
                 rows.append(&mut segment_rows);
             }
         }
+        let head_rows =
+            self.head_rows_for_trace(shard_index, trace_id, start_unix_nano, end_unix_nano);
+        if !head_rows.is_empty() {
+            self.segment_read_batches.fetch_add(1, Ordering::Relaxed);
+        }
+        rows.extend(head_rows);
         rows.sort_by_key(|row| row.end_unix_nano);
         rows
     }
 
     fn stats(&self) -> StorageStatsSnapshot {
-        self.drain_pending_trace_updates_with_limit(STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT);
         let segment_paths = self.segment_paths.read();
-        let (rows_ingested, traces_tracked) =
-            self.trace_shards
-                .iter()
-                .fold((0u64, 0u64), |(rows_acc, traces_acc), shard| {
-                    let state = shard.read();
-                    (
-                        rows_acc + state.rows_ingested(),
-                        traces_acc + state.traces_tracked(),
-                    )
-                });
-        let (typed_field_columns, string_field_columns) =
-            count_field_column_encodings(segment_paths.values());
+        let mut rows_ingested = 0u64;
+        let mut trace_ids = BTreeSet::new();
+        for shard in &self.trace_shards {
+            let state = shard.read();
+            rows_ingested += state.rows_ingested();
+            trace_ids.extend(state.list_trace_ids());
+        }
+        let (trace_head_segments, trace_head_rows, head_trace_ids) = self.head_stats();
+        rows_ingested += trace_head_rows;
+        trace_ids.extend(head_trace_ids);
         StorageStatsSnapshot {
             rows_ingested,
-            traces_tracked,
+            traces_tracked: trace_ids.len() as u64,
             retained_trace_blocks: 0,
             persisted_bytes: self.persisted_bytes.load(Ordering::Relaxed),
-            segment_count: segment_paths.len() as u64,
-            typed_field_columns,
-            string_field_columns,
+            segment_count: segment_paths.len() as u64 + trace_head_segments,
+            trace_head_segments,
+            trace_head_rows,
+            typed_field_columns: self.field_column_counts.typed.load(Ordering::Relaxed),
+            string_field_columns: self.field_column_counts.string.load(Ordering::Relaxed),
             trace_window_lookups: self.trace_window_lookups.load(Ordering::Relaxed),
             row_queries: self.row_queries.load(Ordering::Relaxed),
             segment_read_batches: self.segment_read_batches.load(Ordering::Relaxed),
             part_selective_decodes: self.part_selective_decodes.load(Ordering::Relaxed),
             fsync_operations: self.fsync_operations.load(Ordering::Relaxed),
+            trace_group_commit_flushes: self
+                .head_metrics
+                .group_commit_flushes
+                .load(Ordering::Relaxed),
+            trace_group_commit_rows: self.head_metrics.group_commit_rows.load(Ordering::Relaxed),
+            trace_group_commit_bytes: self.head_metrics.group_commit_bytes.load(Ordering::Relaxed),
             trace_batch_queue_depth: self
                 .append_combiner_stats
                 .iter()
@@ -1294,6 +1979,11 @@ impl StorageEngine for DiskStorageEngine {
                 .map(|stats| stats.wait_micros_max.load(Ordering::Relaxed))
                 .max()
                 .unwrap_or(0),
+            trace_live_update_queue_depth: self.pending_trace_updates.lock().len() as u64,
+            trace_seal_queue_depth: self.head_metrics.seal_queue_depth.load(Ordering::Relaxed),
+            trace_seal_completed: self.head_metrics.seal_completed.load(Ordering::Relaxed),
+            trace_seal_rows: self.head_metrics.seal_rows.load(Ordering::Relaxed),
+            trace_seal_bytes: self.head_metrics.seal_bytes.load(Ordering::Relaxed),
             trace_batch_flush_due_to_wait: self
                 .append_combiner_stats
                 .iter()
@@ -1434,6 +2124,11 @@ impl DiskTraceShardState {
             bounds.start_unix_nano,
             bounds.end_unix_nano,
         ))
+    }
+
+    fn trace_window_bounds(&self, trace_id: &str) -> Option<TraceWindowBounds> {
+        let trace_ref = self.trace_ids.lookup(trace_id)?;
+        self.windows_by_trace.get(&trace_ref).copied()
     }
 
     fn list_services(&self) -> Vec<String> {
@@ -1641,19 +2336,487 @@ impl DiskTraceShardState {
     }
 }
 
+impl PendingTraceQueryEntry {
+    fn observe_window(&mut self, start_unix_nano: i64, end_unix_nano: i64) {
+        *self.start_unix_nanos.entry(start_unix_nano).or_default() += 1;
+        *self.end_unix_nanos.entry(end_unix_nano).or_default() += 1;
+    }
+
+    fn remove_window(&mut self, start_unix_nano: i64, end_unix_nano: i64) {
+        decrement_btree_counter(&mut self.start_unix_nanos, start_unix_nano);
+        decrement_btree_counter(&mut self.end_unix_nanos, end_unix_nano);
+    }
+
+    fn bounds(&self) -> Option<TraceWindowBounds> {
+        Some(TraceWindowBounds::new(
+            *self.start_unix_nanos.keys().next()?,
+            *self.end_unix_nanos.keys().next_back()?,
+        ))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.start_unix_nanos.is_empty()
+            && self.end_unix_nanos.is_empty()
+            && self.services.is_empty()
+            && self.operations.is_empty()
+            && self.indexed_fields.is_empty()
+    }
+}
+
+impl PendingTraceQueryState {
+    fn observe_live_updates(&mut self, updates: &[LiveTraceUpdate]) {
+        let mut intern_cache = BatchInternCache::default();
+        for update in updates {
+            let trace_ref = intern_cache.trace_ref(&mut self.trace_ids, update.trace_id.as_ref());
+            self.all_trace_refs.insert(trace_ref);
+            let mut added_services = SmallVec::<[StringRef; 4]>::new();
+            let mut added_operations = SmallVec::<[StringRef; 4]>::new();
+            let mut added_fields = SmallVec::<[(StringRef, StringRef); 8]>::new();
+
+            {
+                let trace = self.traces.entry(trace_ref).or_default();
+                trace.observe_window(update.start_unix_nano, update.end_unix_nano);
+
+                for service_name in &update.services {
+                    let service_ref =
+                        intern_cache.string_ref(&mut self.strings, service_name.as_ref());
+                    if increment_hash_counter(&mut trace.services, service_ref) {
+                        added_services.push(service_ref);
+                    }
+                }
+
+                for operation_name in &update.operations {
+                    let operation_ref =
+                        intern_cache.string_ref(&mut self.strings, operation_name.as_ref());
+                    if increment_hash_counter(&mut trace.operations, operation_ref) {
+                        added_operations.push(operation_ref);
+                    }
+                }
+
+                for (field_name, field_value) in &update.indexed_fields {
+                    let field_name_ref =
+                        intern_cache.string_ref(&mut self.strings, field_name.as_ref());
+                    let field_value_ref =
+                        intern_cache.string_ref(&mut self.strings, field_value.as_ref());
+                    if increment_hash_counter(
+                        &mut trace.indexed_fields,
+                        (field_name_ref, field_value_ref),
+                    ) {
+                        added_fields.push((field_name_ref, field_value_ref));
+                    }
+                }
+            }
+
+            for service_ref in added_services {
+                self.trace_refs_by_service
+                    .entry(service_ref)
+                    .or_default()
+                    .insert(trace_ref);
+            }
+
+            for operation_ref in added_operations {
+                self.trace_refs_by_operation
+                    .entry(operation_ref)
+                    .or_default()
+                    .insert(trace_ref);
+            }
+
+            for (field_name_ref, field_value_ref) in added_fields {
+                self.trace_refs_by_field_name_value
+                    .entry(field_name_ref)
+                    .or_default()
+                    .entry(field_value_ref)
+                    .or_default()
+                    .insert(trace_ref);
+            }
+
+            for (field_name, field_value) in &update.indexed_fields {
+                let field_name_ref =
+                    intern_cache.string_ref(&mut self.strings, field_name.as_ref());
+                let field_value_ref =
+                    intern_cache.string_ref(&mut self.strings, field_value.as_ref());
+                increment_nested_hash_counter(
+                    &mut self.field_values_by_name,
+                    field_name_ref,
+                    field_value_ref,
+                );
+            }
+        }
+    }
+
+    fn remove_live_updates(&mut self, updates: &[LiveTraceUpdate]) {
+        for update in updates {
+            let Some(trace_ref) = self.trace_ids.lookup(update.trace_id.as_ref()) else {
+                continue;
+            };
+
+            let mut removed_services = SmallVec::<[StringRef; 4]>::new();
+            let mut removed_operations = SmallVec::<[StringRef; 4]>::new();
+            let mut removed_fields = SmallVec::<[(StringRef, StringRef); 8]>::new();
+            let mut seen_field_pairs = SmallVec::<[(StringRef, StringRef); 8]>::new();
+            let remove_trace = if let Some(trace) = self.traces.get_mut(&trace_ref) {
+                trace.remove_window(update.start_unix_nano, update.end_unix_nano);
+
+                for service_name in &update.services {
+                    let Some(service_ref) = self.strings.lookup(service_name.as_ref()) else {
+                        continue;
+                    };
+                    if decrement_hash_counter(&mut trace.services, service_ref) {
+                        removed_services.push(service_ref);
+                    }
+                }
+
+                for operation_name in &update.operations {
+                    let Some(operation_ref) = self.strings.lookup(operation_name.as_ref()) else {
+                        continue;
+                    };
+                    if decrement_hash_counter(&mut trace.operations, operation_ref) {
+                        removed_operations.push(operation_ref);
+                    }
+                }
+
+                for (field_name, field_value) in &update.indexed_fields {
+                    let Some(field_name_ref) = self.strings.lookup(field_name.as_ref()) else {
+                        continue;
+                    };
+                    let Some(field_value_ref) = self.strings.lookup(field_value.as_ref()) else {
+                        continue;
+                    };
+                    if !seen_field_pairs
+                        .iter()
+                        .any(|(existing_name, existing_value)| {
+                            *existing_name == field_name_ref && *existing_value == field_value_ref
+                        })
+                    {
+                        seen_field_pairs.push((field_name_ref, field_value_ref));
+                    }
+                    if decrement_hash_counter(
+                        &mut trace.indexed_fields,
+                        (field_name_ref, field_value_ref),
+                    ) {
+                        removed_fields.push((field_name_ref, field_value_ref));
+                    }
+                }
+
+                trace.is_empty()
+            } else {
+                false
+            };
+
+            for service_ref in removed_services {
+                remove_trace_ref_from_bitmap_map(
+                    &mut self.trace_refs_by_service,
+                    service_ref,
+                    trace_ref,
+                );
+            }
+
+            for operation_ref in removed_operations {
+                remove_trace_ref_from_bitmap_map(
+                    &mut self.trace_refs_by_operation,
+                    operation_ref,
+                    trace_ref,
+                );
+            }
+
+            for (field_name_ref, field_value_ref) in removed_fields {
+                remove_trace_ref_from_nested_bitmap_map(
+                    &mut self.trace_refs_by_field_name_value,
+                    field_name_ref,
+                    field_value_ref,
+                    trace_ref,
+                );
+            }
+
+            for (field_name_ref, field_value_ref) in seen_field_pairs {
+                decrement_nested_hash_counter(
+                    &mut self.field_values_by_name,
+                    field_name_ref,
+                    field_value_ref,
+                );
+            }
+
+            if remove_trace {
+                self.traces.remove(&trace_ref);
+                self.all_trace_refs.remove(trace_ref);
+            }
+        }
+    }
+
+    fn list_services(&self) -> Vec<String> {
+        let mut services: Vec<String> = self
+            .trace_refs_by_service
+            .keys()
+            .filter_map(|value| self.strings.resolve(*value).map(ToString::to_string))
+            .collect();
+        services.sort();
+        services
+    }
+
+    fn list_field_names(&self) -> Vec<String> {
+        let mut field_names: Vec<String> = self
+            .field_values_by_name
+            .keys()
+            .filter_map(|value| self.strings.resolve(*value).map(ToString::to_string))
+            .collect();
+        field_names.sort();
+        field_names
+    }
+
+    fn list_field_values(&self, field_name: &str) -> Vec<String> {
+        let Some(field_name_ref) = self.strings.lookup(field_name) else {
+            return Vec::new();
+        };
+        let mut values: Vec<String> = self
+            .field_values_by_name
+            .get(&field_name_ref)
+            .map(|values| {
+                values
+                    .keys()
+                    .filter_map(|value| self.strings.resolve(*value).map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        values.sort();
+        values
+    }
+
+    fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
+        let candidate_trace_refs = self.candidate_trace_refs(request);
+        let mut hits: Vec<TraceSearchHit> = candidate_trace_refs
+            .into_iter()
+            .filter_map(|trace_ref| {
+                let trace = self.traces.get(&trace_ref)?;
+                let window = trace.bounds()?;
+                let overlaps = window.end_unix_nano >= request.start_unix_nano
+                    && window.start_unix_nano <= request.end_unix_nano;
+                if !overlaps {
+                    return None;
+                }
+
+                let mut services: Vec<String> = trace
+                    .services
+                    .keys()
+                    .filter_map(|value| self.strings.resolve(*value).map(ToString::to_string))
+                    .collect();
+                services.sort();
+
+                Some(TraceSearchHit {
+                    trace_id: self.trace_ids.resolve(trace_ref)?.to_string(),
+                    start_unix_nano: window.start_unix_nano,
+                    end_unix_nano: window.end_unix_nano,
+                    services,
+                })
+            })
+            .collect();
+
+        hits.sort_by(|left, right| {
+            right
+                .end_unix_nano
+                .cmp(&left.end_unix_nano)
+                .then_with(|| left.trace_id.cmp(&right.trace_id))
+        });
+        hits.truncate(request.limit);
+        hits
+    }
+
+    fn candidate_trace_refs(&self, request: &TraceSearchRequest) -> RoaringBitmap {
+        let mut candidate_refs: Option<RoaringBitmap> = request
+            .service_name
+            .as_ref()
+            .and_then(|service_name| self.strings.lookup(service_name))
+            .map(|service_ref| {
+                self.trace_refs_by_service
+                    .get(&service_ref)
+                    .cloned()
+                    .unwrap_or_default()
+            });
+
+        if request.service_name.is_some() && candidate_refs.is_none() {
+            return RoaringBitmap::new();
+        }
+
+        if let Some(operation_name) = &request.operation_name {
+            let Some(operation_ref) = self.strings.lookup(operation_name) else {
+                return RoaringBitmap::new();
+            };
+            let matching = self
+                .trace_refs_by_operation
+                .get(&operation_ref)
+                .cloned()
+                .unwrap_or_default();
+            candidate_refs = Some(match candidate_refs {
+                Some(current) => current & matching,
+                None => matching,
+            });
+        }
+
+        for field_filter in &request.field_filters {
+            let Some(field_name_ref) = self.strings.lookup(&field_filter.name) else {
+                return RoaringBitmap::new();
+            };
+            let Some(field_value_ref) = self.strings.lookup(&field_filter.value) else {
+                return RoaringBitmap::new();
+            };
+            let matching = self
+                .trace_refs_by_field_name_value
+                .get(&field_name_ref)
+                .and_then(|values| values.get(&field_value_ref))
+                .cloned()
+                .unwrap_or_default();
+            candidate_refs = Some(match candidate_refs {
+                Some(current) => current & matching,
+                None => matching,
+            });
+        }
+
+        candidate_refs.unwrap_or_else(|| self.all_trace_refs.clone())
+    }
+}
+
+fn increment_hash_counter<K>(values: &mut FxHashMap<K, u32>, key: K) -> bool
+where
+    K: Eq + Hash,
+{
+    let counter = values.entry(key).or_default();
+    let first = *counter == 0;
+    *counter += 1;
+    first
+}
+
+fn decrement_hash_counter<K>(values: &mut FxHashMap<K, u32>, key: K) -> bool
+where
+    K: Copy + Eq + Hash,
+{
+    let Some(counter) = values.get_mut(&key) else {
+        return false;
+    };
+    *counter = counter.saturating_sub(1);
+    if *counter == 0 {
+        values.remove(&key);
+        return true;
+    }
+    false
+}
+
+fn decrement_btree_counter(values: &mut BTreeMap<i64, u32>, key: i64) -> bool {
+    let Some(counter) = values.get_mut(&key) else {
+        return false;
+    };
+    *counter = counter.saturating_sub(1);
+    if *counter == 0 {
+        values.remove(&key);
+        return true;
+    }
+    false
+}
+
+fn increment_nested_hash_counter(
+    values: &mut FxHashMap<StringRef, FxHashMap<StringRef, u32>>,
+    outer: StringRef,
+    inner: StringRef,
+) {
+    *values.entry(outer).or_default().entry(inner).or_default() += 1;
+}
+
+fn decrement_nested_hash_counter(
+    values: &mut FxHashMap<StringRef, FxHashMap<StringRef, u32>>,
+    outer: StringRef,
+    inner: StringRef,
+) {
+    let Some(inner_values) = values.get_mut(&outer) else {
+        return;
+    };
+    let Some(counter) = inner_values.get_mut(&inner) else {
+        return;
+    };
+    *counter = counter.saturating_sub(1);
+    if *counter == 0 {
+        inner_values.remove(&inner);
+    }
+    if inner_values.is_empty() {
+        values.remove(&outer);
+    }
+}
+
+fn remove_trace_ref_from_bitmap_map(
+    values: &mut FxHashMap<StringRef, RoaringBitmap>,
+    key: StringRef,
+    trace_ref: TraceRef,
+) {
+    let Some(trace_refs) = values.get_mut(&key) else {
+        return;
+    };
+    trace_refs.remove(trace_ref);
+    if trace_refs.is_empty() {
+        values.remove(&key);
+    }
+}
+
+fn remove_trace_ref_from_nested_bitmap_map(
+    values: &mut FxHashMap<StringRef, FxHashMap<StringRef, RoaringBitmap>>,
+    outer: StringRef,
+    inner: StringRef,
+    trace_ref: TraceRef,
+) {
+    let Some(inner_values) = values.get_mut(&outer) else {
+        return;
+    };
+    let Some(trace_refs) = inner_values.get_mut(&inner) else {
+        return;
+    };
+    trace_refs.remove(trace_ref);
+    if trace_refs.is_empty() {
+        inner_values.remove(&inner);
+    }
+    if inner_values.is_empty() {
+        values.remove(&outer);
+    }
+}
+
+fn merge_trace_search_hit(
+    hits_by_trace: &mut FxHashMap<String, TraceSearchHit>,
+    mut incoming: TraceSearchHit,
+) {
+    incoming.services.sort();
+    incoming.services.dedup();
+    match hits_by_trace.get_mut(&incoming.trace_id) {
+        Some(existing) => {
+            existing.start_unix_nano = existing.start_unix_nano.min(incoming.start_unix_nano);
+            existing.end_unix_nano = existing.end_unix_nano.max(incoming.end_unix_nano);
+            existing.services.extend(incoming.services);
+            existing.services.sort();
+            existing.services.dedup();
+        }
+        None => {
+            hits_by_trace.insert(incoming.trace_id.clone(), incoming);
+        }
+    }
+}
+
 impl ActiveSegment {
-    fn open(segments_path: &Path, segment_id: u64) -> Result<Self, StorageError> {
+    fn open(
+        segments_path: &Path,
+        segment_id: u64,
+        wal_writer_capacity_bytes: usize,
+        deferred_wal_writes: bool,
+    ) -> Result<Self, StorageError> {
         let wal_path = segment_wal_path(segments_path, segment_id);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&wal_path)?;
+        let wal_sink = if deferred_wal_writes {
+            TraceWalSink::Deferred(Vec::with_capacity(wal_writer_capacity_bytes))
+        } else {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&wal_path)?;
+            TraceWalSink::Immediate(BufWriter::with_capacity(wal_writer_capacity_bytes, file))
+        };
 
         Ok(Self {
             segment_id,
             wal_path,
-            writer: BufWriter::with_capacity(TRACE_WAL_WRITER_CAPACITY_BYTES, file),
+            wal_sink,
             accumulator: SegmentAccumulator::default(),
             cached_row_length_prefixes: Vec::new(),
             cached_payload_ranges: Vec::new(),
@@ -1669,9 +2832,9 @@ impl ActiveSegment {
         encoded_row_ranges: &[std::ops::Range<usize>],
         start_index: usize,
         end_index: usize,
-    ) -> Result<(Vec<LiveTraceUpdate>, u64), StorageError> {
+    ) -> Result<TraceAppendRowsResult, StorageError> {
         if start_index >= end_index {
-            return Ok((Vec::new(), 0));
+            return Ok(TraceAppendRowsResult::default());
         }
 
         let total_payload_bytes: usize = encoded_row_ranges[start_index..end_index]
@@ -1683,8 +2846,8 @@ impl ActiveSegment {
         let bytes_written = wal_batch_storage_bytes(total_payload_bytes, row_count)
             + if first_write { WAL_HEADER_BYTES } else { 0 };
         if first_write {
-            self.writer.write_all(WAL_MAGIC)?;
-            self.writer.write_all(&[WAL_VERSION_BATCHED_BINARY])?;
+            self.write_wal_all(WAL_MAGIC)?;
+            self.write_wal_all(&[WAL_VERSION_BATCHED_BINARY])?;
         }
 
         let batch_body_len: u32 = wal_batch_body_bytes(total_payload_bytes, row_count)
@@ -1708,17 +2871,22 @@ impl ActiveSegment {
         checksum_hasher.update(&row_count_bytes);
         checksum_hasher.update(&self.cached_row_length_prefixes);
         checksum_hasher.update(&encoded_row_bytes[batch_payload_start..batch_payload_end]);
-        self.writer.write_all(&batch_body_len.to_le_bytes())?;
-        self.writer
-            .write_all(&checksum_hasher.finalize().to_le_bytes())?;
-        self.writer.write_all(&row_count_bytes)?;
-        self.writer.write_all(&self.cached_row_length_prefixes)?;
+        self.write_wal_all(&batch_body_len.to_le_bytes())?;
+        self.write_wal_all(&checksum_hasher.finalize().to_le_bytes())?;
+        self.write_wal_all(&row_count_bytes)?;
+        let row_length_prefixes = std::mem::take(&mut self.cached_row_length_prefixes);
+        self.write_wal_all(&row_length_prefixes)?;
+        self.cached_row_length_prefixes = row_length_prefixes;
 
-        let cached_payload_base = self.cached_payload_bytes.len();
-        self.cached_payload_bytes
-            .extend_from_slice(&encoded_row_bytes[batch_payload_start..batch_payload_end]);
-        self.writer
-            .write_all(&encoded_row_bytes[batch_payload_start..batch_payload_end])?;
+        let payload_storage_base = match &self.wal_sink {
+            TraceWalSink::Immediate(_) => self.cached_payload_bytes.len(),
+            TraceWalSink::Deferred(staged_wal_bytes) => staged_wal_bytes.len(),
+        };
+        if matches!(self.wal_sink, TraceWalSink::Immediate(_)) {
+            self.cached_payload_bytes
+                .extend_from_slice(&encoded_row_bytes[batch_payload_start..batch_payload_end]);
+        }
+        self.write_wal_all(&encoded_row_bytes[batch_payload_start..batch_payload_end])?;
         self.cached_payload_ranges.reserve(row_count);
         let mut intern_cache = BatchInternCache::default();
         let base_row_index = self.accumulator.row_count;
@@ -1727,7 +2895,7 @@ impl ActiveSegment {
         for (batch_offset, row_index) in (start_index..end_index).enumerate() {
             let payload = &encoded_row_bytes[encoded_row_ranges[row_index].clone()];
             let payload_start =
-                cached_payload_base + (encoded_row_ranges[row_index].start - batch_payload_start);
+                payload_storage_base + (encoded_row_ranges[row_index].start - batch_payload_start);
             self.cached_payload_ranges
                 .push(payload_start..payload_start + payload.len());
             let row_location = SegmentRowLocation {
@@ -1751,13 +2919,20 @@ impl ActiveSegment {
             &mut intern_cache,
         );
         self.accumulator.persisted_bytes += bytes_written;
-        Ok((live_updates, bytes_written))
+        Ok(TraceAppendRowsResult {
+            bytes_written,
+            live_updates,
+        })
     }
 
     fn read_rows(
         &self,
         row_refs: &[SegmentRowLocation],
     ) -> Result<Vec<TraceSpanRow>, StorageError> {
+        let payload_bytes = match &self.wal_sink {
+            TraceWalSink::Immediate(_) => self.cached_payload_bytes.as_slice(),
+            TraceWalSink::Deferred(staged_wal_bytes) => staged_wal_bytes.as_slice(),
+        };
         let mut rows = Vec::with_capacity(row_refs.len());
         for row_ref in row_refs {
             let Some(range) = self.cached_payload_ranges.get(row_ref.row_index as usize) else {
@@ -1767,7 +2942,7 @@ impl ActiveSegment {
                 )));
             };
             rows.push(
-                decode_trace_row(&self.cached_payload_bytes[range.clone()])
+                decode_trace_row(&payload_bytes[range.clone()])
                     .map_err(|err| StorageError::Message(err.to_string()))?,
             );
         }
@@ -1778,18 +2953,86 @@ impl ActiveSegment {
         self.accumulator.persisted_bytes
     }
 
+    fn row_count(&self) -> u64 {
+        self.accumulator.row_count
+    }
+
     fn is_empty(&self) -> bool {
         self.accumulator.row_count == 0
     }
 
-    fn flush(&mut self, sync_policy: DiskSyncPolicy) -> Result<bool, StorageError> {
-        self.writer.flush()?;
-        if sync_policy.requires_sync() {
-            self.writer.get_ref().sync_data()?;
-            Ok(true)
-        } else {
-            Ok(false)
+    fn flush(&mut self) -> Result<(), StorageError> {
+        if let TraceWalSink::Immediate(writer) = &mut self.wal_sink {
+            writer.flush()?;
         }
+        Ok(())
+    }
+
+    fn sync_data(&mut self) -> Result<(), StorageError> {
+        if let TraceWalSink::Immediate(writer) = &mut self.wal_sink {
+            writer.get_ref().sync_data()?;
+        }
+        Ok(())
+    }
+
+    fn trace_window_bounds(&self, trace_id: &str) -> Option<TraceWindowBounds> {
+        self.accumulator.trace_window_bounds(trace_id)
+    }
+
+    fn read_rows_for_trace(
+        &self,
+        trace_id: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+    ) -> Result<Vec<TraceSpanRow>, StorageError> {
+        let row_refs =
+            self.accumulator
+                .row_refs_for_trace(trace_id, start_unix_nano, end_unix_nano);
+        self.read_rows(&row_refs)
+    }
+
+    fn list_trace_ids(&self) -> Vec<String> {
+        self.accumulator.list_trace_ids()
+    }
+
+    fn list_services(&self) -> Vec<String> {
+        self.accumulator.list_services()
+    }
+
+    fn list_field_names(&self) -> Vec<String> {
+        self.accumulator.list_field_names()
+    }
+
+    fn list_field_values(&self, field_name: &str) -> Vec<String> {
+        self.accumulator.list_field_values(field_name)
+    }
+
+    fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
+        self.accumulator.search_traces(request)
+    }
+
+    fn into_snapshot(self, shard_index: usize) -> HeadSegmentSnapshot {
+        let staged_wal_bytes = match self.wal_sink {
+            TraceWalSink::Immediate(_) => Vec::new(),
+            TraceWalSink::Deferred(staged_wal_bytes) => staged_wal_bytes,
+        };
+        HeadSegmentSnapshot {
+            shard_index,
+            segment_id: self.segment_id,
+            wal_path: self.wal_path,
+            staged_wal_bytes,
+            accumulator: self.accumulator,
+            cached_payload_ranges: self.cached_payload_ranges,
+            cached_payload_bytes: self.cached_payload_bytes,
+        }
+    }
+
+    fn write_wal_all(&mut self, bytes: &[u8]) -> Result<(), StorageError> {
+        match &mut self.wal_sink {
+            TraceWalSink::Immediate(writer) => writer.write_all(bytes)?,
+            TraceWalSink::Deferred(staged_wal_bytes) => staged_wal_bytes.extend_from_slice(bytes),
+        }
+        Ok(())
     }
 
     fn build_meta(&self, segment_path: &Path) -> Result<SegmentMeta, StorageError> {
@@ -1810,7 +3053,349 @@ impl ActiveSegment {
     }
 }
 
+impl HeadSegmentSnapshot {
+    fn trace_window_bounds(&self, trace_id: &str) -> Option<TraceWindowBounds> {
+        self.accumulator.trace_window_bounds(trace_id)
+    }
+
+    fn row_count(&self) -> u64 {
+        self.accumulator.row_count
+    }
+
+    fn list_trace_ids(&self) -> Vec<String> {
+        self.accumulator.list_trace_ids()
+    }
+
+    fn list_services(&self) -> Vec<String> {
+        self.accumulator.list_services()
+    }
+
+    fn list_field_names(&self) -> Vec<String> {
+        self.accumulator.list_field_names()
+    }
+
+    fn list_field_values(&self, field_name: &str) -> Vec<String> {
+        self.accumulator.list_field_values(field_name)
+    }
+
+    fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
+        self.accumulator.search_traces(request)
+    }
+
+    fn read_rows_for_trace(
+        &self,
+        trace_id: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+    ) -> Result<Vec<TraceSpanRow>, StorageError> {
+        let row_refs =
+            self.accumulator
+                .row_refs_for_trace(trace_id, start_unix_nano, end_unix_nano);
+        self.read_rows(&row_refs)
+    }
+
+    fn read_rows(
+        &self,
+        row_refs: &[SegmentRowLocation],
+    ) -> Result<Vec<TraceSpanRow>, StorageError> {
+        let payload_bytes = if self.staged_wal_bytes.is_empty() {
+            self.cached_payload_bytes.as_slice()
+        } else {
+            self.staged_wal_bytes.as_slice()
+        };
+        let mut rows = Vec::with_capacity(row_refs.len());
+        for row_ref in row_refs {
+            let Some(range) = self.cached_payload_ranges.get(row_ref.row_index as usize) else {
+                return Err(StorageError::Message(format!(
+                    "head snapshot row {} missing from cache",
+                    row_ref.row_index
+                )));
+            };
+            rows.push(
+                decode_trace_row(&payload_bytes[range.clone()])
+                    .map_err(|err| StorageError::Message(err.to_string()))?,
+            );
+        }
+        Ok(rows)
+    }
+
+    fn build_meta(&self, segment_path: &Path) -> Result<SegmentMeta, StorageError> {
+        let (min_time_unix_nano, max_time_unix_nano) = self
+            .accumulator
+            .time_range()
+            .ok_or_else(|| invalid_data("cannot build meta for empty head snapshot"))?;
+
+        Ok(self.accumulator.build_meta(
+            self.segment_id,
+            segment_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .ok_or_else(|| invalid_data("segment path has no file name"))?,
+            min_time_unix_nano,
+            max_time_unix_nano,
+        ))
+    }
+}
+
 impl SegmentAccumulator {
+    fn trace_window_bounds(&self, trace_id: &str) -> Option<TraceWindowBounds> {
+        let trace_ref = self.trace_ids.lookup(trace_id)?;
+        self.traces.get(&trace_ref).map(|trace| trace.window)
+    }
+
+    fn row_refs_for_trace(
+        &self,
+        trace_id: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+    ) -> Vec<SegmentRowLocation> {
+        let Some(trace_ref) = self.trace_ids.lookup(trace_id) else {
+            return Vec::new();
+        };
+        self.traces
+            .get(&trace_ref)
+            .map(|trace| {
+                trace
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row.end_unix_nano >= start_unix_nano && row.start_unix_nano <= end_unix_nano
+                    })
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn list_trace_ids(&self) -> Vec<String> {
+        let mut trace_ids: Vec<String> = self
+            .traces
+            .keys()
+            .filter_map(|trace_ref| self.trace_ids.resolve(*trace_ref).map(ToString::to_string))
+            .collect();
+        trace_ids.sort();
+        trace_ids
+    }
+
+    fn list_services(&self) -> Vec<String> {
+        let mut services = BTreeSet::new();
+        for trace in self.traces.values() {
+            for service_ref in &trace.services {
+                if let Some(service_name) = self.strings.resolve(*service_ref) {
+                    services.insert(service_name.to_string());
+                }
+            }
+        }
+        let mut services: Vec<String> = services.into_iter().collect();
+        services.sort();
+        services
+    }
+
+    fn list_field_names(&self) -> Vec<String> {
+        let mut field_names = BTreeSet::new();
+        for trace in self.traces.values() {
+            for (field_name_ref, _) in &trace.fields {
+                if let Some(field_name) = self.strings.resolve(*field_name_ref) {
+                    field_names.insert(field_name.to_string());
+                }
+            }
+        }
+        let mut field_names: Vec<String> = field_names.into_iter().collect();
+        field_names.sort();
+        field_names
+    }
+
+    fn list_field_values(&self, field_name: &str) -> Vec<String> {
+        let mut values = BTreeSet::new();
+        for trace in self.traces.values() {
+            for (field_name_ref, field_value_ref) in &trace.fields {
+                let Some(existing_name) = self.strings.resolve(*field_name_ref) else {
+                    continue;
+                };
+                if existing_name != field_name {
+                    continue;
+                }
+                if let Some(field_value) = self.strings.resolve(*field_value_ref) {
+                    values.insert(field_value.to_string());
+                }
+            }
+        }
+        let mut values: Vec<String> = values.into_iter().collect();
+        values.sort();
+        values
+    }
+
+    fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
+        let mut hits: Vec<TraceSearchHit> = self
+            .traces
+            .iter()
+            .filter_map(|(trace_ref, trace)| {
+                let overlaps = trace.window.end_unix_nano >= request.start_unix_nano
+                    && trace.window.start_unix_nano <= request.end_unix_nano;
+                if !overlaps {
+                    return None;
+                }
+                if let Some(service_name) = &request.service_name {
+                    let matches = trace.services.iter().any(|service_ref| {
+                        self.strings.resolve(*service_ref) == Some(service_name.as_str())
+                    });
+                    if !matches {
+                        return None;
+                    }
+                }
+                if let Some(operation_name) = &request.operation_name {
+                    let matches = trace.operations.iter().any(|operation_ref| {
+                        self.strings.resolve(*operation_ref) == Some(operation_name.as_str())
+                    });
+                    if !matches {
+                        return None;
+                    }
+                }
+                for field_filter in &request.field_filters {
+                    let matches = trace.fields.iter().any(|(field_name_ref, field_value_ref)| {
+                        self.strings.resolve(*field_name_ref) == Some(field_filter.name.as_str())
+                            && self.strings.resolve(*field_value_ref)
+                                == Some(field_filter.value.as_str())
+                    });
+                    if !matches {
+                        return None;
+                    }
+                }
+
+                let mut services: Vec<String> = trace
+                    .services
+                    .iter()
+                    .filter_map(|value| self.strings.resolve(*value).map(ToString::to_string))
+                    .collect();
+                services.sort();
+
+                Some(TraceSearchHit {
+                    trace_id: self.trace_ids.resolve(*trace_ref)?.to_string(),
+                    start_unix_nano: trace.window.start_unix_nano,
+                    end_unix_nano: trace.window.end_unix_nano,
+                    services,
+                })
+            })
+            .collect();
+
+        hits.sort_by(|left, right| {
+            right
+                .end_unix_nano
+                .cmp(&left.end_unix_nano)
+                .then_with(|| left.trace_id.cmp(&right.trace_id))
+        });
+        hits.truncate(request.limit);
+        hits
+    }
+
+    fn ingest_prepared_block_rows<'a>(
+        &mut self,
+        prepared_rows: &'a [PreparedBlockRowMetadata],
+        prepared_shared_groups: &'a [PreparedSharedGroupMetadata],
+        row_locations: &[SegmentRowLocation],
+        intern_cache: &mut BatchInternCache<'a>,
+    ) {
+        if prepared_rows.is_empty() {
+            return;
+        }
+        debug_assert_eq!(prepared_rows.len(), row_locations.len());
+
+        let mut run_start = 0usize;
+        while run_start < prepared_rows.len() {
+            let trace_id = prepared_rows[run_start].trace_id.as_ref();
+            let mut run_end = run_start + 1;
+            while run_end < prepared_rows.len()
+                && prepared_rows[run_end].trace_id.as_ref() == trace_id
+            {
+                run_end += 1;
+            }
+            self.ingest_prepared_block_row_run(
+                &prepared_rows[run_start..run_end],
+                prepared_shared_groups,
+                &row_locations[run_start..run_end],
+                intern_cache,
+            );
+            run_start = run_end;
+        }
+    }
+
+    fn ingest_prepared_block_row_run<'a>(
+        &mut self,
+        prepared_rows: &'a [PreparedBlockRowMetadata],
+        prepared_shared_groups: &'a [PreparedSharedGroupMetadata],
+        row_locations: &[SegmentRowLocation],
+        intern_cache: &mut BatchInternCache<'a>,
+    ) {
+        let Some(first_row) = prepared_rows.first() else {
+            return;
+        };
+        let Some(first_location) = row_locations.first() else {
+            return;
+        };
+        debug_assert_eq!(prepared_rows.len(), row_locations.len());
+
+        let mut min_start_unix_nano = first_location.start_unix_nano;
+        let mut max_end_unix_nano = first_location.end_unix_nano;
+        for row_location in row_locations.iter().skip(1) {
+            min_start_unix_nano = min_start_unix_nano.min(row_location.start_unix_nano);
+            max_end_unix_nano = max_end_unix_nano.max(row_location.end_unix_nano);
+        }
+
+        self.row_count += row_locations.len() as u64;
+        self.observe_time_range(min_start_unix_nano, max_end_unix_nano);
+
+        let trace_ref = intern_cache.trace_ref(&mut self.trace_ids, first_row.trace_id.as_ref());
+
+        let mut batch_services = SmallVec::<[StringRef; 4]>::new();
+        let mut batch_operations = SmallVec::<[StringRef; 4]>::new();
+        let mut batch_fields = SmallVec::<[(StringRef, StringRef); 8]>::new();
+        for prepared_row in prepared_rows {
+            if let Some(service_name) = prepared_row.service.as_ref() {
+                let service_ref = intern_cache.string_ref(&mut self.strings, service_name.as_ref());
+                if !batch_services.contains(&service_ref) {
+                    batch_services.push(service_ref);
+                }
+            }
+            if let Some(operation_name) = prepared_row.operation.as_ref() {
+                let operation_ref =
+                    intern_cache.string_ref(&mut self.strings, operation_name.as_ref());
+                if !batch_operations.contains(&operation_ref) {
+                    batch_operations.push(operation_ref);
+                }
+            }
+            observe_prepared_row_indexed_fields(
+                prepared_row,
+                prepared_shared_groups,
+                |field_name, field_value| {
+                    let field_name_ref =
+                        intern_cache.string_ref(&mut self.strings, field_name.as_ref());
+                    let field_value_ref =
+                        intern_cache.string_ref(&mut self.strings, field_value.as_ref());
+                    if !batch_fields.iter().any(|(existing_name, existing_value)| {
+                        *existing_name == field_name_ref && *existing_value == field_value_ref
+                    }) {
+                        batch_fields.push((field_name_ref, field_value_ref));
+                    }
+                },
+            );
+        }
+
+        let trace = self.traces.entry(trace_ref).or_insert_with(|| {
+            SegmentTraceAccumulator::new(min_start_unix_nano, max_end_unix_nano)
+        });
+        trace.window.observe(min_start_unix_nano, max_end_unix_nano);
+        for service_ref in batch_services {
+            push_unique_string_ref(&mut trace.services, service_ref);
+        }
+        for operation_ref in batch_operations {
+            push_unique_string_ref(&mut trace.operations, operation_ref);
+        }
+        for (field_name_ref, field_value_ref) in batch_fields {
+            let _ = push_unique_string_ref_pair(&mut trace.fields, field_name_ref, field_value_ref);
+        }
+        trace.rows.extend_from_slice(row_locations);
+    }
+
     fn observe_prepared_block_rows<'a>(
         &mut self,
         prepared_rows: &'a [PreparedBlockRowMetadata],
@@ -1876,42 +3461,47 @@ impl SegmentAccumulator {
                 intern_cache.string_ref(&mut self.strings, operation_name.as_ref())
             });
 
-            let trace = self
-                .traces
-                .entry(trace_ref)
-                .or_insert_with(|| SegmentTraceAccumulator::new(start_unix_nano, end_unix_nano));
-            trace.window.observe(start_unix_nano, end_unix_nano);
             let mut live_update =
                 LiveTraceUpdate::new(first_row.trace_id.clone(), start_unix_nano, end_unix_nano);
-            if let Some(service_ref) = service_ref {
-                push_unique_string_ref(&mut trace.services, service_ref);
-            }
             if let Some(service_name) = first_row.service.as_ref() {
                 push_unique_arc(&mut live_update.services, service_name.clone());
-            }
-            if let Some(operation_ref) = operation_ref {
-                push_unique_string_ref(&mut trace.operations, operation_ref);
             }
             if let Some(operation_name) = first_row.operation.as_ref() {
                 push_unique_arc(&mut live_update.operations, operation_name.clone());
             }
-            observe_prepared_row_indexed_fields(
-                first_row,
-                prepared_shared_groups,
-                |field_name, field_value| {
-                    let field_name_ref =
-                        intern_cache.string_ref(&mut self.strings, field_name.as_ref());
-                    let field_value_ref =
-                        intern_cache.string_ref(&mut self.strings, field_value.as_ref());
-                    push_unique_string_ref_pair(&mut trace.fields, field_name_ref, field_value_ref);
-                    push_unique_arc_pair(
-                        &mut live_update.indexed_fields,
-                        field_name.clone(),
-                        field_value.clone(),
-                    );
-                },
-            );
-            trace.rows.push(*first_location);
+            {
+                let trace = self.traces.entry(trace_ref).or_insert_with(|| {
+                    SegmentTraceAccumulator::new(start_unix_nano, end_unix_nano)
+                });
+                trace.window.observe(start_unix_nano, end_unix_nano);
+                if let Some(service_ref) = service_ref {
+                    let _ = push_unique_string_ref(&mut trace.services, service_ref);
+                }
+                if let Some(operation_ref) = operation_ref {
+                    let _ = push_unique_string_ref(&mut trace.operations, operation_ref);
+                }
+                observe_prepared_row_indexed_fields(
+                    first_row,
+                    prepared_shared_groups,
+                    |field_name, field_value| {
+                        let field_name_ref =
+                            intern_cache.string_ref(&mut self.strings, field_name.as_ref());
+                        let field_value_ref =
+                            intern_cache.string_ref(&mut self.strings, field_value.as_ref());
+                        let _ = push_unique_string_ref_pair(
+                            &mut trace.fields,
+                            field_name_ref,
+                            field_value_ref,
+                        );
+                        push_unique_arc_pair(
+                            &mut live_update.indexed_fields,
+                            field_name.clone(),
+                            field_value.clone(),
+                        );
+                    },
+                );
+                trace.rows.push(*first_location);
+            }
             live_update.row_locations.push(*first_location);
             return Some(live_update);
         }
@@ -1927,10 +3517,6 @@ impl SegmentAccumulator {
         self.observe_time_range(min_start_unix_nano, max_end_unix_nano);
 
         let trace_ref = intern_cache.trace_ref(&mut self.trace_ids, first_row.trace_id.as_ref());
-        let trace = self.traces.entry(trace_ref).or_insert_with(|| {
-            SegmentTraceAccumulator::new(min_start_unix_nano, max_end_unix_nano)
-        });
-        trace.window.observe(min_start_unix_nano, max_end_unix_nano);
         let mut live_update = LiveTraceUpdate::new(
             first_row.trace_id.clone(),
             min_start_unix_nano,
@@ -1976,14 +3562,18 @@ impl SegmentAccumulator {
             );
         }
 
+        let trace = self.traces.entry(trace_ref).or_insert_with(|| {
+            SegmentTraceAccumulator::new(min_start_unix_nano, max_end_unix_nano)
+        });
+        trace.window.observe(min_start_unix_nano, max_end_unix_nano);
         for service_ref in batch_services {
-            push_unique_string_ref(&mut trace.services, service_ref);
+            let _ = push_unique_string_ref(&mut trace.services, service_ref);
         }
         for operation_ref in batch_operations {
-            push_unique_string_ref(&mut trace.operations, operation_ref);
+            let _ = push_unique_string_ref(&mut trace.operations, operation_ref);
         }
         for (field_name_ref, field_value_ref) in batch_fields {
-            push_unique_string_ref_pair(&mut trace.fields, field_name_ref, field_value_ref);
+            let _ = push_unique_string_ref_pair(&mut trace.fields, field_name_ref, field_value_ref);
         }
         trace.rows.extend_from_slice(row_locations);
         live_update.row_locations.extend_from_slice(row_locations);
@@ -2030,13 +3620,13 @@ impl SegmentAccumulator {
         });
         trace.window.observe(row.start_unix_nano, row.end_unix_nano);
         if let Some(service_ref) = service_ref {
-            push_unique_string_ref(&mut trace.services, service_ref);
+            let _ = push_unique_string_ref(&mut trace.services, service_ref);
         }
         if let Some(operation_ref) = operation_ref {
-            push_unique_string_ref(&mut trace.operations, operation_ref);
+            let _ = push_unique_string_ref(&mut trace.operations, operation_ref);
         }
         for (field_name_ref, field_value_ref) in indexed_fields {
-            push_unique_string_ref_pair(&mut trace.fields, field_name_ref, field_value_ref);
+            let _ = push_unique_string_ref_pair(&mut trace.fields, field_name_ref, field_value_ref);
         }
         trace.rows.push(row_location);
     }
@@ -2053,6 +3643,7 @@ impl SegmentAccumulator {
         max_time_unix_nano: i64,
     ) -> SegmentMeta {
         let mut services = BTreeSet::new();
+        let mut field_values_by_name: HashMap<String, BTreeSet<String>> = HashMap::new();
         let traces = self
             .traces
             .iter()
@@ -2099,6 +3690,10 @@ impl SegmentAccumulator {
                         .resolve(*field_value_ref)
                         .expect("field-value ref should resolve for segment meta")
                         .to_string();
+                    field_values_by_name
+                        .entry(field_name.clone())
+                        .or_default()
+                        .insert(field_value.clone());
                     trace_fields
                         .entry(field_name)
                         .or_default()
@@ -2120,6 +3715,8 @@ impl SegmentAccumulator {
                 }
             })
             .collect();
+        let (typed_field_columns, string_field_columns) =
+            count_field_column_encodings_from_value_sets(field_values_by_name.values());
 
         SegmentMeta {
             segment_id,
@@ -2128,6 +3725,8 @@ impl SegmentAccumulator {
             persisted_bytes: self.persisted_bytes,
             min_time_unix_nano,
             max_time_unix_nano,
+            typed_field_columns,
+            string_field_columns,
             services: services.into_iter().collect(),
             traces,
         }
@@ -2474,7 +4073,7 @@ fn recover_state(
             .meta_path
             .unwrap_or_else(|| segment_meta_path(segments_path, segment_id));
 
-        let meta = if meta_path.exists() {
+        let mut meta = if meta_path.exists() {
             let file = File::open(&meta_path)?;
             serde_json::from_reader(file)?
         } else {
@@ -2482,9 +4081,18 @@ fn recover_state(
             let _ = write_segment_meta(&meta_path, &meta, DiskSyncPolicy::None)?;
             meta
         };
+        if meta.typed_field_columns == 0 && meta.string_field_columns == 0 {
+            let (typed_field_columns, string_field_columns) =
+                count_field_column_encodings(std::iter::once(&part_path));
+            meta.typed_field_columns = typed_field_columns;
+            meta.string_field_columns = string_field_columns;
+            let _ = write_segment_meta(&meta_path, &meta, DiskSyncPolicy::None);
+        }
 
         recovered.persisted_bytes += fs::metadata(&part_path)?.len();
         recovered.persisted_bytes += fs::metadata(&meta_path)?.len();
+        recovered.typed_field_columns += meta.typed_field_columns;
+        recovered.string_field_columns += meta.string_field_columns;
         recovered.segment_paths.insert(meta.segment_id, part_path);
         for trace in meta.traces {
             let shard_index = trace_shard_index(&trace.trace_id, trace_shards);
@@ -2683,6 +4291,42 @@ fn partition_trace_block_by_shard(block: TraceBlock, trace_shards: usize) -> Vec
         .collect()
 }
 
+fn route_trace_blocks_for_append(
+    blocks: Vec<TraceBlock>,
+    trace_shards: usize,
+) -> Vec<(usize, Vec<TraceBlock>)> {
+    let mut routed = Vec::new();
+    for block in blocks {
+        if block.is_empty() {
+            continue;
+        }
+        if let Some(shard_index) = trace_block_shard_index(&block, trace_shards) {
+            push_trace_block_for_shard(&mut routed, shard_index, block);
+            continue;
+        }
+        for block in partition_trace_block_by_shard(block, trace_shards) {
+            let shard_index = trace_block_shard_index(&block, trace_shards).unwrap_or(0);
+            push_trace_block_for_shard(&mut routed, shard_index, block);
+        }
+    }
+    routed
+}
+
+fn push_trace_block_for_shard(
+    routed: &mut Vec<(usize, Vec<TraceBlock>)>,
+    shard_index: usize,
+    block: TraceBlock,
+) {
+    if let Some((_, shard_blocks)) = routed
+        .iter_mut()
+        .find(|(existing_shard_index, _)| *existing_shard_index == shard_index)
+    {
+        shard_blocks.push(block);
+    } else {
+        routed.push((shard_index, vec![block]));
+    }
+}
+
 fn observe_live_indexed_field(
     indexed_fields: &mut SmallArcPairList,
     field_name: Arc<str>,
@@ -2829,14 +4473,15 @@ fn push_unique_string_ref_pair(
     values: &mut Vec<(StringRef, StringRef)>,
     name: StringRef,
     value: StringRef,
-) {
+) -> bool {
     if values
         .iter()
         .any(|(existing_name, existing_value)| *existing_name == name && *existing_value == value)
     {
-        return;
+        return false;
     }
     values.push((name, value));
+    true
 }
 
 fn observe_prepared_row_indexed_fields<'a>(
@@ -3049,7 +4694,7 @@ fn observe_segment_trace_field_refs(
     }
     let field_name_ref = strings.intern(field_name);
     let field_value_ref = strings.intern(field_value);
-    push_unique_string_ref_pair(fields, field_name_ref, field_value_ref);
+    let _ = push_unique_string_ref_pair(fields, field_name_ref, field_value_ref);
 }
 
 fn rebuild_segment_meta(segment_id: u64, segment_path: &Path) -> Result<SegmentMeta, StorageError> {
@@ -4187,6 +5832,30 @@ fn truncate_invalid_row_tail(file: &mut File, valid_len: u64) -> Result<(), Stor
     Ok(())
 }
 
+fn count_field_column_encodings_from_value_sets<I, J, S>(field_values_by_name: I) -> (u64, u64)
+where
+    I: IntoIterator<Item = J>,
+    J: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut typed = 0u64;
+    let mut string = 0u64;
+    for values in field_values_by_name {
+        let values = values
+            .into_iter()
+            .map(|value| Some(value.as_ref().to_string()))
+            .collect::<Vec<_>>();
+        if OptionalBoolColumn::from_optional_strings(&values).is_some()
+            || OptionalI64Column::from_optional_strings(&values).is_some()
+        {
+            typed += 1;
+        } else {
+            string += 1;
+        }
+    }
+    (typed, string)
+}
+
 fn count_field_column_encodings<'a, I>(paths: I) -> (u64, u64)
 where
     I: IntoIterator<Item = &'a PathBuf>,
@@ -4293,20 +5962,23 @@ fn invalid_data(message: impl Into<String>) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_live_trace_updates_from_prepared_rows, merge_sorted_row_locations,
-        prepare_block_row_metadata, prepare_shared_group_metadata, trace_block_shard_index,
+        coalesce_trace_blocks_for_shard, collect_live_trace_updates_from_prepared_rows,
+        decode_trace_row, merge_sorted_row_locations, prepare_block_row_metadata,
+        prepare_shared_group_metadata, route_trace_blocks_for_append, trace_block_shard_index,
         trace_shard_index, BatchInternCache, DiskStorageConfig, DiskStorageEngine, LiveTraceUpdate,
         PreparedTraceBlockAppend, PreparedTraceShardBatch, SegmentAccumulator, SegmentRowLocation,
-        SegmentTraceAccumulator, STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT,
+        SegmentTraceAccumulator, TraceLiveUpdateApplyMode,
+        STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT,
     };
     use crate::StorageEngine;
     use serde_json::Value;
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
-    use vtcore::{Field, TraceBlock, TraceSpanRow};
+    use vtcore::{Field, FieldFilter, TraceBlock, TraceSearchRequest, TraceSpanRow};
 
     fn row(segment_id: u64, row_index: u32, start: i64, end: i64) -> SegmentRowLocation {
         SegmentRowLocation {
@@ -4361,6 +6033,17 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rust-vt-disk-unit-{name}-{nanos}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(condition(), "condition not satisfied before timeout");
     }
 
     #[test]
@@ -4464,6 +6147,70 @@ mod tests {
         if shard_index != other_shard_index {
             assert_eq!(trace_block_shard_index(&block, 4), None);
         }
+    }
+
+    #[test]
+    fn route_trace_blocks_for_append_keeps_same_shard_blocks_together() {
+        let trace_shards = 4;
+        let trace_ids = trace_ids_for_shard(trace_shards, 2, 2);
+        let routes = route_trace_blocks_for_append(
+            vec![
+                TraceBlock::from_rows(vec![trace_row(
+                    &trace_ids[0],
+                    "span-1",
+                    "op-a",
+                    100,
+                    150,
+                    &[("resource_attr:service.name", "checkout")],
+                )]),
+                TraceBlock::from_rows(vec![trace_row(
+                    &trace_ids[1],
+                    "span-2",
+                    "op-b",
+                    160,
+                    210,
+                    &[("resource_attr:service.name", "checkout")],
+                )]),
+            ],
+            trace_shards,
+        );
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].0, 2);
+        assert_eq!(routes[0].1.len(), 2);
+    }
+
+    #[test]
+    fn route_trace_blocks_for_append_splits_cross_shard_block_only_once() {
+        let trace_shards = 4;
+        let block = TraceBlock::from_rows(vec![
+            trace_row(
+                "trace-route-a",
+                "span-1",
+                "op-a",
+                100,
+                150,
+                &[("resource_attr:service.name", "checkout")],
+            ),
+            trace_row(
+                "trace-route-b",
+                "span-2",
+                "op-b",
+                160,
+                210,
+                &[("resource_attr:service.name", "checkout")],
+            ),
+        ]);
+
+        let routes = route_trace_blocks_for_append(vec![block], trace_shards);
+
+        assert!(routes.len() >= 1);
+        assert!(routes.iter().all(|(shard_index, blocks)| {
+            !blocks.is_empty()
+                && blocks
+                    .iter()
+                    .all(|block| trace_block_shard_index(block, trace_shards) == Some(*shard_index))
+        }));
     }
 
     #[test]
@@ -4665,13 +6412,190 @@ mod tests {
     }
 
     #[test]
-    fn disk_stats_only_drain_a_bounded_number_of_pending_trace_update_batches() {
-        let path = temp_test_dir("stats-bounded-drain");
-        let engine = DiskStorageEngine::open_with_config(
-            &path,
-            DiskStorageConfig::default().with_trace_shards(1),
-        )
-        .expect("open disk engine");
+    fn disk_storage_config_allows_custom_trace_wal_writer_capacity() {
+        let config = DiskStorageConfig::default().with_trace_wal_writer_capacity_bytes(4 << 20);
+        assert_eq!(config.trace_wal_writer_capacity_bytes, 4 << 20);
+
+        let clamped = DiskStorageConfig::default().with_trace_wal_writer_capacity_bytes(0);
+        assert_eq!(clamped.trace_wal_writer_capacity_bytes, 1);
+    }
+
+    #[test]
+    fn disk_storage_config_can_defer_trace_wal_writes() {
+        let config = DiskStorageConfig::default().with_trace_deferred_wal_writes(true);
+        assert!(config.trace_deferred_wal_writes);
+    }
+
+    #[test]
+    fn deferred_wal_head_trace_reads_without_cached_payload_copy() {
+        let path = temp_test_dir("deferred-wal-head-read-no-payload-copy");
+        let config = DiskStorageConfig::default()
+            .with_trace_shards(1)
+            .with_trace_deferred_wal_writes(true);
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
+        let expected = trace_row(
+            "trace-deferred-read-1",
+            "span-1",
+            "GET /checkout",
+            100,
+            150,
+            &[
+                ("resource_attr:service.name", "checkout"),
+                ("http.method", "GET"),
+            ],
+        );
+
+        engine
+            .append_rows(vec![expected.clone()])
+            .expect("append trace row");
+
+        {
+            let active_segment = engine.active_segments[0].lock();
+            let active_segment = active_segment.as_ref().expect("active segment");
+            assert!(
+                active_segment.cached_payload_bytes.is_empty(),
+                "deferred WAL should not duplicate row payloads into cached payload bytes"
+            );
+            let rows = active_segment
+                .read_rows_for_trace("trace-deferred-read-1", 0, i64::MAX)
+                .expect("read rows for trace");
+            assert_eq!(rows, vec![expected.clone()]);
+        }
+
+        drop(engine);
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn coalesced_trace_block_preparation_preserves_rows_across_multiple_blocks() {
+        let trace_shards = 1;
+        let blocks = vec![
+            TraceBlock::from_rows(vec![
+                trace_row(
+                    "trace-coalesce-1",
+                    "span-1",
+                    "op-a",
+                    100,
+                    150,
+                    &[
+                        ("resource_attr:service.name", "checkout"),
+                        ("http.method", "GET"),
+                    ],
+                ),
+                trace_row(
+                    "trace-coalesce-1",
+                    "span-2",
+                    "op-a",
+                    160,
+                    210,
+                    &[
+                        ("resource_attr:service.name", "checkout"),
+                        ("http.status_code", "200"),
+                    ],
+                ),
+            ]),
+            TraceBlock::from_rows(vec![
+                trace_row(
+                    "trace-coalesce-2",
+                    "span-1",
+                    "op-b",
+                    300,
+                    350,
+                    &[
+                        ("resource_attr:service.name", "checkout"),
+                        ("http.method", "POST"),
+                    ],
+                ),
+                trace_row(
+                    "trace-coalesce-2",
+                    "span-2",
+                    "op-b",
+                    360,
+                    410,
+                    &[
+                        ("resource_attr:service.name", "checkout"),
+                        ("http.status_code", "201"),
+                    ],
+                ),
+            ]),
+        ];
+
+        let individual_batch = PreparedTraceShardBatch::from_prepared_blocks(
+            blocks
+                .clone()
+                .into_iter()
+                .map(|block| PreparedTraceBlockAppend::new(block, trace_shards))
+                .collect(),
+        );
+        let coalesced_block = coalesce_trace_blocks_for_shard(blocks.clone());
+
+        assert_eq!(coalesced_block.row_count(), 4);
+
+        let coalesced_batch =
+            PreparedTraceShardBatch::from_prepared_blocks(vec![PreparedTraceBlockAppend::new(
+                coalesced_block,
+                trace_shards,
+            )]);
+
+        let decode_rows = |batch: &PreparedTraceShardBatch| {
+            batch
+                .encoded_row_ranges
+                .iter()
+                .map(|range| {
+                    decode_trace_row(&batch.encoded_row_bytes[range.clone()])
+                        .expect("decode coalesced row")
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            decode_rows(&coalesced_batch),
+            decode_rows(&individual_batch)
+        );
+        assert_eq!(
+            coalesced_batch
+                .prepared_rows
+                .iter()
+                .map(|row| row.trace_id.clone())
+                .collect::<Vec<_>>(),
+            individual_batch
+                .prepared_rows
+                .iter()
+                .map(|row| row.trace_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            coalesced_batch
+                .prepared_rows
+                .iter()
+                .map(|row| row.operation.clone())
+                .collect::<Vec<_>>(),
+            individual_batch
+                .prepared_rows
+                .iter()
+                .map(|row| row.operation.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(coalesced_batch
+            .prepared_rows
+            .iter()
+            .all(|row| row.shard_index == 0));
+        assert_eq!(
+            blocks
+                .into_iter()
+                .flat_map(|block| block.rows())
+                .collect::<Vec<_>>(),
+            decode_rows(&coalesced_batch)
+        );
+    }
+
+    #[test]
+    fn disk_stats_do_not_drain_pending_trace_update_batches() {
+        let path = temp_test_dir("stats-no-drain");
+        let mut config = DiskStorageConfig::default().with_trace_shards(1);
+        config.trace_live_update_apply_mode = TraceLiveUpdateApplyMode::Manual;
+        let engine = DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
 
         for index in 0..(STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT + 1) {
             engine.enqueue_live_trace_updates_for_shard(
@@ -4691,19 +6615,166 @@ mod tests {
         let stats = engine.stats();
         let pending_after_stats = engine.pending_trace_updates.lock().len();
 
+        assert_eq!(stats.rows_ingested, 0);
         assert_eq!(
-            stats.rows_ingested,
-            STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT as u64
+            pending_after_stats,
+            STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT + 1
         );
-        assert_eq!(pending_after_stats, 1);
-        assert!(
-            engine
-                .trace_window(&format!(
-                    "trace-stats-bounded-{}",
-                    STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT
-                ))
-                .is_some(),
-            "query paths should still fully drain pending trace updates for visibility",
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn disk_manual_live_update_mode_keeps_head_queries_visible_without_apply() {
+        let path = temp_test_dir("manual-live-update-mode");
+        let mut config = DiskStorageConfig::default().with_trace_shards(1);
+        config.trace_live_update_apply_mode = TraceLiveUpdateApplyMode::Manual;
+        let engine = DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
+
+        engine
+            .append_rows(vec![trace_row(
+                "trace-manual-live-update-1",
+                "span-1",
+                "GET /checkout",
+                100,
+                150,
+                &[
+                    ("resource_attr:service.name", "checkout"),
+                    ("span_attr:http.method", "GET"),
+                ],
+            )])
+            .expect("append rows");
+
+        let services = engine.list_services();
+        let field_values = engine.list_field_values("span_attr:http.method");
+        let hits = engine.search_traces(&TraceSearchRequest {
+            start_unix_nano: 0,
+            end_unix_nano: 500,
+            service_name: Some("checkout".to_string()),
+            operation_name: Some("GET /checkout".to_string()),
+            field_filters: Vec::new(),
+            limit: 10,
+        });
+        let pending_after_queries = engine.pending_trace_updates.lock().len();
+
+        assert_eq!(services, vec!["checkout".to_string()]);
+        assert_eq!(field_values, vec!["GET".to_string()]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].trace_id, "trace-manual-live-update-1");
+        assert_eq!(pending_after_queries, 0);
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn disk_append_path_keeps_live_update_queue_empty_with_head_federation() {
+        let path = temp_test_dir("append-no-live-update-queue");
+        let mut config = DiskStorageConfig::default().with_trace_shards(1);
+        config.trace_live_update_apply_mode = TraceLiveUpdateApplyMode::Manual;
+        let engine = DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
+
+        engine
+            .append_rows(vec![trace_row(
+                "trace-no-live-update-queue-1",
+                "span-1",
+                "GET /checkout",
+                100,
+                150,
+                &[
+                    ("resource_attr:service.name", "checkout"),
+                    ("span_attr:http.method", "GET"),
+                ],
+            )])
+            .expect("append rows");
+
+        assert_eq!(engine.pending_trace_updates.lock().len(), 0);
+        assert_eq!(engine.list_services(), vec!["checkout".to_string()]);
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn disk_applying_pending_updates_preserves_head_query_visibility() {
+        let path = temp_test_dir("apply-live-update-overlay-removal");
+        let mut config = DiskStorageConfig::default().with_trace_shards(1);
+        config.trace_live_update_apply_mode = TraceLiveUpdateApplyMode::Manual;
+        let engine = DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
+
+        engine
+            .append_rows(vec![trace_row(
+                "trace-apply-live-update-1",
+                "span-1",
+                "POST /checkout",
+                100,
+                160,
+                &[
+                    ("resource_attr:service.name", "checkout"),
+                    ("span_attr:http.method", "POST"),
+                ],
+            )])
+            .expect("append rows");
+
+        assert_eq!(engine.list_services(), vec!["checkout".to_string()]);
+        assert_eq!(
+            engine.list_field_values("span_attr:http.method"),
+            vec!["POST".to_string()]
+        );
+
+        assert_eq!(engine.pending_trace_updates.lock().len(), 0);
+        engine.apply_pending_trace_updates_with_limit(usize::MAX);
+        assert_eq!(engine.list_services(), vec!["checkout".to_string()]);
+        assert_eq!(
+            engine.list_field_values("span_attr:http.method"),
+            vec!["POST".to_string()]
+        );
+        let hits = engine.search_traces(&TraceSearchRequest {
+            start_unix_nano: 0,
+            end_unix_nano: 500,
+            service_name: Some("checkout".to_string()),
+            operation_name: Some("POST /checkout".to_string()),
+            field_filters: vec![FieldFilter {
+                name: "span_attr:http.method".to_string(),
+                value: "POST".to_string(),
+            }],
+            limit: 10,
+        });
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].trace_id, "trace-apply-live-update-1");
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn disk_background_live_update_mode_applies_pending_updates_without_query_path_help() {
+        let path = temp_test_dir("background-live-update-mode");
+        let engine = DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default().with_trace_shards(1),
+        )
+        .expect("open disk engine");
+
+        engine.enqueue_live_trace_updates_for_shard(
+            0,
+            vec![LiveTraceUpdate {
+                trace_id: "trace-background-live-update-1".into(),
+                start_unix_nano: 100,
+                end_unix_nano: 150,
+                services: vec!["checkout".into()].into(),
+                operations: vec!["GET /checkout".into()].into(),
+                indexed_fields: vec![("span_attr:http.method".into(), "GET".into())].into(),
+                row_locations: vec![row(9, 0, 100, 150)],
+            }],
+        );
+
+        wait_until(|| {
+            engine.pending_trace_updates.lock().is_empty()
+                && engine.list_services() == vec!["checkout".to_string()]
+        });
+
+        assert_eq!(engine.list_services(), vec!["checkout".to_string()]);
+        assert_eq!(
+            engine.list_field_values("span_attr:http.method"),
+            vec!["GET".to_string()]
         );
 
         fs::remove_dir_all(path).expect("cleanup temp dir");

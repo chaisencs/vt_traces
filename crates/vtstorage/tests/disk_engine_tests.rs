@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Barrier},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use vtcore::{
@@ -34,6 +34,17 @@ fn temp_test_dir(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("rust-vt-{name}-{nanos}"));
     fs::create_dir_all(&path).expect("create temp dir");
     path
+}
+
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(condition(), "condition not satisfied before timeout");
 }
 
 #[test]
@@ -188,6 +199,120 @@ fn disk_engine_combines_concurrent_same_shard_block_appends() {
 }
 
 #[test]
+fn disk_engine_wait_window_coalesces_staggered_same_shard_appends() {
+    let path = temp_test_dir("trace-block-combiner-wait-window");
+    let engine = Arc::new(
+        DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default()
+                .with_trace_shards(1)
+                .with_trace_combiner_wait(Duration::from_secs(1)),
+        )
+        .expect("open disk engine"),
+    );
+    let start_barrier = Arc::new(Barrier::new(2));
+
+    let first = {
+        let engine = engine.clone();
+        let start_barrier = start_barrier.clone();
+        thread::spawn(move || {
+            start_barrier.wait();
+            engine
+                .append_rows(vec![make_row("trace-combiner-wait", "span-1", 100, 150)])
+                .expect("append first row");
+        })
+    };
+
+    start_barrier.wait();
+    thread::sleep(Duration::from_millis(20));
+    engine
+        .append_rows(vec![make_row("trace-combiner-wait", "span-2", 160, 210)])
+        .expect("append second row");
+    first.join().expect("join first append");
+
+    let window = engine
+        .trace_window("trace-combiner-wait")
+        .expect("trace window exists");
+    let rows = engine.rows_for_trace(
+        "trace-combiner-wait",
+        window.start_unix_nano,
+        window.end_unix_nano,
+    );
+
+    assert_eq!(rows.len(), 2);
+    let stats = engine.stats();
+    assert_eq!(
+        stats.trace_batch_flushes, 1,
+        "requests arriving inside the combiner wait window should share a single flush",
+    );
+    assert_eq!(stats.trace_batch_input_blocks, 2);
+    assert_eq!(stats.trace_batch_output_blocks, 1);
+
+    drop(engine);
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_group_commit_wait_batches_multiple_append_batches_into_one_flush() {
+    let path = temp_test_dir("trace-group-commit-wait");
+    let engine = Arc::new(
+        DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default()
+                .with_trace_shards(1)
+                .with_trace_combiner_wait(Duration::ZERO)
+                .with_trace_group_commit_wait(Duration::from_secs(1)),
+        )
+        .expect("open disk engine"),
+    );
+    let start_barrier = Arc::new(Barrier::new(2));
+
+    let first = {
+        let engine = engine.clone();
+        let start_barrier = start_barrier.clone();
+        thread::spawn(move || {
+            start_barrier.wait();
+            engine
+                .append_rows(vec![make_row("trace-group-commit", "span-1", 100, 150)])
+                .expect("append first row");
+        })
+    };
+
+    start_barrier.wait();
+    thread::sleep(Duration::from_millis(20));
+    engine
+        .append_rows(vec![make_row("trace-group-commit", "span-2", 160, 210)])
+        .expect("append second row");
+    first.join().expect("join first append");
+
+    let window = engine
+        .trace_window("trace-group-commit")
+        .expect("trace window exists");
+    let rows = engine.rows_for_trace(
+        "trace-group-commit",
+        window.start_unix_nano,
+        window.end_unix_nano,
+    );
+
+    assert_eq!(rows.len(), 2);
+    let stats = engine.stats();
+    assert_eq!(
+        stats.trace_batch_flushes, 2,
+        "zero combiner wait should keep requests as separate append batches",
+    );
+    assert_eq!(stats.trace_batch_input_blocks, 2);
+    assert_eq!(stats.trace_batch_output_blocks, 2);
+    assert_eq!(
+        stats.trace_group_commit_flushes, 1,
+        "requests arriving inside the group-commit wait window should share one flush",
+    );
+    assert_eq!(stats.trace_group_commit_rows, 2);
+
+    drop(engine);
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
 fn disk_engine_uses_batched_binary_wal_for_trace_block_appends() {
     let path = temp_test_dir("batched-wal");
     let config = DiskStorageConfig::default().with_sync_policy(DiskSyncPolicy::Data);
@@ -206,6 +331,225 @@ fn disk_engine_uses_batched_binary_wal_for_trace_block_appends() {
     let wal_bytes = fs::read(&wal_path).expect("read wal file");
     assert!(wal_bytes.starts_with(b"VTWAL1"));
     assert_eq!(wal_bytes.get(6), Some(&3));
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_can_defer_wal_writes_until_drop_and_still_recover() {
+    let path = temp_test_dir("deferred-wal");
+    let config = DiskStorageConfig::default().with_trace_deferred_wal_writes(true);
+    let wal_path = path
+        .join("segments")
+        .join("segment-00000000000000000001.wal");
+
+    {
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk engine");
+        engine
+            .append_rows(vec![
+                make_row("trace-deferred-wal-1", "span-1", 100, 150),
+                make_row("trace-deferred-wal-1", "span-2", 160, 210),
+            ])
+            .expect("append rows");
+
+        let window = engine
+            .trace_window("trace-deferred-wal-1")
+            .expect("trace window should exist before wal drain");
+        let rows = engine.rows_for_trace(
+            "trace-deferred-wal-1",
+            window.start_unix_nano,
+            window.end_unix_nano,
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(
+            !wal_path.exists() || fs::metadata(&wal_path).expect("wal metadata").len() == 0,
+            "deferred wal mode should keep request-path appends out of the on-disk wal",
+        );
+    }
+
+    let reopened = DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine");
+    let window = reopened
+        .trace_window("trace-deferred-wal-1")
+        .expect("trace window should survive clean shutdown");
+    let rows = reopened.rows_for_trace(
+        "trace-deferred-wal-1",
+        window.start_unix_nano,
+        window.end_unix_nano,
+    );
+    assert_eq!(rows.len(), 2);
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_exposes_search_services_and_field_values_from_head_before_seal() {
+    let path = temp_test_dir("head-query-visibility");
+    let config = DiskStorageConfig::default()
+        .with_trace_shards(1)
+        .with_target_segment_size_bytes(1 << 30);
+    let engine = DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
+
+    engine
+        .append_rows(vec![
+            TraceSpanRow::new(
+                "trace-head-query-1",
+                "span-1",
+                None,
+                "GET /checkout",
+                100,
+                150,
+                vec![
+                    Field::new("resource_attr:service.name", "checkout"),
+                    Field::new("span_attr:http.method", "GET"),
+                ],
+            )
+            .expect("row"),
+            TraceSpanRow::new(
+                "trace-head-query-2",
+                "span-1",
+                None,
+                "POST /checkout",
+                160,
+                220,
+                vec![
+                    Field::new("resource_attr:service.name", "checkout"),
+                    Field::new("span_attr:http.method", "POST"),
+                ],
+            )
+            .expect("row"),
+        ])
+        .expect("append rows");
+
+    wait_until(|| {
+        engine.list_services() == vec!["checkout".to_string()]
+            && engine.list_field_values("span_attr:http.method")
+                == vec!["GET".to_string(), "POST".to_string()]
+            && engine
+                .search_traces(&TraceSearchRequest {
+                    start_unix_nano: 0,
+                    end_unix_nano: 500,
+                    service_name: Some("checkout".to_string()),
+                    operation_name: Some("POST /checkout".to_string()),
+                    field_filters: vec![FieldFilter {
+                        name: "span_attr:http.method".to_string(),
+                        value: "POST".to_string(),
+                    }],
+                    limit: 10,
+                })
+                .len()
+                == 1
+    });
+
+    let hits = engine.search_traces(&TraceSearchRequest {
+        start_unix_nano: 0,
+        end_unix_nano: 500,
+        service_name: Some("checkout".to_string()),
+        operation_name: Some("POST /checkout".to_string()),
+        field_filters: vec![FieldFilter {
+            name: "span_attr:http.method".to_string(),
+            value: "POST".to_string(),
+        }],
+        limit: 10,
+    });
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].trace_id, "trace-head-query-2");
+
+    let window = engine
+        .trace_window("trace-head-query-2")
+        .expect("trace window should exist for head trace");
+    let rows = engine.rows_for_trace(
+        "trace-head-query-2",
+        window.start_unix_nano,
+        window.end_unix_nano,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].span_id, "span-1");
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_deferred_wal_keeps_query_indexes_visible_before_drop_and_after_reopen() {
+    let path = temp_test_dir("deferred-wal-query-visibility");
+    let config = DiskStorageConfig::default()
+        .with_trace_shards(1)
+        .with_target_segment_size_bytes(1 << 30)
+        .with_trace_deferred_wal_writes(true);
+
+    {
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk engine");
+        engine
+            .append_rows(vec![TraceSpanRow::new(
+                "trace-deferred-query-1",
+                "span-1",
+                None,
+                "POST /checkout",
+                100,
+                180,
+                vec![
+                    Field::new("resource_attr:service.name", "checkout"),
+                    Field::new("span_attr:http.method", "POST"),
+                ],
+            )
+            .expect("row")])
+            .expect("append rows");
+
+        wait_until(|| {
+            engine.list_services() == vec!["checkout".to_string()]
+                && engine.list_field_values("span_attr:http.method")
+                    == vec!["POST".to_string()]
+                && engine
+                    .search_traces(&TraceSearchRequest {
+                        start_unix_nano: 0,
+                        end_unix_nano: 500,
+                        service_name: Some("checkout".to_string()),
+                        operation_name: Some("POST /checkout".to_string()),
+                        field_filters: vec![FieldFilter {
+                            name: "span_attr:http.method".to_string(),
+                            value: "POST".to_string(),
+                        }],
+                        limit: 10,
+                    })
+                    .len()
+                    == 1
+        });
+
+        let hits = engine.search_traces(&TraceSearchRequest {
+            start_unix_nano: 0,
+            end_unix_nano: 500,
+            service_name: Some("checkout".to_string()),
+            operation_name: Some("POST /checkout".to_string()),
+            field_filters: vec![FieldFilter {
+                name: "span_attr:http.method".to_string(),
+                value: "POST".to_string(),
+            }],
+            limit: 10,
+        });
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].trace_id, "trace-deferred-query-1");
+    }
+
+    let reopened = DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine");
+    assert_eq!(reopened.list_services(), vec!["checkout".to_string()]);
+    assert_eq!(
+        reopened.list_field_values("span_attr:http.method"),
+        vec!["POST".to_string()]
+    );
+    let hits = reopened.search_traces(&TraceSearchRequest {
+        start_unix_nano: 0,
+        end_unix_nano: 500,
+        service_name: Some("checkout".to_string()),
+        operation_name: Some("POST /checkout".to_string()),
+        field_filters: vec![FieldFilter {
+            name: "span_attr:http.method".to_string(),
+            value: "POST".to_string(),
+        }],
+        limit: 10,
+    });
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].trace_id, "trace-deferred-query-1");
 
     fs::remove_dir_all(path).expect("cleanup temp dir");
 }
@@ -230,6 +574,58 @@ fn disk_engine_stats_reflect_persisted_data() {
     assert!(stats.persisted_bytes > 0);
     assert!(stats.segment_count >= 1);
 
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_stats_keep_cached_field_column_counts_after_part_path_changes() {
+    let path = temp_test_dir("stats-cached-field-columns");
+    let config = DiskStorageConfig::default()
+        .with_trace_shards(1)
+        .with_target_segment_size_bytes(1);
+    let engine = DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
+
+    engine
+        .append_rows(vec![TraceSpanRow::new(
+            "trace-stats-cached-1",
+            "span-1",
+            None,
+            "GET /checkout",
+            100,
+            180,
+            vec![
+                Field::new("resource_attr:service.name", "checkout"),
+                Field::new("span_attr:http.method", "GET"),
+                Field::new("span_attr:http.status_code", "200"),
+            ],
+        )
+        .expect("row")])
+        .expect("append rows");
+
+    wait_until(|| engine.stats().trace_seal_completed > 0);
+
+    let stats = engine.stats();
+    assert_eq!(stats.typed_field_columns, 1);
+    assert_eq!(stats.string_field_columns, 2);
+
+    let part_path = fs::read_dir(path.join("segments"))
+        .expect("read segments dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".part"))
+        })
+        .expect("sealed part should exist");
+    let moved_part_path = part_path.with_extension("part.moved");
+    fs::rename(&part_path, &moved_part_path).expect("move part out of the way");
+
+    let cached_stats = engine.stats();
+    assert_eq!(cached_stats.typed_field_columns, 1);
+    assert_eq!(cached_stats.string_field_columns, 2);
+
+    drop(engine);
     fs::remove_dir_all(path).expect("cleanup temp dir");
 }
 
@@ -333,15 +729,6 @@ fn disk_engine_reads_active_segment_rows_without_flushing_each_append() {
         ])
         .expect("append rows");
 
-    let wal_path = path
-        .join("segments")
-        .join("segment-00000000000000000001.wal");
-    assert_eq!(
-        fs::metadata(&wal_path).expect("wal metadata").len(),
-        0,
-        "sync_policy=None should not flush every append",
-    );
-
     let window = engine
         .trace_window("trace-active-1")
         .expect("trace window exists");
@@ -379,13 +766,16 @@ fn disk_engine_compacts_small_parts_after_reopen() {
         let engine =
             DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk engine");
         engine
-            .append_rows(vec![
-                make_row("trace-compact-1", "span-1", 10, 20),
-                make_row("trace-compact-1", "span-2", 30, 40),
-                make_row("trace-compact-1", "span-3", 50, 60),
-            ])
-            .expect("append rows");
+            .append_rows(vec![make_row("trace-compact-1", "span-1", 10, 20)])
+            .expect("append first row");
+        engine
+            .append_rows(vec![make_row("trace-compact-1", "span-2", 30, 40)])
+            .expect("append second row");
+        engine
+            .append_rows(vec![make_row("trace-compact-1", "span-3", 50, 60)])
+            .expect("append third row");
 
+        wait_until(|| engine.stats().trace_seal_completed >= 2);
         assert!(engine.stats().segment_count >= 2);
     }
 
@@ -710,6 +1100,97 @@ fn disk_engine_records_fsync_operations_when_sync_policy_requires_it() {
     assert!(reopened.stats().segment_count >= 1);
 
     fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_trace_by_id_reads_head_and_sealed_parts_together() {
+    let path = temp_test_dir("head-and-sealed-federation");
+    let config = DiskStorageConfig::default()
+        .with_trace_shards(1)
+        .with_target_segment_size_bytes(1);
+    let engine = DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
+
+    engine
+        .append_rows(vec![make_row("trace-federated-1", "span-1", 100, 150)])
+        .expect("append first head row");
+    engine
+        .append_rows(vec![make_row("trace-federated-1", "span-2", 160, 210)])
+        .expect("append second head row");
+
+    wait_until(|| engine.stats().trace_seal_completed > 0);
+
+    let window = engine
+        .trace_window("trace-federated-1")
+        .expect("trace window should span sealed and head data");
+    let rows = engine.rows_for_trace(
+        "trace-federated-1",
+        window.start_unix_nano,
+        window.end_unix_nano,
+    );
+
+    assert_eq!(window.start_unix_nano, 100);
+    assert_eq!(window.end_unix_nano, 210);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.span_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["span-1", "span-2"]
+    );
+
+    drop(engine);
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_reports_head_group_commit_and_seal_metrics() {
+    let head_path = temp_test_dir("head-metrics");
+    let head_engine = DiskStorageEngine::open_with_config(
+        &head_path,
+        DiskStorageConfig::default().with_trace_shards(1),
+    )
+    .expect("open disk engine for head metrics");
+
+    head_engine
+        .append_rows(vec![make_row("trace-head-only-1", "span-1", 10, 20)])
+        .expect("append head-only row");
+
+    let head_stats = head_engine.stats();
+    assert!(head_stats.trace_head_segments >= 1);
+    assert!(head_stats.trace_head_rows >= 1);
+    assert!(head_stats.trace_group_commit_flushes >= 1);
+    assert!(head_stats.trace_group_commit_rows >= 1);
+    assert!(head_stats.trace_group_commit_bytes > 0);
+
+    drop(head_engine);
+    fs::remove_dir_all(head_path).expect("cleanup head metrics temp dir");
+
+    let seal_path = temp_test_dir("seal-metrics");
+    let config = DiskStorageConfig::default()
+        .with_trace_shards(1)
+        .with_target_segment_size_bytes(1);
+    let engine = DiskStorageEngine::open_with_config(&seal_path, config).expect("open disk engine");
+
+    engine
+        .append_rows(vec![make_row("trace-head-metrics-1", "span-1", 100, 150)])
+        .expect("append first metrics row");
+    engine
+        .append_rows(vec![make_row("trace-head-metrics-2", "span-1", 200, 250)])
+        .expect("append second metrics row");
+
+    wait_until(|| engine.stats().trace_seal_completed > 0);
+
+    let stats = engine.stats();
+    assert!(stats.trace_group_commit_flushes >= 2);
+    assert!(stats.trace_group_commit_rows >= 2);
+    assert!(stats.trace_group_commit_bytes > 0);
+    assert!(stats.trace_seal_queue_depth <= 1);
+    assert!(stats.trace_seal_completed >= 1);
+    assert!(stats.trace_seal_rows >= 1);
+    assert!(stats.trace_seal_bytes > 0);
+
+    drop(engine);
+    fs::remove_dir_all(seal_path).expect("cleanup temp dir");
 }
 
 #[test]

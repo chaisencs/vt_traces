@@ -11,24 +11,31 @@ use std::{
     fs,
     net::IpAddr,
     net::SocketAddr,
+    net::TcpListener as StdTcpListener,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
+    thread::JoinHandle as ThreadJoinHandle,
     time::Duration,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{net::TcpListener, sync::Barrier, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{oneshot, Barrier},
+    task::JoinHandle,
+};
 use tower::ServiceExt;
 use vtapi::{
     build_insert_router, build_router, build_router_with_limits, build_router_with_storage,
-    build_router_with_storage_auth_and_limits, build_select_router,
-    build_select_router_with_auth_and_limits, build_select_router_with_client_auth_and_limits,
-    build_storage_router, build_storage_router_with_auth_and_limits,
-    build_storage_router_with_limits, serve_app, spawn_background_rebalance_task, ApiLimitsConfig,
-    AuthConfig, ClusterConfig, ClusterHttpClient, ClusterHttpClientConfig, ServerTlsConfig,
+    build_router_with_storage_and_trace_ingest_profile, build_router_with_storage_auth_and_limits,
+    build_select_router, build_select_router_with_auth_and_limits,
+    build_select_router_with_client_auth_and_limits, build_storage_router,
+    build_storage_router_with_auth_and_limits, build_storage_router_with_limits, serve_app,
+    spawn_background_rebalance_task, ApiLimitsConfig, AuthConfig, ClusterConfig, ClusterHttpClient,
+    ClusterHttpClientConfig, ServerTlsConfig, TraceIngestProfile,
 };
 use vtcore::{
     encode_trace_rows, LogRow, LogSearchRequest, TraceSearchHit, TraceSearchRequest, TraceSpanRow,
@@ -41,7 +48,8 @@ use vtingest::{
     ScopeSpans, SpanRecord, Status,
 };
 use vtstorage::{
-    DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError, StorageStatsSnapshot,
+    DiskStorageConfig, DiskStorageEngine, DiskSyncPolicy, MemoryStorageEngine, StorageEngine,
+    StorageError, StorageStatsSnapshot,
 };
 
 fn temp_test_dir(name: &str) -> PathBuf {
@@ -79,6 +87,29 @@ impl Drop for TestServer {
     }
 }
 
+struct ThreadRuntimeServer {
+    base_url: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    handle: Option<ThreadJoinHandle<()>>,
+}
+
+impl ThreadRuntimeServer {
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+}
+
+impl Drop for ThreadRuntimeServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct GeneratedTlsMaterials {
     ca_cert_pem: String,
     server_cert_pem: String,
@@ -108,6 +139,37 @@ async fn spawn_server_from_listener(listener: TcpListener, app: Router) -> TestS
     TestServer {
         base_url: format!("http://{addr}"),
         handle,
+    }
+}
+
+fn spawn_server_on_single_worker_runtime(app: Router) -> ThreadRuntimeServer {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    listener
+        .set_nonblocking(true)
+        .expect("set listener nonblocking");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build single-worker runtime");
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(listener).expect("tokio listener");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("server should run");
+        });
+    });
+
+    ThreadRuntimeServer {
+        base_url: format!("http://{addr}"),
+        shutdown: Some(shutdown_tx),
+        handle: Some(handle),
     }
 }
 
@@ -264,6 +326,159 @@ async fn healthz_returns_ok() {
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn trace_ingest_keeps_metrics_responsive_while_storage_runs() {
+    let storage = Arc::new(SlowStorageEngine::new(Duration::from_millis(250)));
+    let server = spawn_server_on_single_worker_runtime(build_router_with_storage(storage.clone()));
+    let client = Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build reqwest client");
+    let ingest_payload = json!({
+        "resource_spans": [
+            {
+                "resource_attributes": [
+                    { "key": "service.name", "value": { "kind": "string", "value": "checkout" } }
+                ],
+                "scope_spans": [
+                    {
+                        "scope_name": "io.opentelemetry.auto",
+                        "scope_version": "1.0.0",
+                        "scope_attributes": [],
+                        "spans": [
+                            {
+                                "trace_id": "trace-blocking-boundary-1",
+                                "span_id": "span-blocking-boundary-1",
+                                "parent_span_id": null,
+                                "name": "GET /blocking-boundary",
+                                "start_time_unix_nano": 100,
+                                "end_time_unix_nano": 180,
+                                "attributes": [],
+                                "status": { "code": 0, "message": "OK" }
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    });
+
+    let ingest_request = {
+        let client = client.clone();
+        let url = server.url("/api/v1/traces/ingest");
+        let body = ingest_payload.to_string();
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("trace ingest request")
+        })
+    };
+
+    let wait_started = Instant::now();
+    while !storage.started() {
+        assert!(
+            wait_started.elapsed() < Duration::from_secs(2),
+            "trace ingest never reached storage append",
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let metrics_response = tokio::time::timeout(
+        Duration::from_millis(100),
+        client.get(server.url("/metrics")).send(),
+    )
+    .await
+    .expect("metrics request should stay responsive while trace ingest is in flight")
+    .expect("metrics request");
+    assert_eq!(metrics_response.status(), ReqwestStatusCode::OK);
+
+    let ingest_response = ingest_request.await.expect("join ingest request");
+    assert_eq!(ingest_response.status(), ReqwestStatusCode::OK);
+}
+
+#[tokio::test]
+async fn trace_ingest_throughput_profile_can_block_metrics_on_single_worker_runtime() {
+    let storage = Arc::new(SlowStorageEngine::new(Duration::from_millis(250)));
+    let server =
+        spawn_server_on_single_worker_runtime(build_router_with_storage_and_trace_ingest_profile(
+            storage.clone(),
+            TraceIngestProfile::Throughput,
+        ));
+    let client = Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build reqwest client");
+    let ingest_payload = json!({
+        "resource_spans": [
+            {
+                "resource_attributes": [
+                    { "key": "service.name", "value": { "kind": "string", "value": "checkout" } }
+                ],
+                "scope_spans": [
+                    {
+                        "scope_name": "io.opentelemetry.auto",
+                        "scope_version": "1.0.0",
+                        "scope_attributes": [],
+                        "spans": [
+                            {
+                                "trace_id": "trace-throughput-profile-1",
+                                "span_id": "span-throughput-profile-1",
+                                "parent_span_id": null,
+                                "name": "GET /throughput-profile",
+                                "start_time_unix_nano": 100,
+                                "end_time_unix_nano": 180,
+                                "attributes": [],
+                                "status": { "code": 0, "message": "OK" }
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    });
+
+    let ingest_request = {
+        let client = client.clone();
+        let url = server.url("/api/v1/traces/ingest");
+        let body = ingest_payload.to_string();
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("trace ingest request")
+        })
+    };
+
+    let wait_started = Instant::now();
+    while !storage.started() {
+        assert!(
+            wait_started.elapsed() < Duration::from_secs(2),
+            "trace ingest never reached storage append",
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let metrics_result = tokio::time::timeout(
+        Duration::from_millis(100),
+        client.get(server.url("/metrics")).send(),
+    )
+    .await;
+    assert!(
+        metrics_result.is_err(),
+        "throughput profile should allow metrics to block while trace ingest is in flight",
+    );
+
+    let ingest_response = ingest_request.await.expect("join ingest request");
+    assert_eq!(ingest_response.status(), ReqwestStatusCode::OK);
 }
 
 #[tokio::test]
@@ -1318,14 +1533,26 @@ async fn metrics_endpoint_exposes_storage_counters() {
         .expect("body should decode");
     let body = String::from_utf8(body.to_vec()).expect("utf8 body");
 
+    assert!(body.contains("vt_build_info{"));
+    assert!(body.contains("target_arch=\""));
     assert!(body.contains("vt_rows_ingested_total"));
     assert!(body.contains("vt_traces_tracked"));
     assert!(body.contains("vt_storage_retained_trace_blocks"));
     assert!(body.contains("vt_storage_segments"));
+    assert!(body.contains("vt_storage_trace_head_segments"));
+    assert!(body.contains("vt_storage_trace_head_rows"));
     assert!(body.contains("vt_storage_segment_read_batches_total"));
     assert!(body.contains("vt_storage_part_selective_decodes_total"));
+    assert!(body.contains("vt_storage_trace_group_commit_flushes_total"));
+    assert!(body.contains("vt_storage_trace_group_commit_rows_total"));
+    assert!(body.contains("vt_storage_trace_group_commit_bytes_total"));
     assert!(body.contains("vt_storage_trace_batch_flushes_total"));
     assert!(body.contains("vt_storage_trace_batch_input_blocks_total"));
+    assert!(body.contains("vt_storage_trace_live_update_queue_depth"));
+    assert!(body.contains("vt_storage_trace_seal_queue_depth"));
+    assert!(body.contains("vt_storage_trace_seal_completed_total"));
+    assert!(body.contains("vt_storage_trace_seal_rows_total"));
+    assert!(body.contains("vt_storage_trace_seal_bytes_total"));
 }
 
 #[tokio::test]
@@ -1878,6 +2105,171 @@ async fn disk_backend_survives_router_restart() {
     }
 
     fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[tokio::test]
+async fn disk_backend_query_endpoints_are_immediately_visible_for_stable_and_throughput_profiles() {
+    for (label, profile, config) in [
+        (
+            "stable",
+            TraceIngestProfile::Default,
+            DiskStorageConfig::default()
+                .with_sync_policy(DiskSyncPolicy::Data)
+                .with_trace_shards(1)
+                .with_target_segment_size_bytes(1 << 30),
+        ),
+        (
+            "throughput",
+            TraceIngestProfile::Throughput,
+            DiskStorageConfig::default()
+                .with_sync_policy(DiskSyncPolicy::None)
+                .with_trace_shards(1)
+                .with_target_segment_size_bytes(256 * 1024 * 1024)
+                .with_trace_deferred_wal_writes(true),
+        ),
+    ] {
+        let path = temp_test_dir(&format!("disk-query-profile-{label}"));
+        let storage: Arc<dyn StorageEngine> =
+            Arc::new(DiskStorageEngine::open_with_config(&path, config).expect("open disk"));
+        let app = build_router_with_storage_and_trace_ingest_profile(storage, profile);
+
+        let ingest_payload = json!({
+            "resource_spans": [
+                {
+                    "resource_attributes": [
+                        { "key": "service.name", "value": { "kind": "string", "value": "checkout" } }
+                    ],
+                    "scope_spans": [
+                        {
+                            "scope_name": null,
+                            "scope_version": null,
+                            "scope_attributes": [],
+                            "spans": [
+                                {
+                                    "trace_id": format!("trace-query-profile-{label}-1"),
+                                    "span_id": "span-1",
+                                    "parent_span_id": null,
+                                    "name": "GET /checkout",
+                                    "start_time_unix_nano": 100,
+                                    "end_time_unix_nano": 180,
+                                    "attributes": [
+                                        { "key": "http.method", "value": { "kind": "string", "value": "GET" } }
+                                    ],
+                                    "status": null
+                                },
+                                {
+                                    "trace_id": format!("trace-query-profile-{label}-2"),
+                                    "span_id": "span-2",
+                                    "parent_span_id": null,
+                                    "name": "POST /checkout",
+                                    "start_time_unix_nano": 200,
+                                    "end_time_unix_nano": 320,
+                                    "attributes": [
+                                        { "key": "http.method", "value": { "kind": "string", "value": "POST" } }
+                                    ],
+                                    "status": null
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/traces/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(ingest_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("ingest request");
+        assert_eq!(ingest_response.status(), StatusCode::OK);
+
+        let trace_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/traces/trace-query-profile-{label}-2"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("trace request");
+        assert_eq!(trace_response.status(), StatusCode::OK);
+        let trace_body = axum::body::to_bytes(trace_response.into_body(), usize::MAX)
+            .await
+            .expect("trace body");
+        let trace: Value = serde_json::from_slice(&trace_body).expect("trace json");
+        assert_eq!(trace["trace_id"], format!("trace-query-profile-{label}-2"));
+        assert_eq!(trace["rows"].as_array().unwrap().len(), 1);
+
+        let services_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/services")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("services request");
+        assert_eq!(services_response.status(), StatusCode::OK);
+        let services_body = axum::body::to_bytes(services_response.into_body(), usize::MAX)
+            .await
+            .expect("services body");
+        let services: Value = serde_json::from_slice(&services_body).expect("services json");
+        assert_eq!(
+            services["services"].as_array().unwrap(),
+            &vec![json!("checkout")]
+        );
+
+        let search_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/traces/search?start_unix_nano=0&end_unix_nano=500&service_name=checkout&field_filter=span_attr:http.method=POST&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("search request");
+        assert_eq!(search_response.status(), StatusCode::OK);
+        let search_body = axum::body::to_bytes(search_response.into_body(), usize::MAX)
+            .await
+            .expect("search body");
+        let search_hits: Value = serde_json::from_slice(&search_body).expect("search json");
+        assert_eq!(search_hits["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            search_hits["hits"][0]["trace_id"],
+            format!("trace-query-profile-{label}-2")
+        );
+
+        let values_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/search/tag/span.http.method/values?limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("tempo tag values request");
+        assert_eq!(values_response.status(), StatusCode::OK);
+        let values_body = axum::body::to_bytes(values_response.into_body(), usize::MAX)
+            .await
+            .expect("tempo tag values body");
+        let values: Value = serde_json::from_slice(&values_body).expect("tempo tag values json");
+        assert_eq!(
+            values["tagValues"].as_array().unwrap(),
+            &vec![json!("GET"), json!("POST")]
+        );
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
 }
 
 #[tokio::test]
@@ -3340,7 +3732,11 @@ async fn cluster_rebalance_requires_local_control_leadership() {
     } else {
         (second_addr, first_addr)
     };
-    let leader = spawn_server_at(leader_addr, Router::new().route("/healthz", get(|| async { "ok" }))).await;
+    let leader = spawn_server_at(
+        leader_addr,
+        Router::new().route("/healthz", get(|| async { "ok" })),
+    )
+    .await;
     let local_base_url = format!("http://{local_addr}");
     let cluster = ClusterConfig::new(vec![storage.base_url.clone()], 1)
         .expect("cluster config")

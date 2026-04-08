@@ -43,8 +43,11 @@ Reference commit: `0019f74` (`Bound stats-side live update drain`)
 
 所有结果都来自同一台机器、同一组 benchmark 参数：
 
+在 Apple Silicon 上，这组命令必须用 native ARM target 复现；如果直接运行 `target/release/*`，仓库当前 toolchain 可能会给出 `x86_64` Rosetta 二进制，结果会被污染。
+
 ```bash
-target/release/vtbench otlp-protobuf-load \
+cargo build --release --target aarch64-apple-darwin -p vtapi -p vtbench
+target/aarch64-apple-darwin/release/vtbench otlp-protobuf-load \
   --duration-secs=5 \
   --warmup-secs=1 \
   --concurrency=32 \
@@ -127,7 +130,7 @@ target/release/vtbench otlp-protobuf-load \
 ### 1. Build
 
 ```bash
-cargo build --release -p vtapi -p vtbench
+cargo build --release --target aarch64-apple-darwin -p vtapi -p vtbench
 ```
 
 ### 2. Start official
@@ -145,7 +148,7 @@ cargo build --release -p vtapi -p vtbench
 RUST_LOG=error \
 VT_BIND_ADDR=127.0.0.1:13082 \
 VT_STORAGE_MODE=memory \
-target/release/vtapi
+target/aarch64-apple-darwin/release/vtapi
 ```
 
 ### 4. Start Rust disk engine
@@ -155,13 +158,13 @@ RUST_LOG=error \
 VT_BIND_ADDR=127.0.0.1:13083 \
 VT_STORAGE_MODE=disk \
 VT_STORAGE_PATH=./var/bench-disk \
-target/release/vtapi
+target/aarch64-apple-darwin/release/vtapi
 ```
 
 ### 5. Run the benchmark
 
 ```bash
-target/release/vtbench otlp-protobuf-load \
+target/aarch64-apple-darwin/release/vtbench otlp-protobuf-load \
   --url=http://127.0.0.1:13081/insert/opentelemetry/v1/traces \
   --duration-secs=5 \
   --warmup-secs=1 \

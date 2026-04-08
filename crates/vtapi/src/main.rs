@@ -4,12 +4,13 @@ use mimalloc::MiMalloc;
 use reqwest::{Certificate, Client, Identity};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use vtapi::{
-    build_insert_router_with_client_auth_and_limits, build_router_with_storage_auth_and_limits,
+    build_insert_router_with_client_auth_and_limits,
+    build_router_with_storage_auth_limits_and_trace_ingest_profile,
     build_select_router_with_client_auth_and_limits, build_storage_router_with_auth_and_limits,
     serve_app, spawn_background_control_refresh_task_with_client_and_auth,
     spawn_background_membership_refresh_task_with_client_and_auth,
     spawn_background_rebalance_task_with_client_and_auth, ApiLimitsConfig, AuthConfig,
-    ClusterConfig, ClusterHttpClient, ClusterHttpClientConfig, ServerTlsConfig,
+    ClusterConfig, ClusterHttpClient, ClusterHttpClientConfig, ServerTlsConfig, TraceIngestProfile,
 };
 use vtstorage::{
     BatchingStorageConfig, BatchingStorageEngine, DiskStorageConfig, DiskStorageEngine,
@@ -18,6 +19,14 @@ use vtstorage::{
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
+
+const THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TraceIngestDiskOverrides {
+    deferred_wal_writes: bool,
+    target_segment_size_bytes: Option<u64>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let role = env::var("VT_ROLE").unwrap_or_else(|_| "single".to_string());
     let limits = load_api_limits();
     let auth = load_auth_config();
+    let trace_ingest_profile = load_trace_ingest_profile();
     let server_tls = load_server_tls_config()?;
     let cluster_client = load_cluster_http_client()?;
     let addr = load_bind_addr(&role)?;
@@ -54,12 +64,17 @@ async fn main() -> anyhow::Result<()> {
             auth.clone(),
             limits.clone(),
         ),
-        "storage" => {
-            build_storage_router_with_auth_and_limits(load_storage()?, auth.clone(), limits.clone())
-        }
-        _ => {
-            build_router_with_storage_auth_and_limits(load_storage()?, auth.clone(), limits.clone())
-        }
+        "storage" => build_storage_router_with_auth_and_limits(
+            load_storage(trace_ingest_profile)?,
+            auth.clone(),
+            limits.clone(),
+        ),
+        _ => build_router_with_storage_auth_limits_and_trace_ingest_profile(
+            load_storage(trace_ingest_profile)?,
+            auth.clone(),
+            limits.clone(),
+            trace_ingest_profile,
+        ),
     };
 
     if role == "select" {
@@ -144,7 +159,46 @@ fn load_auth_config() -> AuthConfig {
     auth
 }
 
-fn load_storage() -> anyhow::Result<Arc<dyn StorageEngine>> {
+fn load_trace_ingest_profile() -> TraceIngestProfile {
+    parse_trace_ingest_profile(env::var("VT_TRACE_INGEST_PROFILE").ok().as_deref())
+}
+
+fn parse_trace_ingest_profile(value: Option<&str>) -> TraceIngestProfile {
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "throughput" | "direct" | "benchmark" => TraceIngestProfile::Throughput,
+        _ => TraceIngestProfile::Default,
+    }
+}
+
+fn disk_overrides_for_trace_ingest_profile(
+    trace_ingest_profile: TraceIngestProfile,
+    sync_policy: DiskSyncPolicy,
+    target_segment_size_explicit: bool,
+) -> TraceIngestDiskOverrides {
+    if matches!(trace_ingest_profile, TraceIngestProfile::Throughput)
+        && matches!(sync_policy, DiskSyncPolicy::None)
+    {
+        return TraceIngestDiskOverrides {
+            deferred_wal_writes: true,
+            target_segment_size_bytes: (!target_segment_size_explicit)
+                .then_some(THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES),
+        };
+    }
+
+    TraceIngestDiskOverrides {
+        deferred_wal_writes: false,
+        target_segment_size_bytes: None,
+    }
+}
+
+fn load_storage(
+    trace_ingest_profile: TraceIngestProfile,
+) -> anyhow::Result<Arc<dyn StorageEngine>> {
     let storage_mode = env::var("VT_STORAGE_MODE").unwrap_or_else(|_| "memory".to_string());
     let configured_trace_shards = env::var("VT_STORAGE_TRACE_SHARDS")
         .ok()
@@ -157,21 +211,52 @@ fn load_storage() -> anyhow::Result<Arc<dyn StorageEngine>> {
             if let Some(trace_shards) = configured_trace_shards {
                 config = config.with_trace_shards(trace_shards);
             }
-            if let Some(target_segment_size_bytes) =
+            let configured_target_segment_size_bytes =
                 env::var("VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok());
+            if let Some(target_segment_size_bytes) = configured_target_segment_size_bytes {
+                config = config.with_target_segment_size_bytes(target_segment_size_bytes);
+            }
+            if let Some(trace_group_commit_wait_micros) =
+                env::var("VT_STORAGE_TRACE_GROUP_COMMIT_WAIT_MICROS")
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
             {
-                config = config.with_target_segment_size_bytes(target_segment_size_bytes);
+                config = config.with_trace_group_commit_wait(Duration::from_micros(
+                    trace_group_commit_wait_micros,
+                ));
             }
-            if matches!(
+            if let Some(trace_wal_writer_capacity_bytes) =
+                env::var("VT_STORAGE_TRACE_WAL_WRITER_CAPACITY_BYTES")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+            {
+                config =
+                    config.with_trace_wal_writer_capacity_bytes(trace_wal_writer_capacity_bytes);
+            }
+            let sync_policy = if matches!(
                 env::var("VT_STORAGE_SYNC_POLICY")
                     .unwrap_or_else(|_| "none".to_string())
                     .to_ascii_lowercase()
                     .as_str(),
                 "data" | "sync-data" | "sync_data"
             ) {
-                config = config.with_sync_policy(DiskSyncPolicy::Data);
+                DiskSyncPolicy::Data
+            } else {
+                DiskSyncPolicy::None
+            };
+            config = config.with_sync_policy(sync_policy);
+            let disk_overrides = disk_overrides_for_trace_ingest_profile(
+                trace_ingest_profile,
+                sync_policy,
+                configured_target_segment_size_bytes.is_some(),
+            );
+            if disk_overrides.deferred_wal_writes {
+                config = config.with_trace_deferred_wal_writes(true);
+            }
+            if let Some(target_segment_size_bytes) = disk_overrides.target_segment_size_bytes {
+                config = config.with_target_segment_size_bytes(target_segment_size_bytes);
             }
             Arc::new(DiskStorageEngine::open_with_config(path, config)?)
         }
@@ -292,6 +377,88 @@ fn load_cluster_config(local_control_node: Option<&str>) -> anyhow::Result<Clust
     }
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        disk_overrides_for_trace_ingest_profile, parse_trace_ingest_profile,
+        TraceIngestDiskOverrides, TraceIngestProfile, THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES,
+    };
+    use vtstorage::DiskSyncPolicy;
+
+    #[test]
+    fn parse_trace_ingest_profile_defaults_to_default() {
+        assert_eq!(
+            parse_trace_ingest_profile(None),
+            TraceIngestProfile::Default
+        );
+        assert_eq!(
+            parse_trace_ingest_profile(Some("")),
+            TraceIngestProfile::Default
+        );
+        assert_eq!(
+            parse_trace_ingest_profile(Some("unknown")),
+            TraceIngestProfile::Default
+        );
+    }
+
+    #[test]
+    fn parse_trace_ingest_profile_accepts_throughput_aliases() {
+        assert_eq!(
+            parse_trace_ingest_profile(Some("throughput")),
+            TraceIngestProfile::Throughput
+        );
+        assert_eq!(
+            parse_trace_ingest_profile(Some("direct")),
+            TraceIngestProfile::Throughput
+        );
+        assert_eq!(
+            parse_trace_ingest_profile(Some("benchmark")),
+            TraceIngestProfile::Throughput
+        );
+    }
+
+    #[test]
+    fn throughput_profile_enables_deferred_wal_and_larger_default_segment_size() {
+        assert_eq!(
+            disk_overrides_for_trace_ingest_profile(
+                TraceIngestProfile::Throughput,
+                DiskSyncPolicy::None,
+                false,
+            ),
+            TraceIngestDiskOverrides {
+                deferred_wal_writes: true,
+                target_segment_size_bytes: Some(THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES),
+            }
+        );
+    }
+
+    #[test]
+    fn throughput_profile_respects_explicit_segment_size_and_sync_policy() {
+        assert_eq!(
+            disk_overrides_for_trace_ingest_profile(
+                TraceIngestProfile::Throughput,
+                DiskSyncPolicy::None,
+                true,
+            ),
+            TraceIngestDiskOverrides {
+                deferred_wal_writes: true,
+                target_segment_size_bytes: None,
+            }
+        );
+        assert_eq!(
+            disk_overrides_for_trace_ingest_profile(
+                TraceIngestProfile::Throughput,
+                DiskSyncPolicy::Data,
+                false,
+            ),
+            TraceIngestDiskOverrides {
+                deferred_wal_writes: false,
+                target_segment_size_bytes: None,
+            }
+        );
+    }
 }
 
 fn load_bind_addr(role: &str) -> anyhow::Result<SocketAddr> {

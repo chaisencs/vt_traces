@@ -37,8 +37,11 @@
 下面这组公开结果来自同机、同口径、clean start 的 `vtbench otlp-protobuf-load`。
 这个 benchmark 形状很贴近 AI-Agent 常见的高频小请求写入：
 
+在 Apple Silicon 上复现这组 benchmark 时，必须显式使用 native ARM target；仓库当前 toolchain 默认仍可能产出 `target/release/*` 下的 `x86_64` 二进制。
+
 ```bash
-target/release/vtbench otlp-protobuf-load \
+cargo build --release --target aarch64-apple-darwin -p vtapi -p vtbench
+target/aarch64-apple-darwin/release/vtbench otlp-protobuf-load \
   --duration-secs=5 \
   --warmup-secs=1 \
   --concurrency=32 \
@@ -46,7 +49,26 @@ target/release/vtbench otlp-protobuf-load \
   --payload-variants=1024
 ```
 
+如果你要复现当前的吞吐优先 benchmark profile，请只额外加一个显式开关：
+
+```bash
+VT_TRACE_INGEST_PROFILE=throughput \
+target/aarch64-apple-darwin/release/vtapi
+```
+
+这个 profile 会把 trace ingest 切到吞吐优先路径；它适合 benchmark 和吞吐优先场景，但不会保留默认 profile 的 runtime responsiveness 语义，而且在 `VT_STORAGE_SYNC_POLICY=none` 下会扩大 process-crash 时可能丢失的 acked trace 窗口。
+
 对外完整说明见 [2026-04-06 OTLP Ingest Performance Report](./docs/2026-04-06-otlp-ingest-performance-report.md)。
+
+当前对外发布语义明确拆成两档，不再把它们混成“同一版调不同参数”：
+
+| release tier | 目标 | 必选配置 | 默认 segment 语义 | 适合场景 |
+| --- | --- | --- | --- | --- |
+| `stable` | durability / runtime stability first | `VT_TRACE_INGEST_PROFILE=default` + `VT_STORAGE_SYNC_POLICY=data` | 保持常规 segment 轮转阈值，默认 `8388608` | 先上生产、需要更稳 crash 语义和更保守运维行为 |
+| `throughput` | ingest throughput first | `VT_TRACE_INGEST_PROFILE=throughput` + `VT_STORAGE_SYNC_POLICY=none` | 在未显式设置 `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES` 时自动升到 `268435456` | benchmark、吞吐优先、能接受更大 acked crash-loss window 的场景 |
+
+`throughput` 不是“默认稳定版”，而是一个单独的高吞吐发布档。  
+如果你要先发 production，优先从 `stable` 开始；`throughput` 更适合 canary、回放验证和明确接受 crash-loss tradeoff 的集群。
 
 | target | fresh single spans/s | fresh single p99 | fresh 5-round median spans/s | fresh 5-round median p99 |
 | --- | ---: | ---: | ---: | ---: |
@@ -66,7 +88,7 @@ target/release/vtbench otlp-protobuf-load \
 | --- | --- | --- |
 | 预构建 Linux tarball | 裸机、VM、生产发布 | GitHub Releases |
 | Docker | 容器化部署、PoC、Kubernetes 镜像封装 | [Dockerfile](./Dockerfile) |
-| 从源码构建 | 本地开发、定制编译、基准测试 | `cargo build --release -p vtapi -p vtbench` |
+| 从源码构建 | 本地开发、定制编译；Apple Silicon benchmark 请显式用 ARM target | `cargo build --release -p vtapi -p vtbench` |
 
 正式 release 目标平台是常见 64 位 Linux：
 
@@ -137,6 +159,12 @@ docker run --rm \
 cargo build --release -p vtapi -p vtbench
 ```
 
+如果你是在 Apple Silicon 上做本机 benchmark，请改用：
+
+```bash
+cargo build --release --target aarch64-apple-darwin -p vtapi -p vtbench
+```
+
 启动一个磁盘模式单机节点：
 
 ```bash
@@ -147,6 +175,18 @@ VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608 \
 VT_MAX_REQUEST_BODY_BYTES=8388608 \
 VT_API_CONCURRENCY_LIMIT=1024 \
 target/release/vtapi
+```
+
+Apple Silicon benchmark 场景下，启动命令也要改成：
+
+```bash
+VT_STORAGE_MODE=disk \
+VT_STORAGE_PATH=./var/vt-single \
+VT_STORAGE_SYNC_POLICY=data \
+VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=8388608 \
+VT_MAX_REQUEST_BODY_BYTES=8388608 \
+VT_API_CONCURRENCY_LIMIT=1024 \
+target/aarch64-apple-darwin/release/vtapi
 ```
 
 ## 5 分钟接入和使用
@@ -398,6 +438,11 @@ cargo run -p vtapi
 - `VT_STORAGE_SYNC_POLICY`
   - `none` 或 `data`
   - `data` 会在关键写入路径上调用 `sync_data`
+- `VT_TRACE_INGEST_PROFILE`
+  - `default` 或 `throughput`
+  - `throughput` 会让 trace ingest 走吞吐优先路径，适合 benchmark；默认值会保留更强的 runtime responsiveness 语义
+  - 在 `VT_STORAGE_SYNC_POLICY=none` 下，`throughput` profile 还会默认使用更大的 trace segment 轮转阈值；如果你显式设置了 `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES`，会优先尊重你的配置
+  - 当它和 `VT_STORAGE_SYNC_POLICY=none` 组合使用时，acked trace 的 crash-loss window 会比默认 profile 更大
 - `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES`
   - 活动 segment 轮转阈值
 - `VT_MAX_REQUEST_BODY_BYTES`
@@ -518,6 +563,18 @@ cargo run -p vtbench -- storage-ingest --rows=1000 --batch-size=100 --duration-s
 cargo run -p vtbench -- storage-ingest --rows=1000 --batch-size=100 --duration-secs=30 --warmup-secs=5 --report-file=./var/bench-storage-ingest.json
 ```
 
+把优化轮次变成显式 pass/fail gate：
+
+```bash
+target/aarch64-apple-darwin/release/vtbench compare \
+  --baseline-file=./docs/benchmarks/baselines/storage-ingest-mainline.json \
+  --candidate-file=./var/bench-storage-ingest.json \
+  --min-throughput-ratio=0.97 \
+  --max-p99-ratio=1.10
+```
+
+`compare` 会检查 benchmark shape metadata 是否一致，并在 throughput / `p99` 超出噪声预算时直接返回非零退出码。
+
 带时间序列和故障窗口：
 
 ```bash
@@ -537,6 +594,12 @@ cargo run -p vtbench -- http-ingest --requests=40 --spans-per-request=2 --concur
 ### 生产部署建议
 
 - 用至少 `3` 个 `storage` 节点，`insert` / `select` 各自多实例并放在负载均衡后面，再按副本数设置 `write_quorum` / `read_quorum`
+- 生产拓扑可以直接沿用 VictoriaTraces 的角色心智：
+  - `storage` 负责磁盘落盘
+  - `insert` 负责外部写入和 fan-out
+  - `select` 负责外部查询和治理面
+- 如果你要平滑迁移，优先保持现有的数据盘挂载点和角色划分，只把进程入口映射成 `VT_ROLE=storage|insert|select`
+- 数据目录用 `VT_STORAGE_PATH` 固定到原有存储卷；日志目前走标准输出 / 标准错误，用 `RUST_LOG` 控制级别，再交给 systemd / 容器平台 / 日志采集系统接管
 - 对外发布前先用 `vtbench`、真实流量回放和故障演练产出吞吐、P99、节点失效恢复和证书轮换报告
 - 证书签发、自动轮换和密钥托管建议交给外部 PKI / Secret 平台；本服务负责无重启接管文件更新
 - 如果要把单机吞吐推到目标上限，优先调 `VT_API_CONCURRENCY_LIMIT`、segment 大小、磁盘 sync 策略、拓扑放置和副本数
