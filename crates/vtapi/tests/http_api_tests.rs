@@ -3244,6 +3244,288 @@ async fn jaeger_trace_lookup_returns_not_found_envelope_for_missing_trace() {
 }
 
 #[tokio::test]
+async fn official_victoria_traces_insert_path_accepts_standard_otlp_json() {
+    let app = build_router(MemoryStorageEngine::new());
+
+    let ingest_payload = json!({
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "checkout" } },
+                        { "key": "deployment.environment", "value": { "stringValue": "prod" } }
+                    ]
+                },
+                "scopeSpans": [
+                    {
+                        "scope": {
+                            "name": "wtrace-legacy-migration",
+                            "version": "1.0.0"
+                        },
+                        "spans": [
+                            {
+                                "traceId": "1234567890abcdef1234567890abcdef",
+                                "spanId": "0123456789abcdef",
+                                "parentSpanId": "",
+                                "name": "GET /checkout",
+                                "kind": 2,
+                                "startTimeUnixNano": "100000",
+                                "endTimeUnixNano": "180000",
+                                "attributes": [
+                                    { "key": "http.method", "value": { "stringValue": "GET" } },
+                                    { "key": "http.status_code", "value": { "intValue": "200" } },
+                                    { "key": "cache.hit", "value": { "boolValue": true } }
+                                ],
+                                "events": [
+                                    {
+                                        "name": "annotation",
+                                        "timeUnixNano": "140000",
+                                        "attributes": [
+                                            { "key": "annotation.present", "value": { "boolValue": true } }
+                                        ]
+                                    }
+                                ],
+                                "status": { "code": 1 }
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    });
+
+    let ingest_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/insert/opentelemetry/v1/traces")
+                .header("content-type", "application/json")
+                .body(Body::from(ingest_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("official insert request should succeed");
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    let trace_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/traces/1234567890abcdef1234567890abcdef")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("trace lookup should succeed");
+    assert_eq!(trace_response.status(), StatusCode::OK);
+
+    let trace_body = axum::body::to_bytes(trace_response.into_body(), usize::MAX)
+        .await
+        .expect("trace body");
+    let trace: Value = serde_json::from_slice(&trace_body).expect("trace json");
+    assert_eq!(
+        trace["resource_spans"][0]["resource_attributes"][0]["key"],
+        "deployment.environment"
+    );
+    assert_eq!(
+        trace["resource_spans"][0]["scope_spans"][0]["spans"][0]["trace_id"],
+        "1234567890abcdef1234567890abcdef"
+    );
+    assert_eq!(
+        trace["resource_spans"][0]["scope_spans"][0]["spans"][0]["attributes"][0]["key"],
+        "cache.hit"
+    );
+}
+
+#[tokio::test]
+async fn jaeger_trace_search_supports_tags_and_duration_filters() {
+    let app = build_router(MemoryStorageEngine::new());
+
+    let ingest_payload = json!({
+        "resource_spans": [
+            {
+                "resource_attributes": [
+                    { "key": "service.name", "value": { "kind": "string", "value": "checkout" } }
+                ],
+                "scope_spans": [
+                    {
+                        "scope_name": null,
+                        "scope_version": null,
+                        "scope_attributes": [],
+                        "spans": [
+                            {
+                                "trace_id": "trace-jaeger-filter-1",
+                                "span_id": "span-jaeger-filter-1",
+                                "parent_span_id": null,
+                                "name": "GET /checkout",
+                                "start_time_unix_nano": 100000,
+                                "end_time_unix_nano": 180000,
+                                "attributes": [
+                                    { "key": "http.method", "value": { "kind": "string", "value": "GET" } }
+                                ],
+                                "status": null
+                            },
+                            {
+                                "trace_id": "trace-jaeger-filter-2",
+                                "span_id": "span-jaeger-filter-2",
+                                "parent_span_id": null,
+                                "name": "GET /checkout",
+                                "start_time_unix_nano": 100000,
+                                "end_time_unix_nano": 260000,
+                                "attributes": [
+                                    { "key": "http.method", "value": { "kind": "string", "value": "GET" } }
+                                ],
+                                "status": null
+                            },
+                            {
+                                "trace_id": "trace-jaeger-filter-3",
+                                "span_id": "span-jaeger-filter-3",
+                                "parent_span_id": null,
+                                "name": "GET /checkout",
+                                "start_time_unix_nano": 100000,
+                                "end_time_unix_nano": 180000,
+                                "attributes": [
+                                    { "key": "http.method", "value": { "kind": "string", "value": "POST" } }
+                                ],
+                                "status": null
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    });
+
+    let ingest_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/traces/ingest")
+                .header("content-type", "application/json")
+                .body(Body::from(ingest_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("ingest request should succeed");
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/select/jaeger/api/traces?service=checkout&tags=%7B%22http.method%22%3A%22GET%22%7D&minDuration=50us&maxDuration=90us&limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("jaeger traces request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("search body");
+    let decoded: Value = serde_json::from_slice(&body).expect("search json");
+    assert_eq!(decoded["total"], 1);
+    assert_eq!(
+        decoded["data"][0]["traceID"],
+        "trace-jaeger-filter-1"
+    );
+}
+
+#[tokio::test]
+async fn jaeger_dependencies_endpoint_returns_service_edges() {
+    let app = build_router(MemoryStorageEngine::new());
+
+    let ingest_payload = json!({
+        "resource_spans": [
+            {
+                "resource_attributes": [
+                    { "key": "service.name", "value": { "kind": "string", "value": "frontend" } }
+                ],
+                "scope_spans": [
+                    {
+                        "scope_name": null,
+                        "scope_version": null,
+                        "scope_attributes": [],
+                        "spans": [
+                            {
+                                "trace_id": "trace-jaeger-deps-1",
+                                "span_id": "span-root",
+                                "parent_span_id": null,
+                                "name": "GET /",
+                                "start_time_unix_nano": 1_000_000,
+                                "end_time_unix_nano": 2_000_000,
+                                "attributes": [],
+                                "status": null
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "resource_attributes": [
+                    { "key": "service.name", "value": { "kind": "string", "value": "checkout" } }
+                ],
+                "scope_spans": [
+                    {
+                        "scope_name": null,
+                        "scope_version": null,
+                        "scope_attributes": [],
+                        "spans": [
+                            {
+                                "trace_id": "trace-jaeger-deps-1",
+                                "span_id": "span-child",
+                                "parent_span_id": "span-root",
+                                "name": "POST /checkout",
+                                "start_time_unix_nano": 1_200_000,
+                                "end_time_unix_nano": 1_800_000,
+                                "attributes": [],
+                                "status": null
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    });
+
+    let ingest_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/traces/ingest")
+                .header("content-type", "application/json")
+                .body(Body::from(ingest_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("ingest request should succeed");
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/select/jaeger/api/dependencies?endTs=2000&lookback=10000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("jaeger dependencies request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("dependencies body");
+    let decoded: Value = serde_json::from_slice(&body).expect("dependencies json");
+    assert_eq!(decoded.as_array().unwrap().len(), 1);
+    assert_eq!(decoded[0]["parent"], "frontend");
+    assert_eq!(decoded[0]["child"], "checkout");
+    assert_eq!(decoded[0]["callCount"], 1);
+}
+
+#[tokio::test]
 async fn tls_server_accepts_https_requests() {
     let materials = generate_tls_materials();
     let tls_config = ServerTlsConfig::from_pem(

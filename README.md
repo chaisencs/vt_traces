@@ -258,7 +258,11 @@ curl http://127.0.0.1:13000/api/v1/services
 如果你已经在用 OpenTelemetry SDK 或 Collector，也可以直接把 trace export 指向：
 
 - OTLP/HTTP traces：`POST /v1/traces`
+- VictoriaTraces 兼容 OTLP/HTTP traces：`POST /insert/opentelemetry/v1/traces`
 - OTLP/gRPC traces：`POST /opentelemetry.proto.collector.trace.v1.TraceService/Export`
+
+如果你在迁移现有 VictoriaTraces / wtrace sender，`POST /insert/opentelemetry/v1/traces` 也接受标准 OTLP JSON 结构
+（`resourceSpans` / `scopeSpans` / `traceId` / `stringValue` 这类 camelCase 字段），上游可以只改 URL，不需要把 payload 改成仓库内部的 snake_case 变体。
 
 ## 正式发布与生产可用性
 
@@ -277,12 +281,15 @@ curl http://127.0.0.1:13000/api/v1/services
 ### 接入与查询
 
 - 标准 OTLP/HTTP traces：`POST /v1/traces`
+- VictoriaTraces 兼容 OTLP/HTTP traces：`POST /insert/opentelemetry/v1/traces`
 - 标准 OTLP/HTTP logs：`POST /v1/logs`
 - 标准 OTLP/gRPC unary traces：`POST /opentelemetry.proto.collector.trace.v1.TraceService/Export`
 - 标准 OTLP/gRPC unary logs：`POST /opentelemetry.proto.collector.logs.v1.LogsService/Export`
 - `application/json` 和 `application/x-protobuf` 两种 OTLP/HTTP 负载
+- 标准 OTLP JSON camelCase 和仓库内部 snake_case 两种 JSON 结构
 - trace 查询、service 列表、trace 搜索、logs 搜索
-- Jaeger 兼容 services / operations / traces
+- Jaeger 兼容 services / operations / traces / dependencies
+- Jaeger trace search 兼容 `service` / `operation` / `tags` / `minDuration` / `maxDuration`
 - Tempo 兼容 trace / search / tags / tag values
 
 ### 存储与可见性
@@ -499,6 +506,8 @@ cargo run -p vtapi
   - 支持 JSON 和 protobuf OTLP/HTTP
 - `POST /v1/traces`
   - 支持 JSON 和 protobuf OTLP/HTTP
+- `POST /insert/opentelemetry/v1/traces`
+  - VictoriaTraces 兼容 ingest path，支持标准 OTLP JSON camelCase 和 protobuf OTLP/HTTP
 - `POST /opentelemetry.proto.collector.logs.v1.LogsService/Export`
   - 支持 OTLP/gRPC unary protobuf
 - `POST /opentelemetry.proto.collector.trace.v1.TraceService/Export`
@@ -514,6 +523,7 @@ cargo run -p vtapi
 - `GET /select/jaeger/api/services/:service_name/operations`
 - `GET /select/jaeger/api/traces`
 - `GET /select/jaeger/api/traces/:trace_id`
+- `GET /select/jaeger/api/dependencies`
 
 仅 select 角色：
 

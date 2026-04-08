@@ -172,6 +172,13 @@ If you are migrating from VictoriaTraces, keep the same deployment mental model:
 - `insert` receives external writes and fans them out to the storage set
 - `select` serves external queries and cluster governance
 
+Compatibility endpoints for smooth migration:
+
+- writers may keep the VictoriaTraces-style OTLP/HTTP path: `POST /insert/opentelemetry/v1/traces`
+- that path accepts standard OTLP JSON camelCase payloads as well as OTLP protobuf
+- Grafana Jaeger data sources may point at `http://<select-host>:<port>/select/jaeger`
+- Jaeger query compatibility covers services, operations, trace lookup, trace search, and `dependencies`
+
 That means the smoothest production path is usually:
 
 1. keep your existing data volume conventions and mount the new storage path with `VT_STORAGE_PATH`

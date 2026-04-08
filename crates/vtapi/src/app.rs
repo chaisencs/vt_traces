@@ -30,8 +30,9 @@ use vtcore::{
 };
 use vtingest::{
     decode_export_logs_service_request_protobuf, decode_trace_block_protobuf,
-    decode_trace_blocks_protobuf_sharded, decode_trace_rows_protobuf,
-    encode_export_trace_service_request_protobuf, export_request_from_rows,
+    decode_trace_blocks_protobuf_sharded, decode_trace_rows_protobuf, AttributeValue, KeyValue,
+    ResourceSpans, ScopeSpans, SpanRecord,
+    Status as OtlpStatus, encode_export_trace_service_request_protobuf, export_request_from_rows,
     flatten_export_logs_request, flatten_export_request, ExportLogsServiceRequest,
     ExportTraceServiceRequest,
 };
@@ -41,6 +42,7 @@ use vtstorage::{MemoryStorageEngine, StorageEngine, StorageError, StorageStatsSn
 use crate::{cluster::ClusterConfig, http_client::ClusterHttpClient};
 
 const MAX_JAEGER_LIMIT: usize = 1_000;
+const DEFAULT_JAEGER_DEPENDENCIES_LOOKBACK_MILLIS: i64 = 60 * 60 * 1000;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_CONCURRENCY_LIMIT: usize = 1_024;
 const INTERNAL_TRACE_ROWS_CONTENT_TYPE: &str = "application/x-vt-row-batch";
@@ -948,9 +950,21 @@ struct ControlJournalQuery {
 struct JaegerTraceQuery {
     service: Option<String>,
     operation: Option<String>,
+    tags: Option<String>,
+    #[serde(rename = "minDuration")]
+    min_duration: Option<String>,
+    #[serde(rename = "maxDuration")]
+    max_duration: Option<String>,
     start: Option<i64>,
     end: Option<i64>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct JaegerDependenciesQuery {
+    #[serde(rename = "endTs")]
+    end_ts: Option<i64>,
+    lookback: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -975,6 +989,14 @@ struct JaegerResponse<T> {
     limit: usize,
     offset: usize,
     total: usize,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct JaegerDependencyLink {
+    parent: String,
+    child: String,
+    #[serde(rename = "callCount")]
+    call_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1196,6 +1218,10 @@ pub fn build_router_with_storage_auth_limits_and_trace_ingest_profile(
                     .route("/v1/logs", post(ingest_logs_local))
                     .route("/v1/traces", post(ingest_traces_local))
                     .route(
+                        "/insert/opentelemetry/v1/traces",
+                        post(ingest_traces_local),
+                    )
+                    .route(
                         "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
                         post(ingest_logs_grpc_local),
                     )
@@ -1226,6 +1252,10 @@ pub fn build_router_with_storage_auth_limits_and_trace_ingest_profile(
                         get(list_operations_jaeger_local),
                     )
                     .route("/select/jaeger/api/traces", get(search_traces_jaeger_local))
+                    .route(
+                        "/select/jaeger/api/dependencies",
+                        get(get_jaeger_dependencies_local),
+                    )
                     .route(
                         "/select/jaeger/api/traces/:trace_id",
                         get(get_trace_jaeger_local),
@@ -1325,6 +1355,10 @@ pub fn build_insert_router_with_client_auth_and_limits(
                     .route("/v1/logs", post(ingest_logs_cluster))
                     .route("/v1/traces", post(ingest_traces_cluster))
                     .route(
+                        "/insert/opentelemetry/v1/traces",
+                        post(ingest_traces_cluster),
+                    )
+                    .route(
                         "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
                         post(ingest_logs_grpc_cluster),
                     )
@@ -1404,6 +1438,10 @@ pub fn build_select_router_with_client_auth_and_limits(
                     .route(
                         "/select/jaeger/api/traces",
                         get(search_traces_jaeger_cluster),
+                    )
+                    .route(
+                        "/select/jaeger/api/dependencies",
+                        get(get_jaeger_dependencies_cluster),
                     )
                     .route(
                         "/select/jaeger/api/traces/:trace_id",
@@ -2865,6 +2903,31 @@ async fn search_traces_jaeger_cluster(
     Ok(Json(jaeger_success_response(traces)))
 }
 
+async fn get_jaeger_dependencies_local(
+    State(state): State<Arc<StorageState>>,
+    Query(query): Query<JaegerDependenciesQuery>,
+) -> Result<Json<Vec<JaegerDependencyLink>>, (StatusCode, Json<ErrorResponse>)> {
+    let request = query.trace_search_request();
+    let traces = state
+        .query
+        .search_traces(&request)
+        .into_iter()
+        .map(|hit| state.query.get_trace(&hit.trace_id));
+    Ok(Json(build_jaeger_dependencies(traces)))
+}
+
+async fn get_jaeger_dependencies_cluster(
+    State(state): State<Arc<SelectState>>,
+    Query(query): Query<JaegerDependenciesQuery>,
+) -> Result<Json<Vec<JaegerDependencyLink>>, (StatusCode, Json<ErrorResponse>)> {
+    let hits = gather_trace_hits_cluster(state.as_ref(), &query.search_query()).await?;
+    let mut traces = Vec::with_capacity(hits.len());
+    for hit in hits {
+        traces.push(fetch_trace_rows_cluster(state.as_ref(), &hit.trace_id).await?);
+    }
+    Ok(Json(build_jaeger_dependencies(traces)))
+}
+
 async fn storage_metrics(
     State(state): State<Arc<StorageState>>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
@@ -3645,13 +3708,24 @@ fn search_jaeger_traces_local(
 ) -> Result<Vec<JaegerTrace>, (StatusCode, Json<ErrorResponse>)> {
     let service_name = jaeger_query.required_service_name()?;
     let requested_limit = jaeger_query.checked_limit()?;
-    let search_request = jaeger_query.trace_search_request(service_name.clone(), requested_limit);
+    let tag_filters = jaeger_query.parsed_tag_filters()?;
+    let min_duration_nanos = jaeger_query.min_duration_nanos()?;
+    let max_duration_nanos = jaeger_query.max_duration_nanos()?;
+    let search_request =
+        jaeger_query.trace_search_request(service_name.clone(), requested_limit, &tag_filters)?;
     let hits = query.search_traces(&search_request);
 
     let mut traces = Vec::new();
     for hit in hits {
         let rows = query.get_trace(&hit.trace_id);
-        if !trace_matches_jaeger_query(&rows, &service_name, jaeger_query.operation.as_deref()) {
+        if !trace_matches_jaeger_query(
+            &rows,
+            &service_name,
+            jaeger_query.operation.as_deref(),
+            &tag_filters,
+            min_duration_nanos,
+            max_duration_nanos,
+        ) {
             continue;
         }
         if let Some(trace) = build_jaeger_trace(rows) {
@@ -3671,13 +3745,24 @@ async fn search_jaeger_traces_cluster(
 ) -> Result<Vec<JaegerTrace>, (StatusCode, Json<ErrorResponse>)> {
     let service_name = jaeger_query.required_service_name()?;
     let requested_limit = jaeger_query.checked_limit()?;
-    let search_query = jaeger_query.search_query(service_name.clone(), requested_limit);
+    let tag_filters = jaeger_query.parsed_tag_filters()?;
+    let min_duration_nanos = jaeger_query.min_duration_nanos()?;
+    let max_duration_nanos = jaeger_query.max_duration_nanos()?;
+    let search_query =
+        jaeger_query.search_query(service_name.clone(), requested_limit, &tag_filters)?;
     let hits = gather_trace_hits_cluster(state, &search_query).await?;
 
     let mut traces = Vec::new();
     for hit in hits {
         let rows = fetch_trace_rows_cluster(state, &hit.trace_id).await?;
-        if !trace_matches_jaeger_query(&rows, &service_name, jaeger_query.operation.as_deref()) {
+        if !trace_matches_jaeger_query(
+            &rows,
+            &service_name,
+            jaeger_query.operation.as_deref(),
+            &tag_filters,
+            min_duration_nanos,
+            max_duration_nanos,
+        ) {
             continue;
         }
         if let Some(trace) = build_jaeger_trace(rows) {
@@ -3695,13 +3780,85 @@ fn trace_matches_jaeger_query(
     rows: &[TraceSpanRow],
     service_name: &str,
     operation_name: Option<&str>,
+    tag_filters: &[(String, String)],
+    min_duration_nanos: Option<i64>,
+    max_duration_nanos: Option<i64>,
 ) -> bool {
     rows.iter().any(|row| {
         row.service_name() == Some(service_name)
             && operation_name
                 .map(|operation| row.name == operation)
                 .unwrap_or(true)
+            && row_matches_jaeger_tags(row, tag_filters)
+            && min_duration_nanos
+                .map(|minimum| row.duration_nanos() >= minimum)
+                .unwrap_or(true)
+            && max_duration_nanos
+                .map(|maximum| row.duration_nanos() <= maximum)
+                .unwrap_or(true)
     })
+}
+
+fn row_matches_jaeger_tags(row: &TraceSpanRow, tag_filters: &[(String, String)]) -> bool {
+    tag_filters.iter().all(|(field_name, expected)| match field_name.as_str() {
+        "name" => row.name == *expected,
+        "duration" => row.duration_nanos().to_string() == *expected,
+        _ => row
+            .field_value(field_name)
+            .as_deref()
+            .map(|actual| actual == expected.as_str())
+            .unwrap_or(false),
+    })
+}
+
+fn build_jaeger_dependencies(
+    traces: impl IntoIterator<Item = Vec<TraceSpanRow>>,
+) -> Vec<JaegerDependencyLink> {
+    let mut calls_by_edge: HashMap<(String, String), u64> = HashMap::new();
+
+    for rows in traces {
+        let mut service_by_span_id = HashMap::new();
+        for row in &rows {
+            if let Some(service_name) = row.service_name() {
+                service_by_span_id.insert(row.span_id.clone(), service_name.to_string());
+            }
+        }
+
+        for row in &rows {
+            let Some(child_service) = row.service_name() else {
+                continue;
+            };
+            let Some(parent_span_id) = row.parent_span_id.as_deref().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let Some(parent_service) = service_by_span_id.get(parent_span_id) else {
+                continue;
+            };
+            if parent_service == child_service {
+                continue;
+            }
+            *calls_by_edge
+                .entry((parent_service.clone(), child_service.to_string()))
+                .or_default() += 1;
+        }
+    }
+
+    let mut dependencies: Vec<_> = calls_by_edge
+        .into_iter()
+        .map(|((parent, child), call_count)| JaegerDependencyLink {
+            parent,
+            child,
+            call_count,
+        })
+        .collect();
+    dependencies.sort_by(|left, right| {
+        right
+            .call_count
+            .cmp(&left.call_count)
+            .then_with(|| left.parent.cmp(&right.parent))
+            .then_with(|| left.child.cmp(&right.child))
+    });
+    dependencies
 }
 
 fn build_jaeger_trace(rows: Vec<TraceSpanRow>) -> Option<JaegerTrace> {
@@ -4501,6 +4658,217 @@ fn render_cluster_metrics(
         + "\n"
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StandardOtlpTraceRequest {
+    #[serde(default)]
+    resource_spans: Vec<StandardOtlpResourceSpans>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StandardOtlpResourceSpans {
+    #[serde(default)]
+    resource_attributes: Vec<StandardOtlpKeyValue>,
+    resource: Option<StandardOtlpResource>,
+    #[serde(default)]
+    scope_spans: Vec<StandardOtlpScopeSpans>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StandardOtlpResource {
+    #[serde(default)]
+    attributes: Vec<StandardOtlpKeyValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StandardOtlpScopeSpans {
+    scope_name: Option<String>,
+    scope_version: Option<String>,
+    #[serde(default)]
+    scope_attributes: Vec<StandardOtlpKeyValue>,
+    scope: Option<StandardOtlpScope>,
+    #[serde(default)]
+    spans: Vec<StandardOtlpSpanRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StandardOtlpScope {
+    name: Option<String>,
+    version: Option<String>,
+    #[serde(default)]
+    attributes: Vec<StandardOtlpKeyValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StandardOtlpSpanRecord {
+    trace_id: String,
+    span_id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_empty_as_none")]
+    parent_span_id: Option<String>,
+    name: String,
+    #[serde(deserialize_with = "deserialize_i64_from_string_or_number")]
+    start_time_unix_nano: i64,
+    #[serde(deserialize_with = "deserialize_i64_from_string_or_number")]
+    end_time_unix_nano: i64,
+    #[serde(default)]
+    attributes: Vec<StandardOtlpKeyValue>,
+    #[serde(default)]
+    status: Option<StandardOtlpStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StandardOtlpStatus {
+    code: i32,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StandardOtlpKeyValue {
+    key: String,
+    value: StandardOtlpAnyValue,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StandardOtlpAnyValue {
+    string_value: Option<String>,
+    bool_value: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64_from_string_or_number")]
+    int_value: Option<i64>,
+    double_value: Option<f64>,
+    bytes_value: Option<String>,
+    array_value: Option<serde_json::Value>,
+    kvlist_value: Option<serde_json::Value>,
+}
+
+impl StandardOtlpTraceRequest {
+    fn into_internal(self) -> ExportTraceServiceRequest {
+        ExportTraceServiceRequest {
+            resource_spans: self
+                .resource_spans
+                .into_iter()
+                .map(StandardOtlpResourceSpans::into_internal)
+                .collect(),
+        }
+    }
+}
+
+impl StandardOtlpResourceSpans {
+    fn into_internal(self) -> ResourceSpans {
+        let mut resource_attributes = self.resource_attributes;
+        if let Some(resource) = self.resource {
+            resource_attributes.extend(resource.attributes);
+        }
+
+        ResourceSpans {
+            resource_attributes: resource_attributes
+                .into_iter()
+                .map(StandardOtlpKeyValue::into_internal)
+                .collect(),
+            scope_spans: self
+                .scope_spans
+                .into_iter()
+                .map(StandardOtlpScopeSpans::into_internal)
+                .collect(),
+        }
+    }
+}
+
+impl StandardOtlpScopeSpans {
+    fn into_internal(self) -> ScopeSpans {
+        let mut scope_attributes = self.scope_attributes;
+        let mut scope_name = self.scope_name;
+        let mut scope_version = self.scope_version;
+        if let Some(scope) = self.scope {
+            if scope_name.is_none() {
+                scope_name = scope.name;
+            }
+            if scope_version.is_none() {
+                scope_version = scope.version;
+            }
+            scope_attributes.extend(scope.attributes);
+        }
+
+        ScopeSpans {
+            scope_name,
+            scope_version,
+            scope_attributes: scope_attributes
+                .into_iter()
+                .map(StandardOtlpKeyValue::into_internal)
+                .collect(),
+            spans: self
+                .spans
+                .into_iter()
+                .map(StandardOtlpSpanRecord::into_internal)
+                .collect(),
+        }
+    }
+}
+
+impl StandardOtlpSpanRecord {
+    fn into_internal(self) -> SpanRecord {
+        SpanRecord {
+            trace_id: self.trace_id,
+            span_id: self.span_id,
+            parent_span_id: self.parent_span_id,
+            name: self.name,
+            start_time_unix_nano: self.start_time_unix_nano,
+            end_time_unix_nano: self.end_time_unix_nano,
+            attributes: self
+                .attributes
+                .into_iter()
+                .map(StandardOtlpKeyValue::into_internal)
+                .collect(),
+            status: self.status.map(StandardOtlpStatus::into_internal),
+        }
+    }
+}
+
+impl StandardOtlpStatus {
+    fn into_internal(self) -> OtlpStatus {
+        OtlpStatus {
+            code: self.code,
+            message: self.message.unwrap_or_default(),
+        }
+    }
+}
+
+impl StandardOtlpKeyValue {
+    fn into_internal(self) -> KeyValue {
+        KeyValue::new(self.key, self.value.into_internal())
+    }
+}
+
+impl StandardOtlpAnyValue {
+    fn into_internal(self) -> AttributeValue {
+        if let Some(value) = self.string_value {
+            return AttributeValue::String(value);
+        }
+        if let Some(value) = self.bool_value {
+            return AttributeValue::Bool(value);
+        }
+        if let Some(value) = self.int_value {
+            return AttributeValue::I64(value);
+        }
+        if let Some(value) = self.double_value {
+            return AttributeValue::F64(value);
+        }
+        if let Some(value) = self.bytes_value {
+            return AttributeValue::String(value);
+        }
+        if let Some(value) = self.array_value {
+            return AttributeValue::String(value.to_string());
+        }
+        if let Some(value) = self.kvlist_value {
+            return AttributeValue::String(value.to_string());
+        }
+        AttributeValue::String(String::new())
+    }
+}
+
 fn bad_request(error: impl ToString) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::BAD_REQUEST,
@@ -4544,8 +4912,7 @@ fn decode_otlp_http_trace_rows(
     if is_otlp_protobuf_request(headers) {
         decode_trace_rows_protobuf(body).map_err(|error| error.to_string())
     } else {
-        let request: ExportTraceServiceRequest =
-            serde_json::from_slice(body).map_err(|error| error.to_string())?;
+        let request = decode_otlp_http_trace_request_json(body)?;
         flatten_export_request(&request).map_err(|error| error.to_string())
     }
 }
@@ -4554,8 +4921,7 @@ fn decode_otlp_http_trace_block(headers: &HeaderMap, body: &[u8]) -> Result<Trac
     if is_otlp_protobuf_request(headers) {
         decode_trace_block_protobuf(body).map_err(|error| error.to_string())
     } else {
-        let request: ExportTraceServiceRequest =
-            serde_json::from_slice(body).map_err(|error| error.to_string())?;
+        let request = decode_otlp_http_trace_request_json(body)?;
         let rows = flatten_export_request(&request).map_err(|error| error.to_string())?;
         Ok(TraceBlock::from_rows(rows))
     }
@@ -4586,6 +4952,19 @@ fn decode_otlp_http_logs_request(
         decode_export_logs_service_request_protobuf(body).map_err(|error| error.to_string())
     } else {
         serde_json::from_slice(body).map_err(|error| error.to_string())
+    }
+}
+
+fn decode_otlp_http_trace_request_json(body: &[u8]) -> Result<ExportTraceServiceRequest, String> {
+    match serde_json::from_slice::<ExportTraceServiceRequest>(body) {
+        Ok(request) => Ok(request),
+        Err(primary_error) => serde_json::from_slice::<StandardOtlpTraceRequest>(body)
+            .map(StandardOtlpTraceRequest::into_internal)
+            .map_err(|compat_error| {
+                format!(
+                    "failed to decode OTLP JSON as internal or standard format: primary={primary_error}; compat={compat_error}"
+                )
+            }),
     }
 }
 
@@ -4924,6 +5303,53 @@ where
     )
 }
 
+fn deserialize_i64_from_string_or_number<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    parse_json_i64_value(value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_i64_from_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    value
+        .map(parse_json_i64_value)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_string_or_empty_as_none<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        }))
+}
+
+fn parse_json_i64_value(value: serde_json::Value) -> Result<i64, String> {
+    match value {
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .ok_or_else(|| "expected signed integer".to_string()),
+        serde_json::Value::String(value) => value
+            .trim()
+            .parse::<i64>()
+            .map_err(|error| format!("invalid integer value: {error}")),
+        other => Err(format!("unsupported integer value: {other}")),
+    }
+}
+
 fn parse_field_filter(value: &str) -> Result<FieldFilter, (StatusCode, Json<ErrorResponse>)> {
     let (name, value) = value
         .split_once('=')
@@ -4955,6 +5381,74 @@ fn parse_tempo_tags_filter(
         filters.push((name, expected.to_string()));
     }
     Ok(filters)
+}
+
+fn parse_jaeger_tags_filter(
+    value: Option<&str>,
+) -> Result<Vec<(String, String)>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+
+    let decoded: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(value).map_err(|error| bad_request(format!("invalid tags: {error}")))?;
+    decoded
+        .into_iter()
+        .map(|(name, value)| {
+            let normalized_value = match value {
+                serde_json::Value::String(value) => value,
+                serde_json::Value::Bool(value) => value.to_string(),
+                serde_json::Value::Number(value) => value.to_string(),
+                serde_json::Value::Null => {
+                    return Err(bad_request("invalid tags: null values are not supported"));
+                }
+                other => other.to_string(),
+            };
+            Ok((
+                internal_field_name_for_tempo_tag(&name),
+                normalized_value,
+            ))
+        })
+        .collect()
+}
+
+fn parse_jaeger_duration(value: &str) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(bad_request("invalid duration: empty value"));
+    }
+
+    let (number, multiplier) = if let Some(value) = trimmed.strip_suffix("ns") {
+        (value, 1_f64)
+    } else if let Some(value) = trimmed.strip_suffix("us") {
+        (value, 1_000_f64)
+    } else if let Some(value) = trimmed.strip_suffix("µs") {
+        (value, 1_000_f64)
+    } else if let Some(value) = trimmed.strip_suffix("ms") {
+        (value, 1_000_000_f64)
+    } else if let Some(value) = trimmed.strip_suffix('s') {
+        (value, 1_000_000_000_f64)
+    } else if let Some(value) = trimmed.strip_suffix('m') {
+        (value, 60_f64 * 1_000_000_000_f64)
+    } else if let Some(value) = trimmed.strip_suffix('h') {
+        (value, 60_f64 * 60_f64 * 1_000_000_000_f64)
+    } else {
+        (trimmed, 1_000_f64)
+    };
+
+    let numeric_value = number
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| bad_request(format!("invalid duration: {value}")))?;
+    if !numeric_value.is_finite() || numeric_value < 0.0 {
+        return Err(bad_request(format!("invalid duration: {value}")));
+    }
+
+    let duration = (numeric_value * multiplier).round();
+    if duration > i64::MAX as f64 {
+        return Err(bad_request(format!("invalid duration: {value}")));
+    }
+    Ok(duration as i64)
 }
 
 fn parse_simple_traceql_filters(
@@ -5118,30 +5612,64 @@ impl JaegerTraceQuery {
         Ok(limit)
     }
 
+    fn parsed_tag_filters(&self) -> Result<Vec<(String, String)>, (StatusCode, Json<ErrorResponse>)>
+    {
+        parse_jaeger_tags_filter(self.tags.as_deref())
+    }
+
+    fn min_duration_nanos(&self) -> Result<Option<i64>, (StatusCode, Json<ErrorResponse>)> {
+        self.min_duration
+            .as_deref()
+            .map(parse_jaeger_duration)
+            .transpose()
+    }
+
+    fn max_duration_nanos(&self) -> Result<Option<i64>, (StatusCode, Json<ErrorResponse>)> {
+        self.max_duration
+            .as_deref()
+            .map(parse_jaeger_duration)
+            .transpose()
+    }
+
     fn trace_search_request(
         &self,
         service_name: String,
         requested_limit: usize,
-    ) -> TraceSearchRequest {
-        TraceSearchRequest {
+        tag_filters: &[(String, String)],
+    ) -> Result<TraceSearchRequest, (StatusCode, Json<ErrorResponse>)> {
+        Ok(TraceSearchRequest {
             start_unix_nano: self.start_unix_nano(),
             end_unix_nano: self.end_unix_nano(),
             service_name: Some(service_name),
             operation_name: self.operation.clone(),
-            field_filters: Vec::new(),
+            field_filters: tag_filters
+                .iter()
+                .map(|(name, value)| FieldFilter {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
             limit: self.fetch_limit(requested_limit),
-        }
+        })
     }
 
-    fn search_query(&self, service_name: String, requested_limit: usize) -> SearchQuery {
-        SearchQuery {
+    fn search_query(
+        &self,
+        service_name: String,
+        requested_limit: usize,
+        tag_filters: &[(String, String)],
+    ) -> Result<SearchQuery, (StatusCode, Json<ErrorResponse>)> {
+        Ok(SearchQuery {
             start_unix_nano: self.start_unix_nano(),
             end_unix_nano: self.end_unix_nano(),
             service_name: Some(service_name),
             operation_name: self.operation.clone(),
-            field_filter: Vec::new(),
+            field_filter: tag_filters
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect(),
             limit: Some(self.fetch_limit(requested_limit)),
-        }
+        })
     }
 
     fn fetch_limit(&self, requested_limit: usize) -> usize {
@@ -5162,6 +5690,44 @@ impl JaegerTraceQuery {
         self.end
             .map(|value| value.saturating_mul(1_000))
             .unwrap_or(i64::MAX)
+    }
+}
+
+impl JaegerDependenciesQuery {
+    fn end_unix_nano(&self) -> i64 {
+        self.end_ts
+            .unwrap_or_else(|| system_time_to_unix_millis(SystemTime::now()).unwrap_or(0) as i64)
+            .saturating_mul(1_000_000)
+    }
+
+    fn start_unix_nano(&self) -> i64 {
+        self.end_unix_nano().saturating_sub(
+            self.lookback
+                .unwrap_or(DEFAULT_JAEGER_DEPENDENCIES_LOOKBACK_MILLIS)
+                .saturating_mul(1_000_000),
+        )
+    }
+
+    fn trace_search_request(&self) -> TraceSearchRequest {
+        TraceSearchRequest {
+            start_unix_nano: self.start_unix_nano(),
+            end_unix_nano: self.end_unix_nano(),
+            service_name: None,
+            operation_name: None,
+            field_filters: Vec::new(),
+            limit: usize::MAX,
+        }
+    }
+
+    fn search_query(&self) -> SearchQuery {
+        SearchQuery {
+            start_unix_nano: self.start_unix_nano(),
+            end_unix_nano: self.end_unix_nano(),
+            service_name: None,
+            operation_name: None,
+            field_filter: Vec::new(),
+            limit: Some(usize::MAX),
+        }
     }
 }
 
