@@ -3434,6 +3434,101 @@ async fn jaeger_trace_search_supports_tags_and_duration_filters() {
 }
 
 #[tokio::test]
+async fn jaeger_trace_search_overfetches_for_duration_filtered_matches() {
+    let app = build_router(MemoryStorageEngine::new());
+
+    let mut spans = Vec::new();
+    for index in 0..10 {
+        spans.push(json!({
+            "trace_id": format!("trace-jaeger-duration-slow-{index}"),
+            "span_id": format!("span-jaeger-duration-slow-{index}"),
+            "parent_span_id": null,
+            "name": "GET /checkout",
+            "start_time_unix_nano": 1_000_000 + index * 10_000,
+            "end_time_unix_nano": 1_250_000 + index * 10_000,
+            "attributes": [],
+            "status": null
+        }));
+    }
+    for index in 0..5 {
+        spans.push(json!({
+            "trace_id": format!("trace-jaeger-duration-fast-{index}"),
+            "span_id": format!("span-jaeger-duration-fast-{index}"),
+            "parent_span_id": null,
+            "name": "GET /checkout",
+            "start_time_unix_nano": 100_000 + index * 10_000,
+            "end_time_unix_nano": 180_000 + index * 10_000,
+            "attributes": [],
+            "status": null
+        }));
+    }
+
+    let ingest_payload = json!({
+        "resource_spans": [
+            {
+                "resource_attributes": [
+                    { "key": "service.name", "value": { "kind": "string", "value": "checkout" } }
+                ],
+                "scope_spans": [
+                    {
+                        "scope_name": null,
+                        "scope_version": null,
+                        "scope_attributes": [],
+                        "spans": spans
+                    }
+                ]
+            }
+        ]
+    });
+
+    let ingest_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/traces/ingest")
+                .header("content-type", "application/json")
+                .body(Body::from(ingest_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("ingest request should succeed");
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/select/jaeger/api/traces?service=checkout&minDuration=50us&maxDuration=100us&limit=5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("jaeger traces request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("search body");
+    let decoded: Value = serde_json::from_slice(&body).expect("search json");
+    assert_eq!(decoded["total"], 5);
+    let returned_trace_ids: std::collections::BTreeSet<_> = decoded["data"]
+        .as_array()
+        .expect("jaeger data array")
+        .iter()
+        .map(|trace| {
+            trace["traceID"]
+                .as_str()
+                .expect("traceID")
+                .to_string()
+        })
+        .collect();
+    let expected_trace_ids: std::collections::BTreeSet<_> = (0..5)
+        .map(|index| format!("trace-jaeger-duration-fast-{index}"))
+        .collect();
+    assert_eq!(returned_trace_ids, expected_trace_ids);
+}
+
+#[tokio::test]
 async fn jaeger_dependencies_endpoint_returns_service_edges() {
     let app = build_router(MemoryStorageEngine::new());
 

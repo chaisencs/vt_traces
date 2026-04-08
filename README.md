@@ -65,7 +65,7 @@ target/aarch64-apple-darwin/release/vtapi
 | release tier | 目标 | 必选配置 | 默认 segment 语义 | 适合场景 |
 | --- | --- | --- | --- | --- |
 | `stable` | durability / runtime stability first | `VT_TRACE_INGEST_PROFILE=default` + `VT_STORAGE_SYNC_POLICY=data` | 保持常规 segment 轮转阈值，默认 `8388608` | 先上生产、需要更稳 crash 语义和更保守运维行为 |
-| `throughput` | ingest throughput first | `VT_TRACE_INGEST_PROFILE=throughput` + `VT_STORAGE_SYNC_POLICY=none` | 在未显式设置 `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES` 时自动升到 `268435456` | benchmark、吞吐优先、能接受更大 acked crash-loss window 的场景 |
+| `throughput` | ingest throughput first | `VT_TRACE_INGEST_PROFILE=throughput` + `VT_STORAGE_SYNC_POLICY=none` | 在未显式设置 `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES` 时默认使用 `67108864`，`VT_STORAGE_TRACE_SEAL_WORKER_COUNT` 默认使用 `4` | benchmark、吞吐优先、能接受更大 acked crash-loss window 的场景 |
 
 `throughput` 不是“默认稳定版”，而是一个单独的高吞吐发布档。  
 如果你要先发 production，优先从 `stable` 开始；`throughput` 更适合 canary、回放验证和明确接受 crash-loss tradeoff 的集群。
@@ -448,8 +448,10 @@ cargo run -p vtapi
 - `VT_TRACE_INGEST_PROFILE`
   - `default` 或 `throughput`
   - `throughput` 会让 trace ingest 走吞吐优先路径，适合 benchmark；默认值会保留更强的 runtime responsiveness 语义
-  - 在 `VT_STORAGE_SYNC_POLICY=none` 下，`throughput` profile 还会默认使用更大的 trace segment 轮转阈值；如果你显式设置了 `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES`，会优先尊重你的配置
+  - 在 `VT_STORAGE_SYNC_POLICY=none` 下，`throughput` profile 默认会把 `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES` 收到 `67108864`，并把 `VT_STORAGE_TRACE_SEAL_WORKER_COUNT` 提到 `4`；如果你显式设置了这些值，会优先尊重你的配置
   - 当它和 `VT_STORAGE_SYNC_POLICY=none` 组合使用时，acked trace 的 crash-loss window 会比默认 profile 更大
+- `VT_STORAGE_TRACE_SEAL_WORKER_COUNT`
+  - trace segment seal 的后台 worker 数；`throughput + none` 下默认 `4`
 - `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES`
   - 活动 segment 轮转阈值
 - `VT_MAX_REQUEST_BODY_BYTES`

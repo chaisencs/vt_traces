@@ -91,7 +91,8 @@ For `throughput`, storage hosts must set all of these:
 
 - `VT_TRACE_INGEST_PROFILE=throughput`
 - `VT_STORAGE_SYNC_POLICY=none`
-- `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=268435456`
+- `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=67108864`
+- `VT_STORAGE_TRACE_SEAL_WORKER_COUNT=4`
 
 For all roles, fill in:
 
@@ -185,6 +186,7 @@ Rollback immediately if any of these happen:
 - query `5xx` or timeouts climb
 - `seal_queue_depth` keeps growing instead of settling
 - RSS keeps rising without stabilizing
+- storage restart takes abnormally long before its port starts listening again
 - smoke checks fail for `trace-by-id`, `search`, `services`, or `field-values`
 
 ## 8. Rollback

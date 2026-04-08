@@ -105,6 +105,7 @@ pub struct DiskStorageConfig {
     trace_group_commit_wait: Duration,
     trace_wal_writer_capacity_bytes: usize,
     trace_deferred_wal_writes: bool,
+    trace_seal_worker_count: usize,
     trace_live_update_apply_mode: TraceLiveUpdateApplyMode,
 }
 
@@ -118,6 +119,7 @@ impl Default for DiskStorageConfig {
             trace_group_commit_wait: DEFAULT_TRACE_GROUP_COMMIT_WAIT,
             trace_wal_writer_capacity_bytes: TRACE_WAL_WRITER_CAPACITY_BYTES,
             trace_deferred_wal_writes: false,
+            trace_seal_worker_count: 1,
             trace_live_update_apply_mode: TraceLiveUpdateApplyMode::default(),
         }
     }
@@ -159,6 +161,11 @@ impl DiskStorageConfig {
 
     pub fn with_trace_deferred_wal_writes(mut self, trace_deferred_wal_writes: bool) -> Self {
         self.trace_deferred_wal_writes = trace_deferred_wal_writes;
+        self
+    }
+
+    pub fn with_trace_seal_worker_count(mut self, trace_seal_worker_count: usize) -> Self {
+        self.trace_seal_worker_count = trace_seal_worker_count.max(1);
         self
     }
 }
@@ -357,8 +364,8 @@ struct DiskTraceLiveUpdateShared {
 }
 
 struct DiskTraceSealRuntime {
-    sender: mpsc::Sender<DiskTraceSealCommand>,
-    handle: Mutex<Option<thread::JoinHandle<()>>>,
+    senders: Vec<mpsc::Sender<DiskTraceSealCommand>>,
+    handles: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 enum DiskTraceLiveUpdateRuntime {
@@ -397,16 +404,25 @@ impl std::fmt::Debug for DiskTraceLiveUpdateRuntime {
 
 impl DiskTraceSealRuntime {
     fn spawn(shared: DiskTraceSealShared) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let handle = thread::spawn(move || run_trace_seal_worker(shared, receiver));
+        let worker_count = shared.config.trace_seal_worker_count.max(1);
+        let mut senders = Vec::with_capacity(worker_count);
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let (sender, receiver) = mpsc::channel();
+            let worker_shared = shared.clone();
+            let handle = thread::spawn(move || run_trace_seal_worker(worker_shared, receiver));
+            senders.push(sender);
+            handles.push(handle);
+        }
         Self {
-            sender,
-            handle: Mutex::new(Some(handle)),
+            senders,
+            handles: Mutex::new(handles),
         }
     }
 
     fn schedule(&self, snapshot: Arc<HeadSegmentSnapshot>) -> Result<(), StorageError> {
-        self.sender
+        let worker_index = snapshot.shard_index % self.senders.len().max(1);
+        self.senders[worker_index]
             .send(DiskTraceSealCommand::Seal(snapshot))
             .map_err(|error| {
                 StorageError::Message(format!("disk trace seal worker dropped: {error}"))
@@ -414,8 +430,10 @@ impl DiskTraceSealRuntime {
     }
 
     fn shutdown(&self) {
-        let _ = self.sender.send(DiskTraceSealCommand::Shutdown);
-        if let Some(handle) = self.handle.lock().take() {
+        for sender in &self.senders {
+            let _ = sender.send(DiskTraceSealCommand::Shutdown);
+        }
+        for handle in std::mem::take(&mut *self.handles.lock()) {
             let _ = handle.join();
         }
     }
@@ -1045,7 +1063,8 @@ impl DiskStorageEngine {
         fs::create_dir_all(&segments_path)?;
 
         let trace_shards = config.trace_shards.max(1);
-        let mut recovered = recover_state(&segments_path, trace_shards)?;
+        let mut recovered =
+            recover_state(&segments_path, trace_shards, config.trace_seal_worker_count)?;
         let log_path = root_path.join("logs.wal");
         let (log_state, log_persisted_bytes) = recover_log_state(&log_path)?;
         recovered.persisted_bytes += log_persisted_bytes;
@@ -1055,7 +1074,8 @@ impl DiskStorageEngine {
             &mut next_segment_id,
             compaction_target_segment_size_bytes(&config),
         )? {
-            let compacted = recover_state(&segments_path, trace_shards)?;
+            let compacted =
+                recover_state(&segments_path, trace_shards, config.trace_seal_worker_count)?;
             recovered = compacted;
             recovered.persisted_bytes += log_persisted_bytes;
             next_segment_id = next_segment_id.max(recovered.next_segment_id);
@@ -4006,6 +4026,7 @@ impl OptionalBoolColumn {
 fn recover_state(
     segments_path: &Path,
     trace_shards: usize,
+    recovery_seal_worker_count: usize,
 ) -> Result<RecoveredDiskState, StorageError> {
     let mut segment_files: HashMap<u64, SegmentFileSet> = HashMap::new();
 
@@ -4046,38 +4067,59 @@ fn recover_state(
         .map(|value| value + 1)
         .unwrap_or(1);
 
-    for segment_id in segment_ids {
+    let mut recovery_entries = Vec::with_capacity(segment_ids.len());
+    let mut recovery_seal_tasks = Vec::new();
+
+    for segment_id in segment_ids.iter().copied() {
         let files = segment_files
             .remove(&segment_id)
             .ok_or_else(|| invalid_data("missing segment file set during recovery"))?;
         let source_path = files
             .part_path
-            .or(files.wal_path)
-            .or(files.legacy_rows_path)
+            .clone()
+            .or_else(|| files.wal_path.clone())
+            .or_else(|| files.legacy_rows_path.clone())
             .ok_or_else(|| invalid_data("segment is missing data file"))?;
-        let part_path = if source_path.extension().and_then(|value| value.to_str()) == Some("part")
+        let part_path = segment_part_path(segments_path, segment_id);
+        let needs_seal = source_path != part_path;
+        if needs_seal {
+            recovery_seal_tasks.push(RecoverySealTask {
+                segment_id,
+                source_path,
+                part_path: part_path.clone(),
+            });
+        }
+        recovery_entries.push(RecoveryEntry {
+            segment_id,
+            part_path,
+            meta_path: files.meta_path,
+            needs_seal,
+        });
+    }
+
+    let recovery_seal_results =
+        seal_recovery_tasks(recovery_seal_tasks, recovery_seal_worker_count)?;
+
+    for entry in recovery_entries {
+        if entry.needs_seal
+            && recovery_seal_results
+                .get(&entry.segment_id)
+                .copied()
+                .unwrap_or_default()
+                == 0
         {
-            source_path
-        } else {
-            let part_path = segment_part_path(segments_path, segment_id);
-            if source_path != part_path {
-                let (_, sealed_bytes, _) =
-                    seal_rows_file_to_part(&source_path, &part_path, DiskSyncPolicy::None)?;
-                if sealed_bytes == 0 {
-                    continue;
-                }
-            }
-            part_path
-        };
-        let meta_path = files
+            continue;
+        }
+        let part_path = entry.part_path;
+        let meta_path = entry
             .meta_path
-            .unwrap_or_else(|| segment_meta_path(segments_path, segment_id));
+            .unwrap_or_else(|| segment_meta_path(segments_path, entry.segment_id));
 
         let mut meta = if meta_path.exists() {
             let file = File::open(&meta_path)?;
             serde_json::from_reader(file)?
         } else {
-            let meta = rebuild_segment_meta(segment_id, &part_path)?;
+            let meta = rebuild_segment_meta(entry.segment_id, &part_path)?;
             let _ = write_segment_meta(&meta_path, &meta, DiskSyncPolicy::None)?;
             meta
         };
@@ -4102,6 +4144,67 @@ fn recover_state(
 
     recovered.next_segment_id = next_segment_id;
     Ok(recovered)
+}
+
+#[derive(Debug)]
+struct RecoveryEntry {
+    segment_id: u64,
+    part_path: PathBuf,
+    meta_path: Option<PathBuf>,
+    needs_seal: bool,
+}
+
+#[derive(Debug)]
+struct RecoverySealTask {
+    segment_id: u64,
+    source_path: PathBuf,
+    part_path: PathBuf,
+}
+
+fn seal_recovery_tasks(
+    tasks: Vec<RecoverySealTask>,
+    recovery_seal_worker_count: usize,
+) -> Result<HashMap<u64, u64>, StorageError> {
+    if tasks.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let worker_count = recovery_seal_worker_count.clamp(1, tasks.len());
+    let mut task_buckets: Vec<Vec<RecoverySealTask>> =
+        (0..worker_count).map(|_| Vec::new()).collect();
+    for (task_index, task) in tasks.into_iter().enumerate() {
+        task_buckets[task_index % worker_count].push(task);
+    }
+
+    thread::scope(|scope| -> Result<HashMap<u64, u64>, StorageError> {
+        let mut handles = Vec::new();
+        for task_bucket in task_buckets.into_iter().filter(|bucket| !bucket.is_empty()) {
+            handles.push(scope.spawn(move || -> Result<Vec<(u64, u64)>, StorageError> {
+                let mut results = Vec::with_capacity(task_bucket.len());
+                for task in task_bucket {
+                    let (_, sealed_bytes, _) = seal_rows_file_to_part(
+                        &task.source_path,
+                        &task.part_path,
+                        DiskSyncPolicy::None,
+                    )?;
+                    results.push((task.segment_id, sealed_bytes));
+                }
+                Ok(results)
+            }));
+        }
+
+        let mut sealed_bytes_by_segment = HashMap::new();
+        for handle in handles {
+            let worker_results = handle
+                .join()
+                .map_err(|_| StorageError::Message("disk recovery worker panicked".to_string()))??;
+            for (segment_id, sealed_bytes) in worker_results {
+                sealed_bytes_by_segment.insert(segment_id, sealed_bytes);
+            }
+        }
+
+        Ok(sealed_bytes_by_segment)
+    })
 }
 
 fn recover_log_state(log_path: &Path) -> Result<(LogIndexedState, u64), StorageError> {
@@ -6424,6 +6527,15 @@ mod tests {
     fn disk_storage_config_can_defer_trace_wal_writes() {
         let config = DiskStorageConfig::default().with_trace_deferred_wal_writes(true);
         assert!(config.trace_deferred_wal_writes);
+    }
+
+    #[test]
+    fn disk_storage_config_allows_custom_trace_seal_worker_count() {
+        let config = DiskStorageConfig::default().with_trace_seal_worker_count(4);
+        assert_eq!(config.trace_seal_worker_count, 4);
+
+        let clamped = DiskStorageConfig::default().with_trace_seal_worker_count(0);
+        assert_eq!(clamped.trace_seal_worker_count, 1);
     }
 
     #[test]

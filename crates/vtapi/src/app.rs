@@ -42,6 +42,9 @@ use vtstorage::{MemoryStorageEngine, StorageEngine, StorageError, StorageStatsSn
 use crate::{cluster::ClusterConfig, http_client::ClusterHttpClient};
 
 const MAX_JAEGER_LIMIT: usize = 1_000;
+const JAEGER_POST_FILTER_FETCH_MULTIPLIER: usize = 8;
+const MAX_JAEGER_TRACE_FETCH_LIMIT: usize = MAX_JAEGER_LIMIT * 4;
+const MAX_JAEGER_DEPENDENCIES_TRACE_SCAN_LIMIT: usize = 5_000;
 const DEFAULT_JAEGER_DEPENDENCIES_LOOKBACK_MILLIS: i64 = 60 * 60 * 1000;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_CONCURRENCY_LIMIT: usize = 1_024;
@@ -3711,8 +3714,14 @@ fn search_jaeger_traces_local(
     let tag_filters = jaeger_query.parsed_tag_filters()?;
     let min_duration_nanos = jaeger_query.min_duration_nanos()?;
     let max_duration_nanos = jaeger_query.max_duration_nanos()?;
+    let fetch_limit = jaeger_query.fetch_limit(
+        requested_limit,
+        &tag_filters,
+        min_duration_nanos,
+        max_duration_nanos,
+    );
     let search_request =
-        jaeger_query.trace_search_request(service_name.clone(), requested_limit, &tag_filters)?;
+        jaeger_query.trace_search_request(service_name.clone(), fetch_limit, &tag_filters)?;
     let hits = query.search_traces(&search_request);
 
     let mut traces = Vec::new();
@@ -3748,8 +3757,13 @@ async fn search_jaeger_traces_cluster(
     let tag_filters = jaeger_query.parsed_tag_filters()?;
     let min_duration_nanos = jaeger_query.min_duration_nanos()?;
     let max_duration_nanos = jaeger_query.max_duration_nanos()?;
-    let search_query =
-        jaeger_query.search_query(service_name.clone(), requested_limit, &tag_filters)?;
+    let fetch_limit = jaeger_query.fetch_limit(
+        requested_limit,
+        &tag_filters,
+        min_duration_nanos,
+        max_duration_nanos,
+    );
+    let search_query = jaeger_query.search_query(service_name.clone(), fetch_limit, &tag_filters)?;
     let hits = gather_trace_hits_cluster(state, &search_query).await?;
 
     let mut traces = Vec::new();
@@ -5634,7 +5648,7 @@ impl JaegerTraceQuery {
     fn trace_search_request(
         &self,
         service_name: String,
-        requested_limit: usize,
+        fetch_limit: usize,
         tag_filters: &[(String, String)],
     ) -> Result<TraceSearchRequest, (StatusCode, Json<ErrorResponse>)> {
         Ok(TraceSearchRequest {
@@ -5649,14 +5663,14 @@ impl JaegerTraceQuery {
                     value: value.clone(),
                 })
                 .collect(),
-            limit: self.fetch_limit(requested_limit),
+            limit: fetch_limit,
         })
     }
 
     fn search_query(
         &self,
         service_name: String,
-        requested_limit: usize,
+        fetch_limit: usize,
         tag_filters: &[(String, String)],
     ) -> Result<SearchQuery, (StatusCode, Json<ErrorResponse>)> {
         Ok(SearchQuery {
@@ -5668,16 +5682,36 @@ impl JaegerTraceQuery {
                 .iter()
                 .map(|(name, value)| format!("{name}={value}"))
                 .collect(),
-            limit: Some(self.fetch_limit(requested_limit)),
+            limit: Some(fetch_limit),
         })
     }
 
-    fn fetch_limit(&self, requested_limit: usize) -> usize {
-        if self.operation.is_some() {
-            usize::MAX
-        } else {
-            requested_limit
+    fn fetch_limit(
+        &self,
+        requested_limit: usize,
+        tag_filters: &[(String, String)],
+        min_duration_nanos: Option<i64>,
+        max_duration_nanos: Option<i64>,
+    ) -> usize {
+        if !self.requires_post_filtering(tag_filters, min_duration_nanos, max_duration_nanos) {
+            return requested_limit;
         }
+
+        requested_limit
+            .saturating_mul(JAEGER_POST_FILTER_FETCH_MULTIPLIER)
+            .clamp(requested_limit, MAX_JAEGER_TRACE_FETCH_LIMIT)
+    }
+
+    fn requires_post_filtering(
+        &self,
+        tag_filters: &[(String, String)],
+        min_duration_nanos: Option<i64>,
+        max_duration_nanos: Option<i64>,
+    ) -> bool {
+        self.operation.is_some()
+            || !tag_filters.is_empty()
+            || min_duration_nanos.is_some()
+            || max_duration_nanos.is_some()
     }
 
     fn start_unix_nano(&self) -> i64 {
@@ -5694,6 +5728,10 @@ impl JaegerTraceQuery {
 }
 
 impl JaegerDependenciesQuery {
+    fn trace_scan_limit(&self) -> usize {
+        MAX_JAEGER_DEPENDENCIES_TRACE_SCAN_LIMIT
+    }
+
     fn end_unix_nano(&self) -> i64 {
         self.end_ts
             .unwrap_or_else(|| system_time_to_unix_millis(SystemTime::now()).unwrap_or(0) as i64)
@@ -5715,7 +5753,7 @@ impl JaegerDependenciesQuery {
             service_name: None,
             operation_name: None,
             field_filters: Vec::new(),
-            limit: usize::MAX,
+            limit: self.trace_scan_limit(),
         }
     }
 
@@ -5726,7 +5764,7 @@ impl JaegerDependenciesQuery {
             service_name: None,
             operation_name: None,
             field_filter: Vec::new(),
-            limit: Some(usize::MAX),
+            limit: Some(self.trace_scan_limit()),
         }
     }
 }
@@ -5769,7 +5807,23 @@ impl From<TraceRowResponse> for TraceSpanRow {
                     name: name.into(),
                     value: value.into(),
                 })
-                .collect(),
+            .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jaeger_dependencies_query_applies_hard_trace_scan_cap() {
+        let query = JaegerDependenciesQuery {
+            end_ts: Some(1_717_000_000_000),
+            lookback: Some(DEFAULT_JAEGER_DEPENDENCIES_LOOKBACK_MILLIS),
+        };
+
+        assert!(query.trace_search_request().limit < usize::MAX);
+        assert!(query.search_query().limit.unwrap_or(usize::MAX) < usize::MAX);
     }
 }

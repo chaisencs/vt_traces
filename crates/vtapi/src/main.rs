@@ -22,12 +22,14 @@ use vtstorage::{
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
-const THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
+const THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+const THROUGHPUT_PROFILE_TRACE_SEAL_WORKER_COUNT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TraceIngestDiskOverrides {
     deferred_wal_writes: bool,
     target_segment_size_bytes: Option<u64>,
+    trace_seal_worker_count: Option<usize>,
 }
 
 #[tokio::main]
@@ -181,6 +183,7 @@ fn disk_overrides_for_trace_ingest_profile(
     trace_ingest_profile: TraceIngestProfile,
     sync_policy: DiskSyncPolicy,
     target_segment_size_explicit: bool,
+    trace_seal_worker_count_explicit: bool,
 ) -> TraceIngestDiskOverrides {
     if matches!(trace_ingest_profile, TraceIngestProfile::Throughput)
         && matches!(sync_policy, DiskSyncPolicy::None)
@@ -189,12 +192,15 @@ fn disk_overrides_for_trace_ingest_profile(
             deferred_wal_writes: true,
             target_segment_size_bytes: (!target_segment_size_explicit)
                 .then_some(THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES),
+            trace_seal_worker_count: (!trace_seal_worker_count_explicit)
+                .then_some(THROUGHPUT_PROFILE_TRACE_SEAL_WORKER_COUNT),
         };
     }
 
     TraceIngestDiskOverrides {
         deferred_wal_writes: false,
         target_segment_size_bytes: None,
+        trace_seal_worker_count: None,
     }
 }
 
@@ -237,6 +243,12 @@ fn load_storage(
                 config =
                     config.with_trace_wal_writer_capacity_bytes(trace_wal_writer_capacity_bytes);
             }
+            let configured_trace_seal_worker_count = env::var("VT_STORAGE_TRACE_SEAL_WORKER_COUNT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok());
+            if let Some(trace_seal_worker_count) = configured_trace_seal_worker_count {
+                config = config.with_trace_seal_worker_count(trace_seal_worker_count);
+            }
             let sync_policy = if matches!(
                 env::var("VT_STORAGE_SYNC_POLICY")
                     .unwrap_or_else(|_| "none".to_string())
@@ -253,12 +265,16 @@ fn load_storage(
                 trace_ingest_profile,
                 sync_policy,
                 configured_target_segment_size_bytes.is_some(),
+                configured_trace_seal_worker_count.is_some(),
             );
             if disk_overrides.deferred_wal_writes {
                 config = config.with_trace_deferred_wal_writes(true);
             }
             if let Some(target_segment_size_bytes) = disk_overrides.target_segment_size_bytes {
                 config = config.with_target_segment_size_bytes(target_segment_size_bytes);
+            }
+            if let Some(trace_seal_worker_count) = disk_overrides.trace_seal_worker_count {
+                config = config.with_trace_seal_worker_count(trace_seal_worker_count);
             }
             Arc::new(DiskStorageEngine::open_with_config(path, config)?)
         }
@@ -386,6 +402,7 @@ mod tests {
     use super::{
         disk_overrides_for_trace_ingest_profile, parse_trace_ingest_profile,
         TraceIngestDiskOverrides, TraceIngestProfile, THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES,
+        THROUGHPUT_PROFILE_TRACE_SEAL_WORKER_COUNT,
     };
     use vtstorage::DiskSyncPolicy;
 
@@ -422,16 +439,18 @@ mod tests {
     }
 
     #[test]
-    fn throughput_profile_enables_deferred_wal_and_larger_default_segment_size() {
+    fn throughput_profile_enables_deferred_wal_and_bounded_default_segment_size() {
         assert_eq!(
             disk_overrides_for_trace_ingest_profile(
                 TraceIngestProfile::Throughput,
                 DiskSyncPolicy::None,
                 false,
+                false,
             ),
             TraceIngestDiskOverrides {
                 deferred_wal_writes: true,
                 target_segment_size_bytes: Some(THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES),
+                trace_seal_worker_count: Some(THROUGHPUT_PROFILE_TRACE_SEAL_WORKER_COUNT),
             }
         );
     }
@@ -443,10 +462,12 @@ mod tests {
                 TraceIngestProfile::Throughput,
                 DiskSyncPolicy::None,
                 true,
+                false,
             ),
             TraceIngestDiskOverrides {
                 deferred_wal_writes: true,
                 target_segment_size_bytes: None,
+                trace_seal_worker_count: Some(THROUGHPUT_PROFILE_TRACE_SEAL_WORKER_COUNT),
             }
         );
         assert_eq!(
@@ -454,10 +475,12 @@ mod tests {
                 TraceIngestProfile::Throughput,
                 DiskSyncPolicy::Data,
                 false,
+                false,
             ),
             TraceIngestDiskOverrides {
                 deferred_wal_writes: false,
                 target_segment_size_bytes: None,
+                trace_seal_worker_count: None,
             }
         );
     }

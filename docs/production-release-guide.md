@@ -129,7 +129,7 @@ Do not treat the current runtime knobs as one fuzzy deployment mode. The release
 | release tier | goal | required config | segment behavior | recommendation |
 | --- | --- | --- | --- | --- |
 | `stable` | durability / operational stability first | `VT_TRACE_INGEST_PROFILE=default` + `VT_STORAGE_SYNC_POLICY=data` | keep the normal segment size path, default `8388608` | the default choice for first production rollout |
-| `throughput` | ingest throughput first | `VT_TRACE_INGEST_PROFILE=throughput` + `VT_STORAGE_SYNC_POLICY=none` | if `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES` is not set explicitly, it auto-raises to `268435456` | use only after canary / replay / soak confirms the query plane is acceptable for your workload |
+| `throughput` | ingest throughput first | `VT_TRACE_INGEST_PROFILE=throughput` + `VT_STORAGE_SYNC_POLICY=none` | if `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES` is not set explicitly, it defaults to `67108864`, and `VT_STORAGE_TRACE_SEAL_WORKER_COUNT` defaults to `4` | use only after canary / replay / soak confirms the query plane is acceptable for your workload |
 
 Recommended first-production `stable` runtime:
 
@@ -151,7 +151,8 @@ VT_STORAGE_MODE=disk \
 VT_STORAGE_PATH=/var/lib/rust-victoria-trace \
 VT_TRACE_INGEST_PROFILE=throughput \
 VT_STORAGE_SYNC_POLICY=none \
-VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=268435456 \
+VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES=67108864 \
+VT_STORAGE_TRACE_SEAL_WORKER_COUNT=4 \
 VT_MAX_REQUEST_BODY_BYTES=8388608 \
 VT_API_CONCURRENCY_LIMIT=1024 \
 vtapi
@@ -162,6 +163,7 @@ Recommended operational checks:
 - scrape `/metrics`
 - verify `GET /healthz`
 - validate WAL and `.part` files are created under the configured storage path
+- for `throughput`, confirm `vt_storage_trace_seal_queue_depth` settles instead of growing without bound
 - run at least one OTLP protobuf smoke test before exposing public traffic
 
 ## Topology Mapping
