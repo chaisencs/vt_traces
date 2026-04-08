@@ -316,6 +316,30 @@ impl StorageEngine for SlowStorageEngine {
 async fn healthz_returns_ok() {
     let app = build_router(MemoryStorageEngine::new());
 
+    let livez_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/livez")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("livez request should succeed");
+    assert_eq!(livez_response.status(), StatusCode::OK);
+
+    let readyz_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("readyz request should succeed");
+    assert_eq!(readyz_response.status(), StatusCode::OK);
+
     let response = app
         .oneshot(
             Request::builder()
@@ -344,16 +368,37 @@ async fn storage_router_binds_and_returns_service_unavailable_until_startup_fini
         .build()
         .expect("build reqwest client");
 
+    let livez_response = client
+        .get(server.url("/livez"))
+        .send()
+        .await
+        .expect("startup livez response");
+    assert_eq!(livez_response.status(), ReqwestStatusCode::OK);
+    let livez_body: Value = livez_response.json().await.expect("startup livez body");
+    assert_eq!(livez_body["status"], "ok");
+
+    let readyz_response = client
+        .get(server.url("/readyz"))
+        .send()
+        .await
+        .expect("startup readyz response");
+    assert_eq!(
+        readyz_response.status(),
+        ReqwestStatusCode::SERVICE_UNAVAILABLE
+    );
+    let readyz_body: Value = readyz_response.json().await.expect("startup readyz body");
+    assert_eq!(readyz_body["status"], "starting");
+
     let health_response = client
         .get(server.url("/healthz"))
         .send()
         .await
         .expect("startup healthz response");
-    assert_eq!(health_response.status(), ReqwestStatusCode::SERVICE_UNAVAILABLE);
-    let health_body: Value = health_response
-        .json()
-        .await
-        .expect("startup healthz body");
+    assert_eq!(
+        health_response.status(),
+        ReqwestStatusCode::SERVICE_UNAVAILABLE
+    );
+    let health_body: Value = health_response.json().await.expect("startup healthz body");
     assert_eq!(health_body["status"], "starting");
 
     let services_response = client
@@ -361,9 +406,30 @@ async fn storage_router_binds_and_returns_service_unavailable_until_startup_fini
         .send()
         .await
         .expect("startup services response");
-    assert_eq!(services_response.status(), ReqwestStatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        services_response.status(),
+        ReqwestStatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let startup_metrics = client
+        .get(server.url("/metrics"))
+        .send()
+        .await
+        .expect("startup metrics response")
+        .text()
+        .await
+        .expect("startup metrics body");
+    assert!(startup_metrics.contains("vt_storage_startup_ready 0"));
+    assert!(startup_metrics.contains("vt_storage_startup_failed 0"));
 
     startup.mark_ready();
+
+    let ready_readyz_response = client
+        .get(server.url("/readyz"))
+        .send()
+        .await
+        .expect("ready readyz response");
+    assert_eq!(ready_readyz_response.status(), ReqwestStatusCode::OK);
 
     let ready_health_response = client
         .get(server.url("/healthz"))
@@ -378,6 +444,17 @@ async fn storage_router_binds_and_returns_service_unavailable_until_startup_fini
         .await
         .expect("ready services response");
     assert_eq!(ready_services_response.status(), ReqwestStatusCode::OK);
+
+    let ready_metrics = client
+        .get(server.url("/metrics"))
+        .send()
+        .await
+        .expect("ready metrics response")
+        .text()
+        .await
+        .expect("ready metrics body");
+    assert!(ready_metrics.contains("vt_storage_startup_ready 1"));
+    assert!(ready_metrics.contains("vt_storage_startup_failed 0"));
 }
 
 #[tokio::test]
@@ -3479,10 +3556,7 @@ async fn jaeger_trace_search_supports_tags_and_duration_filters() {
         .expect("search body");
     let decoded: Value = serde_json::from_slice(&body).expect("search json");
     assert_eq!(decoded["total"], 1);
-    assert_eq!(
-        decoded["data"][0]["traceID"],
-        "trace-jaeger-filter-1"
-    );
+    assert_eq!(decoded["data"][0]["traceID"], "trace-jaeger-filter-1");
 }
 
 #[tokio::test]
@@ -3567,12 +3641,7 @@ async fn jaeger_trace_search_overfetches_for_duration_filtered_matches() {
         .as_array()
         .expect("jaeger data array")
         .iter()
-        .map(|trace| {
-            trace["traceID"]
-                .as_str()
-                .expect("traceID")
-                .to_string()
-        })
+        .map(|trace| trace["traceID"].as_str().expect("traceID").to_string())
         .collect();
     let expected_trace_ids: std::collections::BTreeSet<_> = (0..5)
         .map(|index| format!("trace-jaeger-duration-fast-{index}"))

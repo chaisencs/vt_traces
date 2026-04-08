@@ -498,8 +498,7 @@ fn disk_engine_deferred_wal_keeps_query_indexes_visible_before_drop_and_after_re
 
         wait_until(|| {
             engine.list_services() == vec!["checkout".to_string()]
-                && engine.list_field_values("span_attr:http.method")
-                    == vec!["POST".to_string()]
+                && engine.list_field_values("span_attr:http.method") == vec!["POST".to_string()]
                 && engine
                     .search_traces(&TraceSearchRequest {
                         start_unix_nano: 0,

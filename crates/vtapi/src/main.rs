@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs, io,
     net::SocketAddr,
     sync::{Arc, RwLock},
     thread,
@@ -10,17 +12,20 @@ use std::{
 #[cfg(feature = "mimalloc_allocator")]
 use mimalloc::MiMalloc;
 use reqwest::{Certificate, Client, Identity};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use vtapi::{
     build_insert_router_with_client_auth_and_limits,
     build_router_with_storage_startup_auth_limits_and_trace_ingest_profile,
     build_select_router_with_client_auth_and_limits,
-    build_storage_router_with_startup_auth_and_limits,
-    serve_app, spawn_background_control_refresh_task_with_client_and_auth,
+    build_storage_router_with_startup_auth_and_limits, serve_app,
+    spawn_background_control_refresh_task_with_client_and_auth,
     spawn_background_membership_refresh_task_with_client_and_auth,
-    spawn_background_rebalance_task_with_client_and_auth, ApiLimitsConfig, AuthConfig, ClusterConfig,
-    ClusterHttpClient, ClusterHttpClientConfig, ServerTlsConfig, StorageStartupState,
-    TraceIngestProfile,
+    spawn_background_rebalance_task_with_client_and_auth, ApiLimitsConfig, AuthConfig,
+    ClusterConfig, ClusterHttpClient, ClusterHttpClientConfig, ServerTlsConfig,
+    StorageStartupState, TraceIngestProfile,
 };
 use vtstorage::{
     BatchingStorageConfig, BatchingStorageEngine, DiskStorageConfig, DiskStorageEngine,
@@ -33,12 +38,30 @@ static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 const THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const THROUGHPUT_PROFILE_TRACE_SEAL_WORKER_COUNT: usize = 4;
+const SYSTEMD_STARTUP_EXTEND_INTERVAL: Duration = Duration::from_secs(10);
+const SYSTEMD_STARTUP_EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TraceIngestDiskOverrides {
     deferred_wal_writes: bool,
     target_segment_size_bytes: Option<u64>,
     trace_seal_worker_count: Option<usize>,
+}
+
+struct DeferredStartupApp {
+    app: axum::Router,
+    runtime: StartupRuntime,
+}
+
+struct StartupRuntime {
+    startup: StorageStartupState,
+    deferred: Arc<DeferredStorageEngine>,
+    trace_ingest_profile: TraceIngestProfile,
+}
+
+#[derive(Clone, Default)]
+struct SystemdNotifier {
+    notify_socket: Option<Arc<std::ffi::OsString>>,
 }
 
 #[tokio::main]
@@ -55,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
     let server_tls = load_server_tls_config()?;
     let cluster_client = load_cluster_http_client()?;
     let addr = load_bind_addr(&role)?;
+    let notifier = SystemdNotifier::from_env();
     let base_url = format!(
         "{}://{addr}",
         if server_tls.is_some() {
@@ -64,21 +88,35 @@ async fn main() -> anyhow::Result<()> {
         }
     );
 
-    let app = match role.as_str() {
-        "insert" => build_insert_router_with_client_auth_and_limits(
-            load_cluster_config(None)?,
-            cluster_client.clone(),
-            auth.clone(),
-            limits.clone(),
+    let (app, startup_runtime) = match role.as_str() {
+        "insert" => (
+            build_insert_router_with_client_auth_and_limits(
+                load_cluster_config(None)?,
+                cluster_client.clone(),
+                auth.clone(),
+                limits.clone(),
+            ),
+            None,
         ),
-        "select" => build_select_router_with_client_auth_and_limits(
-            load_cluster_config(Some(base_url.as_str()))?,
-            cluster_client.clone(),
-            auth.clone(),
-            limits.clone(),
+        "select" => (
+            build_select_router_with_client_auth_and_limits(
+                load_cluster_config(Some(base_url.as_str()))?,
+                cluster_client.clone(),
+                auth.clone(),
+                limits.clone(),
+            ),
+            None,
         ),
-        "storage" => build_storage_startup_app(trace_ingest_profile, auth.clone(), limits.clone()),
-        _ => build_single_startup_app(trace_ingest_profile, auth.clone(), limits.clone()),
+        "storage" => {
+            let startup_app =
+                build_storage_startup_app(trace_ingest_profile, auth.clone(), limits.clone());
+            (startup_app.app, Some(startup_app.runtime))
+        }
+        _ => {
+            let startup_app =
+                build_single_startup_app(trace_ingest_profile, auth.clone(), limits.clone());
+            (startup_app.app, Some(startup_app.runtime))
+        }
     };
 
     if role == "select" {
@@ -119,6 +157,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    if let Some(runtime) = startup_runtime {
+        let startup = runtime.startup.clone();
+        notifier.startup_progress(
+            format!("{role} listening on {addr}; storage recovery in progress"),
+            SYSTEMD_STARTUP_EXTEND_TIMEOUT,
+        );
+        spawn_startup_timeout_extender(startup.clone(), notifier.clone(), role.clone(), addr);
+        spawn_storage_loader(runtime, notifier.clone(), role.clone(), addr);
+    } else {
+        notifier.ready(format!("{role} ready on {addr}"));
+    }
     serve_app(listener, app, server_tls).await?;
     Ok(())
 }
@@ -321,59 +370,229 @@ fn build_storage_startup_app(
     trace_ingest_profile: TraceIngestProfile,
     auth: AuthConfig,
     limits: ApiLimitsConfig,
-) -> axum::Router {
+) -> DeferredStartupApp {
     let startup = StorageStartupState::starting();
     let deferred = Arc::new(DeferredStorageEngine::default());
     let deferred_storage: Arc<dyn StorageEngine> = deferred.clone();
-    let loader_startup = startup.clone();
-    let loader_storage = deferred.clone();
-    thread::spawn(move || match load_storage_sync(trace_ingest_profile) {
-        Ok(storage) => {
-            loader_storage.install(storage);
-            loader_startup.mark_ready();
-        }
-        Err(error) => {
-            loader_startup.mark_failed(error.to_string());
-        }
-    });
-
-    let app = build_storage_router_with_startup_auth_and_limits(
-        deferred_storage,
-        startup,
-        auth,
-        limits,
-    );
-    app
+    DeferredStartupApp {
+        app: build_storage_router_with_startup_auth_and_limits(
+            deferred_storage,
+            startup.clone(),
+            auth,
+            limits,
+        ),
+        runtime: StartupRuntime {
+            startup,
+            deferred,
+            trace_ingest_profile,
+        },
+    }
 }
 
 fn build_single_startup_app(
     trace_ingest_profile: TraceIngestProfile,
     auth: AuthConfig,
     limits: ApiLimitsConfig,
-) -> axum::Router {
+) -> DeferredStartupApp {
     let startup = StorageStartupState::starting();
     let deferred = Arc::new(DeferredStorageEngine::default());
     let deferred_storage: Arc<dyn StorageEngine> = deferred.clone();
-    let loader_startup = startup.clone();
-    let loader_storage = deferred.clone();
-    thread::spawn(move || match load_storage_sync(trace_ingest_profile) {
-        Ok(storage) => {
-            loader_storage.install(storage);
-            loader_startup.mark_ready();
-        }
-        Err(error) => {
-            loader_startup.mark_failed(error.to_string());
+    DeferredStartupApp {
+        app: build_router_with_storage_startup_auth_limits_and_trace_ingest_profile(
+            deferred_storage,
+            startup.clone(),
+            auth,
+            limits,
+            trace_ingest_profile,
+        ),
+        runtime: StartupRuntime {
+            startup,
+            deferred,
+            trace_ingest_profile,
+        },
+    }
+}
+
+fn spawn_storage_loader(
+    runtime: StartupRuntime,
+    notifier: SystemdNotifier,
+    role: String,
+    addr: SocketAddr,
+) {
+    thread::spawn(
+        move || match load_storage_sync(runtime.trace_ingest_profile) {
+            Ok(storage) => {
+                runtime.deferred.install(storage);
+                runtime.startup.mark_ready();
+                info!(role = %role, addr = %addr, "storage recovery completed");
+                notifier.ready(format!("{role} ready on {addr}"));
+            }
+            Err(error) => {
+                let error_message = error.to_string();
+                runtime.startup.mark_failed(error_message.clone());
+                warn!(
+                    role = %role,
+                    addr = %addr,
+                    error = %error_message,
+                    "storage startup failed"
+                );
+                notifier.status(format!("{role} startup failed on {addr}: {error_message}"));
+                thread::sleep(Duration::from_millis(200));
+                std::process::exit(1);
+            }
+        },
+    );
+}
+
+fn spawn_startup_timeout_extender(
+    startup: StorageStartupState,
+    notifier: SystemdNotifier,
+    role: String,
+    addr: SocketAddr,
+) {
+    if !notifier.is_enabled() {
+        return;
+    }
+
+    thread::spawn(move || {
+        while !startup.is_ready() && startup.failure().is_none() {
+            thread::sleep(SYSTEMD_STARTUP_EXTEND_INTERVAL);
+            if startup.is_ready() || startup.failure().is_some() {
+                break;
+            }
+            notifier.startup_progress(
+                format!("{role} listening on {addr}; storage recovery in progress"),
+                SYSTEMD_STARTUP_EXTEND_TIMEOUT,
+            );
         }
     });
+}
 
-    let app = build_router_with_storage_startup_auth_limits_and_trace_ingest_profile(
-        deferred_storage,
-        startup,
-        auth,
-        limits,
-        trace_ingest_profile,
-    );
-    app
+impl SystemdNotifier {
+    fn from_env() -> Self {
+        Self {
+            notify_socket: env::var_os("NOTIFY_SOCKET").map(Arc::new),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.notify_socket.is_some()
+    }
+
+    fn status(&self, status: impl AsRef<str>) {
+        self.notify(&format!(
+            "STATUS={}",
+            sanitize_systemd_value(status.as_ref())
+        ));
+    }
+
+    fn startup_progress(&self, status: impl AsRef<str>, timeout: Duration) {
+        self.notify(&format!(
+            "STATUS={}\nEXTEND_TIMEOUT_USEC={}",
+            sanitize_systemd_value(status.as_ref()),
+            timeout.as_micros()
+        ));
+    }
+
+    fn ready(&self, status: impl AsRef<str>) {
+        self.notify(&format!(
+            "READY=1\nSTATUS={}",
+            sanitize_systemd_value(status.as_ref())
+        ));
+    }
+
+    fn notify(&self, state: &str) {
+        let Some(socket) = self.notify_socket.as_deref() else {
+            return;
+        };
+
+        if let Err(error) = send_systemd_notification(socket.as_ref(), state) {
+            warn!(error = %error, state = %state, "systemd notify failed");
+        }
+    }
+}
+
+fn sanitize_systemd_value(value: &str) -> String {
+    value.replace('\n', " ")
+}
+
+#[cfg(unix)]
+fn send_systemd_notification(socket: &OsStr, state: &str) -> io::Result<()> {
+    let socket_bytes = socket.as_bytes();
+    if socket_bytes.is_empty() {
+        return Ok(());
+    }
+
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let base_len = (&addr.sun_path as *const _ as usize) - (&addr as *const _ as usize);
+        let addr_len = if socket_bytes[0] == b'@' {
+            #[cfg(target_os = "linux")]
+            {
+                let name = &socket_bytes[1..];
+                if name.len() + 1 > addr.sun_path.len() {
+                    libc::close(fd);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "NOTIFY_SOCKET abstract path too long",
+                    ));
+                }
+                addr.sun_path[0] = 0;
+                for (index, byte) in name.iter().enumerate() {
+                    addr.sun_path[index + 1] = *byte as libc::c_char;
+                }
+                base_len + 1 + name.len()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                libc::close(fd);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "abstract NOTIFY_SOCKET is only supported on Linux",
+                ));
+            }
+        } else {
+            if socket_bytes.len() >= addr.sun_path.len() {
+                libc::close(fd);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "NOTIFY_SOCKET path too long",
+                ));
+            }
+            for (index, byte) in socket_bytes.iter().enumerate() {
+                addr.sun_path[index] = *byte as libc::c_char;
+            }
+            addr.sun_path[socket_bytes.len()] = 0;
+            base_len + socket_bytes.len() + 1
+        };
+
+        let result = libc::sendto(
+            fd,
+            state.as_ptr().cast(),
+            state.len(),
+            0,
+            (&addr as *const libc::sockaddr_un).cast(),
+            addr_len as libc::socklen_t,
+        );
+        let send_result = if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        libc::close(fd);
+        send_result
+    }
+}
+
+#[cfg(not(unix))]
+fn send_systemd_notification(_socket: &OsStr, _state: &str) -> io::Result<()> {
+    Ok(())
 }
 
 #[derive(Default)]
@@ -394,7 +613,9 @@ impl DeferredStorageEngine {
             .read()
             .expect("deferred storage rwlock poisoned")
             .clone()
-            .ok_or_else(|| vtstorage::StorageError::Message("storage startup in progress".to_string()))
+            .ok_or_else(|| {
+                vtstorage::StorageError::Message("storage startup in progress".to_string())
+            })
     }
 }
 
@@ -437,10 +658,7 @@ impl StorageEngine for DeferredStorageEngine {
             .unwrap_or_default()
     }
 
-    fn search_traces(
-        &self,
-        request: &vtcore::TraceSearchRequest,
-    ) -> Vec<vtcore::TraceSearchHit> {
+    fn search_traces(&self, request: &vtcore::TraceSearchRequest) -> Vec<vtcore::TraceSearchHit> {
         self.ready_storage()
             .map(|storage| storage.search_traces(request))
             .unwrap_or_default()

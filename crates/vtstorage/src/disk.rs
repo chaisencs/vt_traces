@@ -3272,11 +3272,15 @@ impl SegmentAccumulator {
                     }
                 }
                 for field_filter in &request.field_filters {
-                    let matches = trace.fields.iter().any(|(field_name_ref, field_value_ref)| {
-                        self.strings.resolve(*field_name_ref) == Some(field_filter.name.as_str())
-                            && self.strings.resolve(*field_value_ref)
-                                == Some(field_filter.value.as_str())
-                    });
+                    let matches = trace
+                        .fields
+                        .iter()
+                        .any(|(field_name_ref, field_value_ref)| {
+                            self.strings.resolve(*field_name_ref)
+                                == Some(field_filter.name.as_str())
+                                && self.strings.resolve(*field_value_ref)
+                                    == Some(field_filter.value.as_str())
+                        });
                     if !matches {
                         return None;
                     }
@@ -4100,43 +4104,23 @@ fn recover_state(
     let recovery_seal_results =
         seal_recovery_tasks(recovery_seal_tasks, recovery_seal_worker_count)?;
 
-    for entry in recovery_entries {
-        if entry.needs_seal
-            && recovery_seal_results
-                .get(&entry.segment_id)
-                .copied()
-                .unwrap_or_default()
-                == 0
-        {
-            continue;
-        }
-        let part_path = entry.part_path;
-        let meta_path = entry
-            .meta_path
-            .unwrap_or_else(|| segment_meta_path(segments_path, entry.segment_id));
+    let recovered_segments = materialize_recovery_entries(
+        recovery_entries,
+        &recovery_seal_results,
+        recovery_seal_worker_count,
+        segments_path,
+    )?;
 
-        let mut meta = if meta_path.exists() {
-            let file = File::open(&meta_path)?;
-            serde_json::from_reader(file)?
-        } else {
-            let meta = rebuild_segment_meta(entry.segment_id, &part_path)?;
-            let _ = write_segment_meta(&meta_path, &meta, DiskSyncPolicy::None)?;
-            meta
-        };
-        if meta.typed_field_columns == 0 && meta.string_field_columns == 0 {
-            let (typed_field_columns, string_field_columns) =
-                count_field_column_encodings(std::iter::once(&part_path));
-            meta.typed_field_columns = typed_field_columns;
-            meta.string_field_columns = string_field_columns;
-            let _ = write_segment_meta(&meta_path, &meta, DiskSyncPolicy::None);
-        }
-
-        recovered.persisted_bytes += fs::metadata(&part_path)?.len();
-        recovered.persisted_bytes += fs::metadata(&meta_path)?.len();
-        recovered.typed_field_columns += meta.typed_field_columns;
-        recovered.string_field_columns += meta.string_field_columns;
-        recovered.segment_paths.insert(meta.segment_id, part_path);
-        for trace in meta.traces {
+    for recovered_segment in recovered_segments {
+        recovered.persisted_bytes += recovered_segment.part_bytes;
+        recovered.persisted_bytes += recovered_segment.meta_bytes;
+        recovered.typed_field_columns += recovered_segment.meta.typed_field_columns;
+        recovered.string_field_columns += recovered_segment.meta.string_field_columns;
+        recovered.segment_paths.insert(
+            recovered_segment.meta.segment_id,
+            recovered_segment.part_path,
+        );
+        for trace in recovered_segment.meta.traces {
             let shard_index = trace_shard_index(&trace.trace_id, trace_shards);
             recovered.trace_shards[shard_index].observe_persisted_trace(trace);
         }
@@ -4161,6 +4145,14 @@ struct RecoverySealTask {
     part_path: PathBuf,
 }
 
+#[derive(Debug)]
+struct RecoveredSegmentEntry {
+    part_path: PathBuf,
+    meta: SegmentMeta,
+    part_bytes: u64,
+    meta_bytes: u64,
+}
+
 fn seal_recovery_tasks(
     tasks: Vec<RecoverySealTask>,
     recovery_seal_worker_count: usize,
@@ -4179,25 +4171,27 @@ fn seal_recovery_tasks(
     thread::scope(|scope| -> Result<HashMap<u64, u64>, StorageError> {
         let mut handles = Vec::new();
         for task_bucket in task_buckets.into_iter().filter(|bucket| !bucket.is_empty()) {
-            handles.push(scope.spawn(move || -> Result<Vec<(u64, u64)>, StorageError> {
-                let mut results = Vec::with_capacity(task_bucket.len());
-                for task in task_bucket {
-                    let (_, sealed_bytes, _) = seal_rows_file_to_part(
-                        &task.source_path,
-                        &task.part_path,
-                        DiskSyncPolicy::None,
-                    )?;
-                    results.push((task.segment_id, sealed_bytes));
-                }
-                Ok(results)
-            }));
+            handles.push(
+                scope.spawn(move || -> Result<Vec<(u64, u64)>, StorageError> {
+                    let mut results = Vec::with_capacity(task_bucket.len());
+                    for task in task_bucket {
+                        let (_, sealed_bytes, _) = seal_rows_file_to_part(
+                            &task.source_path,
+                            &task.part_path,
+                            DiskSyncPolicy::None,
+                        )?;
+                        results.push((task.segment_id, sealed_bytes));
+                    }
+                    Ok(results)
+                }),
+            );
         }
 
         let mut sealed_bytes_by_segment = HashMap::new();
         for handle in handles {
-            let worker_results = handle
-                .join()
-                .map_err(|_| StorageError::Message("disk recovery worker panicked".to_string()))??;
+            let worker_results = handle.join().map_err(|_| {
+                StorageError::Message("disk recovery worker panicked".to_string())
+            })??;
             for (segment_id, sealed_bytes) in worker_results {
                 sealed_bytes_by_segment.insert(segment_id, sealed_bytes);
             }
@@ -4205,6 +4199,108 @@ fn seal_recovery_tasks(
 
         Ok(sealed_bytes_by_segment)
     })
+}
+
+fn materialize_recovery_entries(
+    entries: Vec<RecoveryEntry>,
+    recovery_seal_results: &HashMap<u64, u64>,
+    recovery_worker_count: usize,
+    segments_path: &Path,
+) -> Result<Vec<RecoveredSegmentEntry>, StorageError> {
+    let mut pending_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.needs_seal
+            && recovery_seal_results
+                .get(&entry.segment_id)
+                .copied()
+                .unwrap_or_default()
+                == 0
+        {
+            continue;
+        }
+        pending_entries.push(entry);
+    }
+
+    if pending_entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = recovery_worker_count.clamp(1, pending_entries.len());
+    let mut entry_buckets: Vec<Vec<RecoveryEntry>> =
+        (0..worker_count).map(|_| Vec::new()).collect();
+    for (entry_index, entry) in pending_entries.into_iter().enumerate() {
+        entry_buckets[entry_index % worker_count].push(entry);
+    }
+
+    let mut recovered_segments = thread::scope(
+        |scope| -> Result<Vec<RecoveredSegmentEntry>, StorageError> {
+            let mut handles = Vec::new();
+            for entry_bucket in entry_buckets
+                .into_iter()
+                .filter(|bucket| !bucket.is_empty())
+            {
+                handles.push(scope.spawn(
+                    move || -> Result<Vec<RecoveredSegmentEntry>, StorageError> {
+                        let mut prepared = Vec::with_capacity(entry_bucket.len());
+                        for entry in entry_bucket {
+                            prepared.push(materialize_recovery_entry(entry, segments_path)?);
+                        }
+                        Ok(prepared)
+                    },
+                ));
+            }
+
+            let mut recovered = Vec::new();
+            for handle in handles {
+                recovered.extend(handle.join().map_err(|_| {
+                    StorageError::Message("disk recovery materializer panicked".to_string())
+                })??);
+            }
+            Ok(recovered)
+        },
+    )?;
+
+    recovered_segments.sort_by_key(|entry| entry.meta.segment_id);
+    Ok(recovered_segments)
+}
+
+fn materialize_recovery_entry(
+    entry: RecoveryEntry,
+    segments_path: &Path,
+) -> Result<RecoveredSegmentEntry, StorageError> {
+    let meta_path = entry
+        .meta_path
+        .unwrap_or_else(|| segment_meta_path(segments_path, entry.segment_id));
+    let mut meta = load_or_rebuild_segment_meta(entry.segment_id, &entry.part_path, &meta_path)?;
+    if meta.typed_field_columns == 0 && meta.string_field_columns == 0 {
+        let (typed_field_columns, string_field_columns) =
+            count_field_column_encodings(std::iter::once(&entry.part_path));
+        meta.typed_field_columns = typed_field_columns;
+        meta.string_field_columns = string_field_columns;
+        let _ = write_segment_meta(&meta_path, &meta, DiskSyncPolicy::None)?;
+    }
+
+    Ok(RecoveredSegmentEntry {
+        part_bytes: fs::metadata(&entry.part_path)?.len(),
+        meta_bytes: fs::metadata(&meta_path)?.len(),
+        part_path: entry.part_path,
+        meta,
+    })
+}
+
+fn load_or_rebuild_segment_meta(
+    segment_id: u64,
+    part_path: &Path,
+    meta_path: &Path,
+) -> Result<SegmentMeta, StorageError> {
+    if meta_path.exists() {
+        let file = File::open(meta_path)?;
+        Ok(serde_json::from_reader(file)?)
+    } else {
+        let meta = rebuild_segment_meta(segment_id, part_path)?;
+        let _ = write_segment_meta(meta_path, &meta, DiskSyncPolicy::None)?;
+        Ok(meta)
+    }
 }
 
 fn recover_log_state(log_path: &Path) -> Result<(LogIndexedState, u64), StorageError> {
@@ -6070,8 +6166,7 @@ mod tests {
         prepare_shared_group_metadata, route_trace_blocks_for_append, trace_block_shard_index,
         trace_shard_index, BatchInternCache, DiskStorageConfig, DiskStorageEngine, LiveTraceUpdate,
         PreparedTraceBlockAppend, PreparedTraceShardBatch, SegmentAccumulator, SegmentRowLocation,
-        SegmentTraceAccumulator, TraceLiveUpdateApplyMode,
-        STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT,
+        SegmentTraceAccumulator, TraceLiveUpdateApplyMode, STATS_TRACE_UPDATE_DRAIN_BATCH_LIMIT,
     };
     use crate::StorageEngine;
     use serde_json::Value;
@@ -6544,8 +6639,7 @@ mod tests {
         let config = DiskStorageConfig::default()
             .with_trace_shards(1)
             .with_trace_deferred_wal_writes(true);
-        let engine =
-            DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
+        let engine = DiskStorageEngine::open_with_config(&path, config).expect("open disk engine");
         let expected = trace_row(
             "trace-deferred-read-1",
             "span-1",

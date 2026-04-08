@@ -30,11 +30,11 @@ use vtcore::{
 };
 use vtingest::{
     decode_export_logs_service_request_protobuf, decode_trace_block_protobuf,
-    decode_trace_blocks_protobuf_sharded, decode_trace_rows_protobuf, AttributeValue, KeyValue,
-    ResourceSpans, ScopeSpans, SpanRecord,
-    Status as OtlpStatus, encode_export_trace_service_request_protobuf, export_request_from_rows,
-    flatten_export_logs_request, flatten_export_request, ExportLogsServiceRequest,
-    ExportTraceServiceRequest,
+    decode_trace_blocks_protobuf_sharded, decode_trace_rows_protobuf,
+    encode_export_trace_service_request_protobuf, export_request_from_rows,
+    flatten_export_logs_request, flatten_export_request, AttributeValue, ExportLogsServiceRequest,
+    ExportTraceServiceRequest, KeyValue, ResourceSpans, ScopeSpans, SpanRecord,
+    Status as OtlpStatus,
 };
 use vtquery::QueryService;
 use vtstorage::{MemoryStorageEngine, StorageEngine, StorageError, StorageStatsSnapshot};
@@ -176,18 +176,12 @@ impl StorageStartupState {
 
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Relaxed);
-        *self
-            .failed
-            .lock()
-            .expect("startup state mutex poisoned") = None;
+        *self.failed.lock().expect("startup state mutex poisoned") = None;
     }
 
     pub fn mark_failed(&self, error: impl Into<String>) {
         self.ready.store(false, Ordering::Relaxed);
-        *self
-            .failed
-            .lock()
-            .expect("startup state mutex poisoned") = Some(error.into());
+        *self.failed.lock().expect("startup state mutex poisoned") = Some(error.into());
     }
 }
 
@@ -1281,7 +1275,9 @@ pub fn build_router_with_storage_startup_auth_limits_and_trace_ingest_profile(
     });
 
     Router::new()
-        .route("/healthz", get(storage_healthz))
+        .route("/livez", get(livez))
+        .route("/readyz", get(storage_readyz))
+        .route("/healthz", get(storage_readyz))
         .route("/metrics", get(storage_metrics))
         .merge(apply_optional_bearer_auth(
             apply_storage_startup_gate(
@@ -1294,10 +1290,7 @@ pub fn build_router_with_storage_startup_auth_limits_and_trace_ingest_profile(
                         .route("/api/v1/traces/ingest", post(ingest_traces_local))
                         .route("/v1/logs", post(ingest_logs_local))
                         .route("/v1/traces", post(ingest_traces_local))
-                        .route(
-                            "/insert/opentelemetry/v1/traces",
-                            post(ingest_traces_local),
-                        )
+                        .route("/insert/opentelemetry/v1/traces", post(ingest_traces_local))
                         .route(
                             "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
                             post(ingest_logs_grpc_local),
@@ -1384,7 +1377,9 @@ pub fn build_storage_router_with_startup_auth_and_limits(
     });
 
     Router::new()
-        .route("/healthz", get(storage_healthz))
+        .route("/livez", get(livez))
+        .route("/readyz", get(storage_readyz))
+        .route("/healthz", get(storage_readyz))
         .route("/metrics", get(storage_metrics))
         .merge(apply_optional_bearer_auth(
             apply_storage_startup_gate(
@@ -1442,7 +1437,9 @@ pub fn build_insert_router_with_client_auth_and_limits(
     });
 
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
+        .route("/healthz", get(readyz))
         .route("/metrics", get(insert_metrics))
         .merge(apply_optional_bearer_auth(
             apply_api_limits(
@@ -1502,7 +1499,9 @@ pub fn build_select_router_with_client_auth_and_limits(
     });
 
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
+        .route("/healthz", get(readyz))
         .route("/metrics", get(select_metrics))
         .merge(apply_optional_bearer_auth(
             apply_api_limits(
@@ -1856,11 +1855,15 @@ async fn enforce_storage_startup_ready(
     Err(storage_startup_unavailable(&startup))
 }
 
-async fn healthz() -> Json<HealthResponse> {
+async fn livez() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-async fn storage_healthz(
+async fn readyz() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
+}
+
+async fn storage_readyz(
     State(state): State<Arc<StorageState>>,
 ) -> (StatusCode, Json<HealthResponse>) {
     if state.startup.is_ready() {
@@ -1878,14 +1881,15 @@ async fn storage_healthz(
     )
 }
 
-fn storage_startup_unavailable(
-    startup: &StorageStartupState,
-) -> (StatusCode, Json<ErrorResponse>) {
+fn storage_startup_unavailable(startup: &StorageStartupState) -> (StatusCode, Json<ErrorResponse>) {
     let error = startup
         .failure()
         .map(|error| format!("storage startup failed: {error}"))
         .unwrap_or_else(|| "storage startup in progress".to_string());
-    (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error }))
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse { error }),
+    )
 }
 
 async fn ingest_traces_local(
@@ -3083,7 +3087,7 @@ async fn storage_metrics(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        render_storage_metrics(&state.storage.stats()),
+        render_storage_metrics(&state.storage.stats(), &state.startup),
     )
 }
 
@@ -3907,7 +3911,8 @@ async fn search_jaeger_traces_cluster(
         min_duration_nanos,
         max_duration_nanos,
     );
-    let search_query = jaeger_query.search_query(service_name.clone(), fetch_limit, &tag_filters)?;
+    let search_query =
+        jaeger_query.search_query(service_name.clone(), fetch_limit, &tag_filters)?;
     let hits = gather_trace_hits_cluster(state, &search_query).await?;
 
     let mut traces = Vec::new();
@@ -3958,15 +3963,17 @@ fn trace_matches_jaeger_query(
 }
 
 fn row_matches_jaeger_tags(row: &TraceSpanRow, tag_filters: &[(String, String)]) -> bool {
-    tag_filters.iter().all(|(field_name, expected)| match field_name.as_str() {
-        "name" => row.name == *expected,
-        "duration" => row.duration_nanos().to_string() == *expected,
-        _ => row
-            .field_value(field_name)
-            .as_deref()
-            .map(|actual| actual == expected.as_str())
-            .unwrap_or(false),
-    })
+    tag_filters
+        .iter()
+        .all(|(field_name, expected)| match field_name.as_str() {
+            "name" => row.name == *expected,
+            "duration" => row.duration_nanos().to_string() == *expected,
+            _ => row
+                .field_value(field_name)
+                .as_deref()
+                .map(|actual| actual == expected.as_str())
+                .unwrap_or(false),
+        })
 }
 
 fn build_jaeger_dependencies(
@@ -3986,7 +3993,11 @@ fn build_jaeger_dependencies(
             let Some(child_service) = row.service_name() else {
                 continue;
             };
-            let Some(parent_span_id) = row.parent_span_id.as_deref().filter(|value| !value.is_empty()) else {
+            let Some(parent_span_id) = row
+                .parent_span_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            else {
                 continue;
             };
             let Some(parent_service) = service_by_span_id.get(parent_span_id) else {
@@ -4559,7 +4570,9 @@ fn apply_limit<T>(mut values: Vec<T>, limit: Option<usize>) -> Vec<T> {
     values
 }
 
-fn render_storage_metrics(stats: &StorageStatsSnapshot) -> String {
+fn render_storage_metrics(stats: &StorageStatsSnapshot, startup: &StorageStartupState) -> String {
+    let startup_ready = u8::from(startup.is_ready());
+    let startup_failed = u8::from(startup.failure().is_some());
     [
         "# TYPE vt_build_info gauge".to_string(),
         format!(
@@ -4712,6 +4725,10 @@ fn render_storage_metrics(stats: &StorageStatsSnapshot) -> String {
             "vt_storage_trace_batch_flush_due_to_wait_total {}",
             stats.trace_batch_flush_due_to_wait
         ),
+        "# TYPE vt_storage_startup_ready gauge".to_string(),
+        format!("vt_storage_startup_ready {}", startup_ready),
+        "# TYPE vt_storage_startup_failed gauge".to_string(),
+        format!("vt_storage_startup_failed {}", startup_failed),
     ]
     .join("\n")
         + "\n"
@@ -4864,7 +4881,10 @@ struct StandardOtlpScope {
 struct StandardOtlpSpanRecord {
     trace_id: String,
     span_id: String,
-    #[serde(default, deserialize_with = "deserialize_optional_string_or_empty_as_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string_or_empty_as_none"
+    )]
     parent_span_id: Option<String>,
     name: String,
     #[serde(deserialize_with = "deserialize_i64_from_string_or_number")]
@@ -4894,7 +4914,10 @@ struct StandardOtlpKeyValue {
 struct StandardOtlpAnyValue {
     string_value: Option<String>,
     bool_value: Option<bool>,
-    #[serde(default, deserialize_with = "deserialize_optional_i64_from_string_or_number")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_i64_from_string_or_number"
+    )]
     int_value: Option<i64>,
     double_value: Option<f64>,
     bytes_value: Option<String>,
@@ -5488,11 +5511,12 @@ fn deserialize_optional_string_or_empty_as_none<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<String>::deserialize(deserializer)?
-        .and_then(|value| {
+    Ok(
+        Option::<String>::deserialize(deserializer)?.and_then(|value| {
             let trimmed = value.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
-        }))
+        }),
+    )
 }
 
 fn parse_json_i64_value(value: serde_json::Value) -> Result<i64, String> {
@@ -5548,8 +5572,8 @@ fn parse_jaeger_tags_filter(
         return Ok(Vec::new());
     };
 
-    let decoded: BTreeMap<String, serde_json::Value> =
-        serde_json::from_str(value).map_err(|error| bad_request(format!("invalid tags: {error}")))?;
+    let decoded: BTreeMap<String, serde_json::Value> = serde_json::from_str(value)
+        .map_err(|error| bad_request(format!("invalid tags: {error}")))?;
     decoded
         .into_iter()
         .map(|(name, value)| {
@@ -5562,10 +5586,7 @@ fn parse_jaeger_tags_filter(
                 }
                 other => other.to_string(),
             };
-            Ok((
-                internal_field_name_for_tempo_tag(&name),
-                normalized_value,
-            ))
+            Ok((internal_field_name_for_tempo_tag(&name), normalized_value))
         })
         .collect()
 }
@@ -5770,8 +5791,9 @@ impl JaegerTraceQuery {
         Ok(limit)
     }
 
-    fn parsed_tag_filters(&self) -> Result<Vec<(String, String)>, (StatusCode, Json<ErrorResponse>)>
-    {
+    fn parsed_tag_filters(
+        &self,
+    ) -> Result<Vec<(String, String)>, (StatusCode, Json<ErrorResponse>)> {
         parse_jaeger_tags_filter(self.tags.as_deref())
     }
 
@@ -5951,7 +5973,7 @@ impl From<TraceRowResponse> for TraceSpanRow {
                     name: name.into(),
                     value: value.into(),
                 })
-            .collect(),
+                .collect(),
         }
     }
 }

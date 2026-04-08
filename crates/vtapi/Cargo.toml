@@ -11,6 +11,7 @@ mimalloc_allocator = ["dep:mimalloc"]
 anyhow.workspace = true
 axum.workspace = true
 hyper-util.workspace = true
+libc.workspace = true
 mimalloc = { workspace = true, optional = true }
 reqwest.workspace = true
 rustls.workspace = true

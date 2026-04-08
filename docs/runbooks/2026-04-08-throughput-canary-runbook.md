@@ -103,6 +103,13 @@ For all roles, fill in:
 
 Do not reuse the old VictoriaTraces data directory contents.
 
+Storage readiness semantics are intentional:
+
+- `storage` may bind its TCP port before recovery finishes
+- `/livez` means the process is up
+- `/readyz` and `/healthz` stay `503` until recovery is complete
+- `systemd` readiness for `rust-victoria-trace-storage@*` is driven by `READY=1`, not by the port alone
+
 ## 4. Start Order
 
 Start order is fixed:
@@ -153,6 +160,8 @@ The smoke script verifies:
 
 Also verify on the storage hosts:
 
+- `systemctl status rust-victoria-trace-storage@a` or `@b` reaches `active (running)` only after recovery is ready
+- `curl http://127.0.0.1:13011/readyz` returns `200`
 - the configured `VT_STORAGE_PATH` exists
 - WAL files appear
 - `.part` files appear once sealing starts
@@ -186,7 +195,7 @@ Rollback immediately if any of these happen:
 - query `5xx` or timeouts climb
 - `seal_queue_depth` keeps growing instead of settling
 - RSS keeps rising without stabilizing
-- storage restart takes abnormally long before its port starts listening again
+- storage stays on `/readyz = 503` for abnormally long
 - smoke checks fail for `trace-by-id`, `search`, `services`, or `field-values`
 
 ## 8. Rollback
@@ -215,6 +224,7 @@ Execute:
 All of these should be true before you widen traffic:
 
 - `healthz` is green on all active roles
+- `readyz` is green on `storage`
 - `metrics` is scrapeable
 - smoke script passes
 - storage paths show WAL and `.part`
