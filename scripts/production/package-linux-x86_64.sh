@@ -92,7 +92,10 @@ mkdir -p "$STAGE_DIR/docs"
 cp -R docs/runbooks "$STAGE_DIR/docs/runbooks"
 
 tar -C "$OUTPUT_DIR" -czf "$TARBALL" linux-x86_64
-sha256sum "$(basename "$TARBALL")" > "$CHECKSUM"
+(
+  cd "$OUTPUT_DIR"
+  sha256sum "$(basename "$TARBALL")" > "$(basename "$CHECKSUM")"
+)
 
 echo "bundle ready:"
 echo "  tarball: $TARBALL"
