@@ -112,6 +112,8 @@ fn is_benchmark_mode(mode: &str) -> bool {
             | "http-ingest"
             | "otlp-protobuf-load"
             | "disk-trace-block-append"
+            | "official-compare"
+            | "official-query-compare"
     )
 }
 

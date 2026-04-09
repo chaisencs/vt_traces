@@ -1,4 +1,6 @@
 mod compare;
+mod official_compare;
+mod official_query_compare;
 mod preflight;
 
 use std::{
@@ -24,6 +26,10 @@ use axum::{
 };
 use bytes::Bytes;
 use compare::{default_report_schema_version, run_compare, CompareOptions};
+use official_compare::{parse_official_compare_options, run_official_compare};
+use official_query_compare::{
+    parse_official_query_compare_options, run_official_query_compare,
+};
 use preflight::{validate_benchmark_preflight, validate_otlp_benchmark_target};
 use reqwest::Client;
 use rustc_hash::FxHasher;
@@ -43,11 +49,15 @@ use vtstorage::{
 async fn main() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
     let mode = args.next().ok_or_else(|| {
-        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load|disk-trace-block-append|compare> [--key=value ...]")
+        anyhow!("usage: vtbench <storage-ingest|storage-query|http-ingest|otlp-protobuf-load|disk-trace-block-append|compare|official-compare|official-query-compare> [--key=value ...]")
     })?;
     validate_benchmark_preflight(&mode)?;
     match mode.as_str() {
         "compare" => run_compare(parse_compare_options(args)?),
+        "official-compare" => run_official_compare(parse_official_compare_options(args)?).await,
+        "official-query-compare" => {
+            run_official_query_compare(parse_official_query_compare_options(args)?).await
+        }
         _ => {
             let options = parse_options(args)?;
             match mode.as_str() {
@@ -615,7 +625,13 @@ impl Default for BenchOptions {
 }
 
 fn parse_options(args: impl Iterator<Item = String>) -> anyhow::Result<BenchOptions> {
-    let mut options = BenchOptions::default();
+    parse_options_with_defaults(args, BenchOptions::default())
+}
+
+fn parse_options_with_defaults(
+    args: impl Iterator<Item = String>,
+    mut options: BenchOptions,
+) -> anyhow::Result<BenchOptions> {
     for arg in args {
         let (key, value) = arg
             .strip_prefix("--")

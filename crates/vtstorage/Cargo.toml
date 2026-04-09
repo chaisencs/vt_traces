@@ -13,3 +13,4 @@ serde_json.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 vtcore = { path = "../vtcore" }
+zstd.workspace = true

@@ -1,189 +1,112 @@
-# Task Plan: Rust VictoriaTraces Rewrite
+# Task Plan: VictoriaTraces Design Gap Closure
 
 ## Goal
-Build a production-oriented Rust rewrite of the VictoriaTraces core inside `rust_victoria_trace`, starting with a single-node ingest/storage/query vertical slice and an architecture that can expand to cluster mode later.
+对照 `/Users/sen.chai/wmt_shop_env_projects/codex_projects/opentelemetry-migrate/victoriatraces-source-analysis-report.md`，系统比较 upstream VictoriaTraces 与当前 Rust 实现的写入、查询、持久化与恢复设计，明确哪些优点要保留、哪些缺点要补齐，并形成可执行的改造路线。
 
 ## Current Phase
-Phase 19
+Phase 6
 
 ## Phases
 
-### Phase 1: Requirements & Discovery
-- [x] Understand user intent
-- [x] Identify constraints and requirements
-- [x] Document findings in findings.md
+### Phase 1: Canonical Reading
+- [x] Read the VictoriaTraces source analysis report for core architectural choices
+- [x] Read current Rust architecture and recent recovery/perf design docs
+- [x] Capture stable comparison dimensions in findings.md
 - **Status:** complete
 
-### Phase 2: Planning & Structure
-- [x] Define technical approach
-- [x] Create Rust workspace structure
-- [x] Document decisions with rationale
+### Phase 2: Design Comparison
+- [x] Compare ingest hot path
+- [x] Compare query/index model
+- [x] Compare persistence/recovery semantics
+- [x] Compare cluster/HA tradeoffs
 - **Status:** complete
 
-### Phase 3: Implementation
-- [x] Create workspace and core crates
-- [x] Implement OTLP ingest model and flattening pipeline
-- [x] Implement in-memory trace index and row store
-- [x] Implement trace lookup API path
-- [x] Test incrementally
+### Phase 3: Direction Setting
+- [x] Decide what to preserve from current Rust design
+- [x] Decide what to adopt from VictoriaTraces design
+- [x] Reject low-value or incompatible directions explicitly
 - **Status:** complete
 
-### Phase 4: Testing & Verification
-- [x] Run Rust unit/integration tests
-- [x] Verify ingest -> query vertical slice
-- [x] Log results in progress.md
+### Phase 4: Delivery Assets
+- [x] Write a comparison and next-step design doc under docs/plans
+- [x] Summarize the concrete next implementation bets
+- [x] Note whether a thread capability package is needed next
 - **Status:** complete
 
-### Phase 5: Cluster Foundation
-- [x] Split `insert` / `select` / `storage` API roles
-- [x] Add trace-aware replica routing
-- [x] Add replica fallback on reads
-- [x] Add cluster metrics and tests
+### Phase 5: Recovery-First Implementation
+- [x] Preserve covered segment kind in recovery manifest/snapshot (`wal|part`)
+- [x] Make clean-shutdown recovery snapshot preserve actual persisted segment paths
+- [x] Add regression coverage for wal-backed covered segments
+- [x] Move steady-state trace roll from immediate seal to rotate-only persistence
+- [x] Re-benchmark Rust disk vs official after rotate-only lands
+- [x] Add a storage config switch to disable trace WAL explicitly
+- [x] Make rotate-only persistence recover correctly when WAL is disabled and segments are part-backed from birth
+- [x] Plumb `VT_STORAGE_TRACE_WAL_ENABLED` through `vtapi` runtime config and deployment examples
+- [x] Remove dead live-update tests/APIs plus the idle seal runtime from the steady-state data path
+- [x] Re-run full `vtstorage` / `vtapi` suites after the cleanup batch
+- [x] Re-benchmark the current arm64 working tree against official after the cleanup batch
+- [x] Probe the current WAL on/off throughput tradeoff directly on the throughput profile
+- [x] Use the new benchmark evidence to choose the next hot-path cut
+- **Status:** in progress
+
+### Phase 6: Sealed Query-Prune Index
+- [x] Land a sealed persistent filter index for service / operation / generic field pruning
+- [x] Route sealed trace search through prune-first execution instead of broad row scans
+- [x] Re-benchmark query-heavy same-shape workloads after sealed prune index lands
+- [x] Verify the new sealed index does not regress ingest hot path or recovery semantics
 - **Status:** complete
-
-### Phase 6: Delivery
-- [x] Summarize implemented scope and gaps to full VictoriaTraces parity
-- [x] Leave next-phase roadmap
-- [ ] Deliver current slice to user
-- **Status:** in_progress
-
-### Phase 7: Storage Core Hardening
-- [x] Replace single append file with segment-based disk storage
-- [x] Add sidecar metadata recovery for segments
-- [x] Add write quorum semantics for cluster ingest
-- [x] Move row-oriented segments to columnar parts
-- **Status:** complete
-
-### Phase 8: Segment Compaction & Node Governance
-- [x] Add automatic small-part compaction for sealed segments
-- [x] Add cluster node failure backoff and quarantine
-- [x] Expose quarantine behavior through metrics and tests
-- **Status:** complete
-
-### Phase 9: Selective Decode, Pruning & Repair Loops
-- [x] Add part-level selective decode for sealed `.part` trace reads
-- [x] Add time/service/operation pruning with per-trace operation bloom hints
-- [x] Add configurable read quorum for trace reads
-- [x] Add read repair after successful quorum reads
-- [x] Add admin-triggered rebalance for missing desired replicas
-- [x] Verify targeted and full-suite regressions
-- **Status:** complete
-
-### Phase 10: Production P0 Hardening
-- [x] Add durability hardening: record checksums, fsync policy, and crash-tail recovery
-- [x] Add overload controls: API concurrency limits, request body bounds, and test coverage
-- [x] Add stronger cluster governance: automatic repair loop and topology-aware placement
-- [x] Add benchmark/load-test harness for ingest/query hot paths
-- [x] Re-verify touched crates and workspace with fresh commands
-- **Status:** complete
-
-### Phase 11: Replica Governance, Auth & Performance Evidence
-- [x] Upgrade placement to weighted rendezvous with optional node weights
-- [x] Add concurrent replica fan-out and fast-replica trace reads
-- [x] Add public/internal/admin bearer-token boundaries
-- [x] Add standard OTLP/HTTP JSON ingest on `/v1/traces`
-- [x] Extend `vtbench` with duration mode and latency percentile output
-- [x] Re-verify touched crates and workspace with fresh commands
-- **Status:** complete
-
-### Phase 12: OTLP Protobuf, TLS & Membership Control Plane
-- [x] Add OTLP/HTTP protobuf ingest on `/v1/traces`
-- [x] Add optional HTTPS / mTLS server mode
-- [x] Add HTTPS / mTLS cluster client wiring for `insert` and `select`
-- [x] Add admin cluster members endpoint and background membership refresh loop
-- [x] Re-verify touched crates and workspace with fresh commands
-- **Status:** complete
-
-### Phase 13: Distributed Governance, TLS Lifecycle & Columnar Refinement
-- [x] Add select control-plane peer config and peer membership sync
-- [x] Add deterministic leader election and leader-only governance loops
-- [x] Add replicated control journal endpoints and peer journal sync
-- [x] Add rotating/reloading cluster HTTP client certificates without process restart
-- [x] Tighten columnar part internals with typed field encoding where it materially reduces read/write cost
-- [x] Re-verify touched crates and workspace with fresh commands
-- **Status:** complete
-
-### Phase 14: Benchmark Evidence & Protocol Expansion
-- [x] Extend `vtbench` with time-series reporting, `p999`, and injectable failure windows
-- [ ] Add higher-pressure soak/capacity workflows and publish repeatable result baselines
-- [x] Expand OTLP beyond traces with shared-core logs ingest/search support
-- [ ] Decide whether metrics belongs in this repository as a first-class series engine or as a separate bounded product slice
-- **Status:** in_progress
-
-### Phase 17: Trace Microbatch Leap
-- [x] Write a bounded design for the batching-layer microbatch route before touching code
-- [x] Add Step 0 metrics for retained blocks and trace batch formation
-- [x] Add Step 1 shard-local trace microbatch combiner on the shared batching layer
-- [x] Re-run same-host `vtbench otlp-protobuf-load` gates before deciding whether to keep pushing the route
-- **Status:** in_progress
-
-### Phase 18: Release Matrix & Query Gate
-- [x] Lock `stable` vs `throughput` as separate production release definitions
-- [x] Run query gate for `trace-by-id`, `search`, `services`, `field-values`, and mixed read/write
-- [x] Evaluate near-realtime query visibility and production deployment guidance
-- [x] Document results in README / release guide
-- **Status:** complete
-
-### Phase 19: Query-Plane Decoupling
-- [x] Remove request-path live-update drain from `search/services/field-values`
-- [x] Move live-update apply into a background worker and keep `/metrics` off the drain path
-- [x] Cache persisted field-column counts so `stats()` stops rereading every `.part`
-- [x] Re-run throughput static/mixed query gate and visibility probes
-- [ ] Decide whether `throughput` should ship with eventual `search/services/field-values` semantics under backlog or whether a read overlay / faster applier is required
-- **Status:** in_progress
 
 ## Key Questions
-1. Which crash-consistency guarantees can be delivered now without overcomplicating the current part lifecycle?
-2. Which overload controls protect the process fastest: per-role concurrency bounds, body-size limits, or both?
-3. How far can admin-led membership refresh and repair go before needing a fully distributed control plane?
-4. Does `default + data` preserve the right production stability semantics without collapsing into the `throughput + none` release?
-5. Are `trace-by-id`, `search`, `services`, `field-values`, and mixed read/write query paths fast enough and near-realtime enough for a production recommendation?
+1. Which VictoriaTraces design choices materially explain its performance profile?
+2. Which of those choices are compatible with the Rust rewrite's current goals and strengths?
+3. Which current Rust features are worth preserving even if upstream does not have them?
+4. What should the next implementation wave target first to improve throughput without discarding recovery v2?
 
 ## Decisions Made
 | Decision | Rationale |
 |----------|-----------|
-| Start with single-node vertical slice | Full parity with VictoriaTraces cluster is too large for one pass; a vertical slice proves architecture and behavior |
-| Build a Cargo workspace with multiple crates | Keeps ingest, storage, query, and API boundaries explicit and easier to evolve |
-| Model spans as flattened rows plus trace index | Preserves the same core design principle used by VictoriaTraces while staying implementable now |
-| Implement tests before behavior code where practical | Needed to keep the rewrite honest and avoid speculative architecture |
-| Use an OTLP-like JSON ingest surface for v0 | It preserved the conceptual boundary without pulling full protobuf and wire compatibility into the first slice |
-| Add cluster split before columnar parts | It locks the product topology early so the storage rewrite can focus on local efficiency instead of moving network boundaries later |
-| Add segment storage before columnar storage | It establishes the persistent part lifecycle and thin-index model before encoding optimization work |
-| Add compaction before deeper pruning | It reduces fan-out and query amplification early while preserving the current storage API surface |
-| Add in-process node quarantine before broader HA work | It removes repeated failed probes immediately without committing to a full membership protocol yet |
-| Add operation-aware pruning before broader per-field indexes | It targets a common tracing filter with small metadata and avoids paying the cost of generic indexing too early |
-| Add read repair before full automation | It restores replica health opportunistically on read paths while keeping the cluster loop simple and testable |
-| Prioritize durability before deeper hot-path rewrites | A fast trace system that can lose acknowledged writes is not production-ready |
-| Add bounded overload controls before claiming high-QPS readiness | Backpressure is required before any throughput number is trustworthy |
-| Add OTLP protobuf on `/v1/traces` before broader protocol work | It closes the most visible compatibility gap without forcing OTLP gRPC into the same pass |
-| Add TLS/mTLS and a select-side membership control surface before distributed consensus | It materially improves deployability and observability while keeping the control loop simple enough to verify |
-| Treat `stable` and `throughput` as separate release contracts, not runtime aliases | Production guidance becomes incoherent if durability- and responsiveness-biased defaults are mixed with the crash-loss-tolerant benchmark profile |
-| Recommend `stable` as the first production tier and keep `throughput` behind canary/soak | The local query gate shows `throughput` preserves excellent write throughput and ack-to-visible latency, but its post-burst query/metrics behavior is materially less stable |
+| Stay on the current thread for now | The immediate need is comparison and design convergence, not thread transfer |
+| Use VictoriaTraces report as canonical upstream design summary | Prevents re-deriving the upstream architecture from scratch |
+| Evaluate along four dimensions: ingest, query/index, persistence/recovery, cluster/HA | Keeps comparison concrete and implementation-oriented |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| `git status` failed because repo root is not a git repository | 1 | Continue without git assumptions; work directly in filesystem |
-| `cargo init` created nested `.git` directories for each crate | 1 | Removed generated nested repos and kept a single workspace layout |
-| `throughput` post-load `/metrics` scrape timed out while seal backlog was draining | 1 | Treat it as a real query-plane risk signal instead of waiting for the issue to disappear before measuring |
 
 ## Notes
-- This session targets a serious foundation, not fake completeness.
-- Initial implementation favors correctness and architecture clarity over premature micro-optimization.
-- Part payloads, selective decode, operation-aware pruning, and repair/rebalance control loops are now in place.
-- The hardening pass through Phase 13 is now complete; the remaining risks are proof-level benchmark evidence and whether metrics should become a first-class series engine here.
-- Phase 14 is now focused on turning `vtbench` into a stronger soak/fault evidence path and deciding how far OTLP metrics should be brought into a trace/log-first product boundary.
-- The current disk ingest focus inside Phase 14 is hot-path reuse and tail-stability work on the synchronous mainline, not a return to the failed async shard-worker experiment.
-- The trace-microbatch route was worth testing because it matched the request shape, but it is no longer the primary disk direction after the same-host review.
-- The remaining high-value performance path is now inside the disk append kernel itself, not in another outer request-batching rewrite.
-- Same-host review now shows the retained outer trace microbatch layer regresses disk versus both `2fd0eca` and `f326503`; the next execution plan is to recover the faster direct disk path first, then pursue a disk-internal prepared shard batch writer instead of extending the batching envelope.
-- Recovery line is now in place: passthrough engines bypass outer trace batching again, and disk-only same-host A/B puts current head back near the `f326503` direct-write band.
-- The new `vtbench disk-trace-block-append` harness now proves the disk kernel scales materially with larger same-shard append packets; the next unresolved task is exposing that gain to end-to-end HTTP ingest with a cheaper handoff than the rejected outer microbatch layer.
-- Reusing the outer batching envelope for passthrough trace appends has now been re-tested and rejected; it regressed disk to about `375492 spans/s`, so the next gain must stay disk-local.
-- The disk-local same-shard combiner should stay in its raw-queue / late-pickup form; an extra pre-prepare raw-block fusion attempt regressed disk throughput and has been dropped.
-- Read-side bounded drain is now in place for `stats()`, so `/metrics` no longer blocks on the full live-update backlog.
-- Fresh clean-start benchmarking after keeping only the bounded stats-side drain still has disk above official on both fresh single-run (`430192 spans/s` vs `396475`) and fresh 5-round median (`359315` vs `343086`) with better p99 in both cases.
-- The next real bottleneck is still forming materially larger same-shard append packets cheaply on the write path, while query/read paths beyond `stats()` still carry the full live-update drain debt.
-- A fresh disk-only `VT_STORAGE_TRACE_SHARDS=4/8/16` sweep shows `16` shards still wins on this host, so shard-count reduction is not the next high-value move.
-- This session is explicitly constrained to release semantics, query gate evidence, and production deployment guidance; ingest hot-path changes and benchmark-shape changes are out of scope.
-- The follow-up query-plane decoupling pass fixed the request-path drain and the `/metrics` part-reread hotspot, but it also made the remaining backlog semantics explicit: under heavy throughput backlog, `trace-by-id` stays near-realtime while `search/services/field-values` become eventual until the background applier catches up.
+- This task is comparative and architectural first; implementation sequencing comes after design convergence.
+- If a new thread is opened later, it should inherit method, benchmark, and output conventions via a capability package rather than a chat-summary handoff.
+- Main delivery artifacts:
+  - `docs/plans/2026-04-08-victoriatraces-design-realignment.md`
+  - `docs/handoffs/2026-04-08-rust-vt-design-capability-package.md`
+- Current implementation focus has moved from design-only to code: recovery manifest now carries covered segment kind so rotate-only persisted WAL segments can become a first-class recovery state.
+- Current benchmark status now needs to be read in time order, not cherry-picked:
+  - there was a temporary regression window where the cleaned current tree lagged official on native arm64
+  - after replacing the no-WAL direct-to-part rotate path with a cheap `.rows` row-file path, the latest native arm64 3-round median is back to Rust disk `638,582 spans/s` vs official `607,682 spans/s`, throughput ratio `1.0508`, p99 ratio `0.6133`
+  - current output dir: `/tmp/rust-vt-official-bench-rows-walfix-20260409`
+- New durability/performance runtime switch:
+  - `VT_STORAGE_TRACE_WAL_ENABLED` defaults to `true`
+  - setting it to `false` disables trace active-head WAL, keeps head visibility in memory, and materializes rolled segments as persisted `.rows` row files
+  - this is intentionally an opt-in tradeoff: higher write efficiency in exchange for losing active-head rows on process crash before roll
+- Latest direct probe says the no-WAL path is now a real mode rather than a pathological slow path:
+  - previous single native arm64 run with WAL off on the direct-to-part path: `252,397 spans/s`
+  - latest single native arm64 run with WAL on: `692,153 spans/s`, `p99 0.677 ms`
+  - latest single native arm64 run with WAL off on the new `.rows` path: `595,778 spans/s`, `p99 0.752 ms`
+  - conclusion: `trace_wal_enabled=false` is now a viable throughput-oriented option, but WAL-on still wins on absolute throughput and durability
+- Phase 6 has now landed a first real sealed-side prune path:
+  - recovery shard snapshot v3 stores compact persisted segment summaries plus per-trace summaries, instead of depending on heavy persisted inverted indexes
+  - reopened disk search now uses `persisted_segments -> candidate segment pruning -> exact trace-summary match`, so searches no longer need to rebuild segment metadata just to answer sealed queries
+  - old shard snapshot versions remain readable through versioned recovery decoding
+- Latest native arm64 3-round same-shape ingest compare after the Phase 6 cut:
+  - official median: `605,762.724 spans/s`, `p99 1.252 ms`
+  - Rust disk median: `623,163.967 spans/s`, `p99 0.774 ms`
+  - throughput ratio: `1.0287`
+  - p99 ratio: `0.6177`
+  - output dir: `/tmp/rust-vt-official-bench-phase6-20260409`
+- Phase 6 query-heavy same-shape benchmark is now also complete on the public Jaeger trace search path after persisted-data restart:
+  - official median: `28,022.114 qps`, `p99 2.162 ms`
+  - Rust disk median: `167,437.718 qps`, `p99 0.275 ms`
+  - throughput ratio: `5.9752`
+  - p99 ratio: `0.1271`
+  - output dir: `/tmp/rust-vt-official-query-bench-20260409`
+  - harness doc: `docs/plans/2026-04-09-official-query-benchmark-harness.md`

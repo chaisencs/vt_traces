@@ -13,6 +13,8 @@ use vtcore::{
 };
 use vtstorage::{DiskStorageConfig, DiskStorageEngine, DiskSyncPolicy, StorageEngine};
 
+const RECOVERY_MANIFEST_FILENAME: &str = "trace-index.manifest";
+
 fn make_row(trace_id: &str, span_id: &str, start: i64, end: i64) -> TraceSpanRow {
     TraceSpanRow::new(
         trace_id.to_string(),
@@ -47,6 +49,51 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
     assert!(condition(), "condition not satisfied before timeout");
 }
 
+fn segment_files_with_suffix(path: &PathBuf, suffix: &str) -> Vec<PathBuf> {
+    fs::read_dir(path)
+        .expect("read segment dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .map(|value| value.to_string_lossy().ends_with(suffix))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn root_files_with_prefix(path: &PathBuf, prefix: &str) -> Vec<PathBuf> {
+    fs::read_dir(path)
+        .expect("read root dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .map(|value| value.to_string_lossy().starts_with(prefix))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn segment_data_files(path: &PathBuf) -> Vec<PathBuf> {
+    fs::read_dir(path)
+        .expect("read segment dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value.ends_with(".wal") || value.ends_with(".part") || value.ends_with(".rows")
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 #[test]
 fn disk_engine_recovers_rows_after_reopen() {
     let path = temp_test_dir("recover");
@@ -73,6 +120,78 @@ fn disk_engine_recovers_rows_after_reopen() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].span_id, "span-1");
     assert_eq!(rows[1].span_id, "span-2");
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_can_disable_trace_wal_and_recover_from_rows_only() {
+    let path = temp_test_dir("recover-without-trace-wal");
+    let config = DiskStorageConfig::default()
+        .with_trace_shards(1)
+        .with_target_segment_size_bytes(1)
+        .with_trace_wal_enabled(false);
+
+    {
+        let engine = DiskStorageEngine::open_with_config(&path, config.clone())
+            .expect("open disk engine without wal");
+        engine
+            .append_rows(vec![make_row("trace-no-wal-1", "span-1", 100, 150)])
+            .expect("append first row");
+        engine
+            .append_rows(vec![make_row("trace-no-wal-2", "span-1", 200, 250)])
+            .expect("append second row");
+
+        let segments_path = path.join("segments");
+        wait_until(|| !segment_files_with_suffix(&segments_path, ".rows").is_empty());
+        assert!(
+            segment_files_with_suffix(&segments_path, ".wal").is_empty(),
+            "wal-disabled mode should not persist rotated trace segments as .wal files",
+        );
+        assert!(
+            segment_files_with_suffix(&segments_path, ".part").is_empty(),
+            "wal-disabled mode should not build .part files on the ingest hot path",
+        );
+    }
+
+    let segments_path = path.join("segments");
+    assert!(
+        segment_files_with_suffix(&segments_path, ".wal").is_empty(),
+        "wal-disabled mode should not leave trace .wal files behind after drop",
+    );
+    assert!(
+        !segment_files_with_suffix(&segments_path, ".rows").is_empty(),
+        "wal-disabled mode should materialize persisted segments as row files",
+    );
+    assert!(
+        segment_files_with_suffix(&segments_path, ".part").is_empty(),
+        "wal-disabled mode should not leave .part files behind after drop",
+    );
+
+    let reopened =
+        DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine without wal");
+    let first_window = reopened
+        .trace_window("trace-no-wal-1")
+        .expect("first trace window survives restart");
+    let second_window = reopened
+        .trace_window("trace-no-wal-2")
+        .expect("second trace window survives restart");
+    assert_eq!(
+        reopened.rows_for_trace(
+            "trace-no-wal-1",
+            first_window.start_unix_nano,
+            first_window.end_unix_nano,
+        ),
+        vec![make_row("trace-no-wal-1", "span-1", 100, 150)]
+    );
+    assert_eq!(
+        reopened.rows_for_trace(
+            "trace-no-wal-2",
+            second_window.start_unix_nano,
+            second_window.end_unix_nano,
+        ),
+        vec![make_row("trace-no-wal-2", "span-1", 200, 250)]
+    );
 
     fs::remove_dir_all(path).expect("cleanup temp dir");
 }
@@ -601,24 +720,18 @@ fn disk_engine_stats_keep_cached_field_column_counts_after_part_path_changes() {
         .expect("row")])
         .expect("append rows");
 
-    wait_until(|| engine.stats().trace_seal_completed > 0);
+    wait_until(|| engine.stats().segment_count >= 1);
 
     let stats = engine.stats();
     assert_eq!(stats.typed_field_columns, 1);
     assert_eq!(stats.string_field_columns, 2);
 
-    let part_path = fs::read_dir(path.join("segments"))
-        .expect("read segments dir")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".part"))
-        })
-        .expect("sealed part should exist");
-    let moved_part_path = part_path.with_extension("part.moved");
-    fs::rename(&part_path, &moved_part_path).expect("move part out of the way");
+    let data_path = segment_data_files(&path.join("segments"))
+        .into_iter()
+        .next()
+        .expect("persisted segment should exist");
+    let moved_data_path = data_path.with_extension("segment.moved");
+    fs::rename(&data_path, &moved_data_path).expect("move persisted segment out of the way");
 
     let cached_stats = engine.stats();
     assert_eq!(cached_stats.typed_field_columns, 1);
@@ -686,6 +799,186 @@ fn disk_engine_rotates_segments_and_recovers_indexes() {
     let part_bytes = fs::read(&first_part_path).expect("read part file");
     assert!(part_bytes.starts_with(b"VTPART1"));
     assert_eq!(part_bytes.get(7), Some(&2));
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_writes_recovery_snapshot_and_reopens_without_recreating_segment_meta() {
+    let path = temp_test_dir("recovery-snapshot");
+    let config = DiskStorageConfig::default()
+        .with_target_segment_size_bytes(1)
+        .with_trace_shards(1);
+
+    {
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk engine");
+        engine
+            .append_rows(vec![
+                make_row("trace-snapshot-1", "span-1", 10, 20),
+                make_row("trace-snapshot-2", "span-1", 30, 40),
+            ])
+            .expect("append rows");
+        wait_until(|| engine.stats().segment_count >= 1);
+    }
+
+    let manifest_path = path.join(RECOVERY_MANIFEST_FILENAME);
+    assert!(
+        manifest_path.exists(),
+        "clean shutdown should persist a recovery manifest"
+    );
+    assert!(
+        !root_files_with_prefix(&path, "trace-index-shard-").is_empty(),
+        "clean shutdown should persist per-shard recovery files",
+    );
+
+    let segments_dir = path.join("segments");
+    let meta_json_files = segment_files_with_suffix(&segments_dir, ".meta.json");
+    let meta_bin_files = segment_files_with_suffix(&segments_dir, ".meta.bin");
+    for meta_path in meta_json_files.iter().chain(meta_bin_files.iter()) {
+        fs::remove_file(meta_path).expect("remove segment meta");
+    }
+
+    let reopened = DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine");
+    let hits = reopened.search_traces(&TraceSearchRequest {
+        start_unix_nano: 0,
+        end_unix_nano: 100,
+        service_name: Some("checkout".to_string()),
+        operation_name: None,
+        field_filters: Vec::new(),
+        limit: 10,
+    });
+    assert_eq!(hits.len(), 2);
+    assert!(
+        segment_files_with_suffix(&segments_dir, ".meta.json").is_empty()
+            && segment_files_with_suffix(&segments_dir, ".meta.bin").is_empty(),
+        "snapshot-backed reopen should not need to recreate missing segment metadata",
+    );
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_replays_only_tail_segments_outside_the_recovery_snapshot() {
+    let path = temp_test_dir("recovery-tail");
+    let config = DiskStorageConfig::default()
+        .with_target_segment_size_bytes(1)
+        .with_trace_shards(1);
+    let manifest_path = path.join(RECOVERY_MANIFEST_FILENAME);
+
+    {
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk engine");
+        engine
+            .append_rows(vec![make_row("trace-base", "span-1", 10, 20)])
+            .expect("append base row");
+        wait_until(|| engine.stats().segment_count >= 1);
+    }
+    let stale_manifest = fs::read(&manifest_path).expect("read initial manifest");
+    let stale_shard_files = root_files_with_prefix(&path, "trace-index-shard-")
+        .into_iter()
+        .map(|path| {
+            let file_name = path
+                .file_name()
+                .expect("snapshot shard file name")
+                .to_string_lossy()
+                .to_string();
+            let bytes = fs::read(&path).expect("read snapshot shard file");
+            (file_name, bytes)
+        })
+        .collect::<Vec<_>>();
+
+    {
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config.clone()).expect("reopen disk engine");
+        engine
+            .append_rows(vec![make_row("trace-tail", "span-1", 30, 40)])
+            .expect("append tail row");
+        wait_until(|| engine.stats().segment_count >= 2);
+    }
+
+    fs::write(&manifest_path, stale_manifest).expect("restore stale manifest");
+    for shard_path in root_files_with_prefix(&path, "trace-index-shard-") {
+        fs::remove_file(shard_path).expect("remove current shard snapshot");
+    }
+    for (file_name, bytes) in stale_shard_files {
+        fs::write(path.join(file_name), bytes).expect("restore stale shard snapshot");
+    }
+
+    let segments_dir = path.join("segments");
+    let persisted_segment_files = segment_data_files(&segments_dir);
+    assert!(
+        persisted_segment_files.len() >= 2,
+        "fixture should contain at least two persisted segments"
+    );
+    let mut meta_files = segment_files_with_suffix(&segments_dir, ".meta.bin");
+    meta_files.sort();
+    if meta_files.is_empty() {
+        meta_files = segment_files_with_suffix(&segments_dir, ".meta.json");
+        meta_files.sort();
+    }
+    let covered_meta = meta_files.first().cloned();
+    if let Some(meta_path) = covered_meta.as_ref() {
+        fs::remove_file(meta_path).expect("remove covered segment metadata");
+    }
+
+    let reopened = DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine");
+    assert!(reopened.trace_window("trace-base").is_some());
+    assert!(reopened.trace_window("trace-tail").is_some());
+    if let Some(meta_path) = covered_meta {
+        assert!(
+            !meta_path.exists(),
+            "segments already covered by the recovery snapshot should not need metadata recreation",
+        );
+    } else {
+        let covered_meta_json = segments_dir.join("segment-00000000000000000001.meta.json");
+        let covered_meta_bin = segments_dir.join("segment-00000000000000000001.meta.bin");
+        assert!(
+            !covered_meta_json.exists() && !covered_meta_bin.exists(),
+            "snapshot-covered wal segments should not need metadata recreation",
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_ignores_corrupted_recovery_shard_and_rebuilds_from_segments() {
+    let path = temp_test_dir("recovery-corrupt-shard");
+    let config = DiskStorageConfig::default()
+        .with_target_segment_size_bytes(1)
+        .with_trace_shards(1);
+
+    {
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk engine");
+        engine
+            .append_rows(vec![
+                make_row("trace-corrupt-1", "span-1", 10, 20),
+                make_row("trace-corrupt-2", "span-1", 30, 40),
+            ])
+            .expect("append rows");
+        wait_until(|| engine.stats().segment_count >= 1);
+    }
+
+    let shard_files = root_files_with_prefix(&path, "trace-index-shard-");
+    assert_eq!(
+        shard_files.len(),
+        1,
+        "fixture should persist exactly one shard snapshot"
+    );
+    fs::write(&shard_files[0], b"corrupted").expect("corrupt shard snapshot");
+
+    let reopened = DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine");
+    let hits = reopened.search_traces(&TraceSearchRequest {
+        start_unix_nano: 0,
+        end_unix_nano: 100,
+        service_name: Some("checkout".to_string()),
+        operation_name: None,
+        field_filters: Vec::new(),
+        limit: 10,
+    });
+    assert_eq!(hits.len(), 2, "corrupted shard snapshot should be ignored");
 
     fs::remove_dir_all(path).expect("cleanup temp dir");
 }
@@ -774,7 +1067,7 @@ fn disk_engine_compacts_small_parts_after_reopen() {
             .append_rows(vec![make_row("trace-compact-1", "span-3", 50, 60)])
             .expect("append third row");
 
-        wait_until(|| engine.stats().trace_seal_completed >= 2);
+        wait_until(|| engine.stats().segment_count >= 2);
         assert!(engine.stats().segment_count >= 2);
     }
 
@@ -800,18 +1093,24 @@ fn disk_engine_compacts_small_parts_after_reopen() {
 #[test]
 fn disk_engine_uses_selective_decode_for_part_reads() {
     let path = temp_test_dir("selective-decode");
+    let config = DiskStorageConfig::default().with_target_segment_size_bytes(1);
 
     {
-        let engine = DiskStorageEngine::open(&path).expect("open disk engine");
+        let engine = DiskStorageEngine::open_with_config(&path, config.clone())
+            .expect("open disk engine");
         engine
-            .append_rows(vec![
-                make_row("trace-part-read-1", "span-1", 100, 150),
-                make_row("trace-part-read-1", "span-2", 160, 210),
-            ])
-            .expect("append rows");
+            .append_rows(vec![make_row("trace-part-read-1", "span-1", 100, 150)])
+            .expect("append first row");
+        engine
+            .append_rows(vec![make_row("trace-part-read-1", "span-2", 160, 210)])
+            .expect("append second row");
+        engine
+            .append_rows(vec![make_row("trace-part-read-1", "span-3", 220, 260)])
+            .expect("append third row");
+        wait_until(|| engine.stats().segment_count >= 2);
     }
 
-    let reopened = DiskStorageEngine::open(&path).expect("reopen disk engine");
+    let reopened = DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine");
     let window = reopened
         .trace_window("trace-part-read-1")
         .expect("trace window exists");
@@ -821,7 +1120,7 @@ fn disk_engine_uses_selective_decode_for_part_reads() {
         window.end_unix_nano,
     );
 
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert_eq!(reopened.stats().part_selective_decodes, 1);
 
     fs::remove_dir_all(path).expect("cleanup temp dir");
@@ -1102,7 +1401,7 @@ fn disk_engine_records_fsync_operations_when_sync_policy_requires_it() {
 }
 
 #[test]
-fn disk_engine_trace_by_id_reads_head_and_sealed_parts_together() {
+fn disk_engine_trace_by_id_reads_across_rotated_persisted_segments() {
     let path = temp_test_dir("head-and-sealed-federation");
     let config = DiskStorageConfig::default()
         .with_trace_shards(1)
@@ -1116,11 +1415,11 @@ fn disk_engine_trace_by_id_reads_head_and_sealed_parts_together() {
         .append_rows(vec![make_row("trace-federated-1", "span-2", 160, 210)])
         .expect("append second head row");
 
-    wait_until(|| engine.stats().trace_seal_completed > 0);
+    wait_until(|| engine.stats().segment_count >= 2);
 
     let window = engine
         .trace_window("trace-federated-1")
-        .expect("trace window should span sealed and head data");
+        .expect("trace window should span rotated persisted data");
     let rows = engine.rows_for_trace(
         "trace-federated-1",
         window.start_unix_nano,
@@ -1177,16 +1476,16 @@ fn disk_engine_reports_head_group_commit_and_seal_metrics() {
         .append_rows(vec![make_row("trace-head-metrics-2", "span-1", 200, 250)])
         .expect("append second metrics row");
 
-    wait_until(|| engine.stats().trace_seal_completed > 0);
+    wait_until(|| engine.stats().segment_count >= 2);
 
     let stats = engine.stats();
     assert!(stats.trace_group_commit_flushes >= 2);
     assert!(stats.trace_group_commit_rows >= 2);
     assert!(stats.trace_group_commit_bytes > 0);
-    assert!(stats.trace_seal_queue_depth <= 1);
-    assert!(stats.trace_seal_completed >= 1);
-    assert!(stats.trace_seal_rows >= 1);
-    assert!(stats.trace_seal_bytes > 0);
+    assert_eq!(stats.trace_seal_queue_depth, 0);
+    assert_eq!(stats.trace_seal_completed, 0);
+    assert_eq!(stats.trace_seal_rows, 0);
+    assert_eq!(stats.trace_seal_bytes, 0);
 
     drop(engine);
     fs::remove_dir_all(seal_path).expect("cleanup temp dir");

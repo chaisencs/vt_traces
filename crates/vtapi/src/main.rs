@@ -292,6 +292,9 @@ fn load_storage_sync(
                 config =
                     config.with_trace_wal_writer_capacity_bytes(trace_wal_writer_capacity_bytes);
             }
+            if let Some(trace_wal_enabled) = env_bool("VT_STORAGE_TRACE_WAL_ENABLED") {
+                config = config.with_trace_wal_enabled(trace_wal_enabled);
+            }
             let configured_trace_seal_worker_count = env::var("VT_STORAGE_TRACE_SEAL_WORKER_COUNT")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok());
@@ -700,15 +703,22 @@ impl StorageEngine for DeferredStorageEngine {
     }
 }
 
+fn parse_env_bool_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env::var(name)
+        .ok()
+        .and_then(|value| parse_env_bool_value(&value))
+}
+
 fn env_truthy(name: &str) -> bool {
-    matches!(
-        env::var(name)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    env_bool(name).unwrap_or(false)
 }
 
 fn load_cluster_config(local_control_node: Option<&str>) -> anyhow::Result<ClusterConfig> {
@@ -783,7 +793,8 @@ fn load_cluster_config(local_control_node: Option<&str>) -> anyhow::Result<Clust
 #[cfg(test)]
 mod tests {
     use super::{
-        disk_overrides_for_trace_ingest_profile, parse_trace_ingest_profile,
+        disk_overrides_for_trace_ingest_profile, parse_env_bool_value,
+        parse_trace_ingest_profile,
         TraceIngestDiskOverrides, TraceIngestProfile, THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES,
         THROUGHPUT_PROFILE_TRACE_SEAL_WORKER_COUNT,
     };
@@ -866,6 +877,19 @@ mod tests {
                 trace_seal_worker_count: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_env_bool_value_supports_truthy_and_falsey_values() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            assert_eq!(parse_env_bool_value(value), Some(true), "{value}");
+        }
+        for value in ["0", "false", "FALSE", " no ", "Off"] {
+            assert_eq!(parse_env_bool_value(value), Some(false), "{value}");
+        }
+        for value in ["", "maybe", "2"] {
+            assert_eq!(parse_env_bool_value(value), None, "{value}");
+        }
     }
 }
 

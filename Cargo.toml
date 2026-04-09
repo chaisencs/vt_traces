@@ -39,6 +39,7 @@ tower = { version = "0.5", features = ["limit", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 mimalloc = { version = "0.1.43", default-features = false }
+zstd = "0.13"
 
 [profile.release]
 codegen-units = 1

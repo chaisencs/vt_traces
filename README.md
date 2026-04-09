@@ -452,6 +452,10 @@ cargo run -p vtapi
   - 当它和 `VT_STORAGE_SYNC_POLICY=none` 组合使用时，acked trace 的 crash-loss window 会比默认 profile 更大
 - `VT_STORAGE_TRACE_SEAL_WORKER_COUNT`
   - trace segment seal 的后台 worker 数；`throughput + none` 下默认 `4`
+- `VT_STORAGE_TRACE_WAL_ENABLED`
+  - 默认 `true`
+  - 设成 `false` 后，trace active head 不再落 `.wal`，滚段时直接 materialize 成 `.part`
+  - 这样可以进一步减轻写入热路径，但进程在 active head 尚未滚段前崩溃时，会丢失这部分已 ack trace
 - `VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES`
   - 活动 segment 轮转阈值
 - `VT_MAX_REQUEST_BODY_BYTES`
