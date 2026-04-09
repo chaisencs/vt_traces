@@ -1,8 +1,22 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vtcore::{
     LogRow, LogSearchRequest, TraceBlock, TraceSearchHit, TraceSearchRequest, TraceSpanRow,
     TraceWindow,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceRowsRequest {
+    pub trace_id: String,
+    pub start_unix_nano: i64,
+    pub end_unix_nano: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceRowsResponse {
+    pub trace_id: String,
+    pub rows: Vec<TraceSpanRow>,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TraceBatchPayloadMode {
@@ -17,6 +31,7 @@ pub struct StorageStatsSnapshot {
     pub traces_tracked: u64,
     pub retained_trace_blocks: u64,
     pub persisted_bytes: u64,
+    pub persisted_segment_count: u64,
     pub segment_count: u64,
     pub trace_head_segments: u64,
     pub trace_head_rows: u64,
@@ -43,6 +58,8 @@ pub struct StorageStatsSnapshot {
     pub trace_seal_completed: u64,
     pub trace_seal_rows: u64,
     pub trace_seal_bytes: u64,
+    pub trace_retention_deleted_segments: u64,
+    pub trace_retention_deleted_bytes: u64,
     pub trace_batch_flush_due_to_rows: u64,
     pub trace_batch_flush_due_to_blocks: u64,
     pub trace_batch_flush_due_to_wait: u64,
@@ -75,6 +92,35 @@ pub trait StorageEngine: Send + Sync + 'static {
     fn list_services(&self) -> Vec<String>;
     fn list_field_names(&self) -> Vec<String>;
     fn list_field_values(&self, field_name: &str) -> Vec<String>;
+    fn list_operations(
+        &self,
+        service_name: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+        limit: usize,
+    ) -> Vec<String> {
+        let hits = self.search_traces(&TraceSearchRequest {
+            start_unix_nano,
+            end_unix_nano,
+            service_name: Some(service_name.to_string()),
+            operation_name: None,
+            field_filters: Vec::new(),
+            limit: usize::MAX,
+        });
+
+        let mut operations = std::collections::BTreeSet::new();
+        for hit in hits {
+            for row in self.rows_for_trace(&hit.trace_id, hit.start_unix_nano, hit.end_unix_nano) {
+                if row.service_name() == Some(service_name) {
+                    operations.insert(row.name);
+                    if operations.len() >= limit {
+                        return operations.into_iter().collect();
+                    }
+                }
+            }
+        }
+        operations.into_iter().collect()
+    }
     fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit>;
     fn search_logs(&self, request: &LogSearchRequest) -> Vec<LogRow>;
     fn rows_for_trace(
@@ -83,6 +129,19 @@ pub trait StorageEngine: Send + Sync + 'static {
         start_unix_nano: i64,
         end_unix_nano: i64,
     ) -> Vec<TraceSpanRow>;
+    fn rows_for_traces(&self, requests: &[TraceRowsRequest]) -> Vec<TraceRowsResponse> {
+        requests
+            .iter()
+            .map(|request| TraceRowsResponse {
+                trace_id: request.trace_id.clone(),
+                rows: self.rows_for_trace(
+                    &request.trace_id,
+                    request.start_unix_nano,
+                    request.end_unix_nano,
+                ),
+            })
+            .collect()
+    }
     fn stats(&self) -> StorageStatsSnapshot;
     fn preferred_trace_ingest_shards(&self) -> usize {
         1

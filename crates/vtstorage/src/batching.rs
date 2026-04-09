@@ -17,7 +17,10 @@ use vtcore::{
     TraceSpanRow, TraceWindow,
 };
 
-use crate::{StorageEngine, StorageError, StorageStatsSnapshot, TraceBatchPayloadMode};
+use crate::{
+    StorageEngine, StorageError, StorageStatsSnapshot, TraceBatchPayloadMode, TraceRowsRequest,
+    TraceRowsResponse,
+};
 
 const DEFAULT_MAX_BATCH_ROWS: usize = 8_192;
 const DEFAULT_MAX_TRACE_BATCH_BLOCKS: usize = 256;
@@ -425,6 +428,17 @@ impl StorageEngine for BatchingStorageEngine {
         self.inner.search_logs(request)
     }
 
+    fn list_operations(
+        &self,
+        service_name: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+        limit: usize,
+    ) -> Vec<String> {
+        self.inner
+            .list_operations(service_name, start_unix_nano, end_unix_nano, limit)
+    }
+
     fn rows_for_trace(
         &self,
         trace_id: &str,
@@ -433,6 +447,10 @@ impl StorageEngine for BatchingStorageEngine {
     ) -> Vec<TraceSpanRow> {
         self.inner
             .rows_for_trace(trace_id, start_unix_nano, end_unix_nano)
+    }
+
+    fn rows_for_traces(&self, requests: &[TraceRowsRequest]) -> Vec<TraceRowsResponse> {
+        self.inner.rows_for_traces(requests)
     }
 
     fn stats(&self) -> StorageStatsSnapshot {

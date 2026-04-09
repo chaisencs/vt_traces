@@ -8,5 +8,8 @@ mod state;
 
 pub use batching::{BatchingStorageConfig, BatchingStorageEngine};
 pub use disk::{DiskStorageConfig, DiskStorageEngine, DiskSyncPolicy};
-pub use engine::{StorageEngine, StorageError, StorageStatsSnapshot, TraceBatchPayloadMode};
+pub use engine::{
+    StorageEngine, StorageError, StorageStatsSnapshot, TraceBatchPayloadMode, TraceRowsRequest,
+    TraceRowsResponse,
+};
 pub use memory::MemoryStorageEngine;

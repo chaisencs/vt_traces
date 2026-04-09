@@ -452,6 +452,9 @@ cargo run -p vtapi
   - 当它和 `VT_STORAGE_SYNC_POLICY=none` 组合使用时，acked trace 的 crash-loss window 会比默认 profile 更大
 - `VT_STORAGE_TRACE_SEAL_WORKER_COUNT`
   - trace segment seal 的后台 worker 数；`throughput + none` 下默认 `4`
+- `VT_STORAGE_RETENTION_HOURS` / `VT_STORAGE_RETENTION_DAYS`
+  - 按 persisted segment 的时间窗做 TTL 清理；`24h` 可以配 `VT_STORAGE_RETENTION_HOURS=24` 或 `VT_STORAGE_RETENTION_DAYS=1`
+  - 当前是 segment 粒度保留，不是按单条 span 精确截断；超过 retention 的 persisted `wal|part|rows` 及其 `meta` 会被删除
 - `VT_STORAGE_TRACE_WAL_ENABLED`
   - 默认 `true`
   - 设成 `false` 后，trace active head 不再落 `.wal`，滚段时直接 materialize 成 `.part`

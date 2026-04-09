@@ -37,7 +37,10 @@ use vtingest::{
     Status as OtlpStatus,
 };
 use vtquery::QueryService;
-use vtstorage::{MemoryStorageEngine, StorageEngine, StorageError, StorageStatsSnapshot};
+use vtstorage::{
+    MemoryStorageEngine, StorageEngine, StorageError, StorageStatsSnapshot, TraceRowsRequest,
+    TraceRowsResponse,
+};
 
 use crate::{cluster::ClusterConfig, http_client::ClusterHttpClient};
 
@@ -907,8 +910,84 @@ struct TraceResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct TraceRowsBatchRequest {
+    traces: Vec<TraceRowsRequest>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TraceRowsBatchResponse {
+    traces: Vec<TraceRowsResponse>,
+}
+
+#[derive(Debug, Default)]
+struct TraceReplicaReadState {
+    chosen_rows: Option<Vec<TraceSpanRow>>,
+    successful_row_reads: usize,
+    repair_targets: Vec<String>,
+    had_error: bool,
+}
+
+impl TraceReplicaReadState {
+    fn record_rows(
+        &mut self,
+        trace_id: &str,
+        rows: Vec<TraceSpanRow>,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if let Some(existing) = &self.chosen_rows {
+            if !canonical_trace_rows_equal(existing, &rows) {
+                return Err(bad_gateway(format!(
+                    "read quorum mismatch for trace {trace_id}"
+                )));
+            }
+        } else {
+            self.chosen_rows = Some(rows);
+        }
+        self.successful_row_reads += 1;
+        Ok(())
+    }
+
+    fn record_empty(&mut self, node: String) {
+        self.repair_targets.push(node);
+    }
+
+    fn record_failure(&mut self, node: String) {
+        self.had_error = true;
+        self.repair_targets.push(node);
+    }
+
+    async fn finalize(
+        self,
+        state: &SelectState,
+        trace_id: &str,
+    ) -> Result<Vec<TraceSpanRow>, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(rows) = self.chosen_rows {
+            if self.successful_row_reads < state.cluster.read_quorum() {
+                return Err(bad_gateway(format!(
+                    "read quorum not met for trace {trace_id}: successes={}, required={}",
+                    self.successful_row_reads,
+                    state.cluster.read_quorum()
+                )));
+            }
+            let _ = repair_trace_on_nodes(state, &self.repair_targets, &rows).await;
+            Ok(rows)
+        } else if self.had_error {
+            Err(bad_gateway(format!(
+                "all replicas failed while querying trace {trace_id}"
+            )))
+        } else {
+            Ok(Vec::new())
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ServicesResponse {
     services: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OperationsResponse {
+    operations: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1387,8 +1466,13 @@ pub fn build_storage_router_with_startup_auth_and_limits(
                     Router::new()
                         .route("/internal/v1/rows", post(append_rows_internal))
                         .route("/internal/v1/logs", post(append_logs_internal))
+                        .route("/internal/v1/traces/rows", post(get_trace_rows_local))
                         .route("/internal/v1/traces/index", get(list_trace_ids_local))
                         .route("/internal/v1/services", get(list_services_local))
+                        .route(
+                            "/internal/v1/services/:service_name/operations",
+                            get(list_operations_local),
+                        )
                         .route("/internal/v1/tags", get(list_tags_local))
                         .route(
                             "/internal/v1/tags/:tag_name/values",
@@ -1960,7 +2044,7 @@ async fn append_trace_blocks_with_profile(
 ) -> Result<(), StorageError> {
     match trace_ingest_profile {
         TraceIngestProfile::Default => append_trace_blocks_blocking(storage, blocks).await,
-        TraceIngestProfile::Throughput => storage.append_trace_blocks(blocks),
+        TraceIngestProfile::Throughput => append_trace_blocks_blocking(storage, blocks).await,
     }
 }
 
@@ -2337,6 +2421,15 @@ async fn get_trace_local(
     Json(build_trace_response(&state.query, trace_id))
 }
 
+async fn get_trace_rows_local(
+    State(state): State<Arc<StorageState>>,
+    Json(request): Json<TraceRowsBatchRequest>,
+) -> Json<TraceRowsBatchResponse> {
+    Json(TraceRowsBatchResponse {
+        traces: state.storage.rows_for_traces(&request.traces),
+    })
+}
+
 async fn get_trace_cluster(
     State(state): State<Arc<SelectState>>,
     Path(trace_id): Path<String>,
@@ -2348,6 +2441,17 @@ async fn get_trace_cluster(
 async fn list_services_local(State(state): State<Arc<StorageState>>) -> Json<ServicesResponse> {
     Json(ServicesResponse {
         services: state.query.list_services(),
+    })
+}
+
+async fn list_operations_local(
+    State(state): State<Arc<StorageState>>,
+    Path(service_name): Path<String>,
+) -> Json<OperationsResponse> {
+    Json(OperationsResponse {
+        operations: state
+            .query
+            .list_operations(&service_name, i64::MIN, i64::MAX, usize::MAX),
     })
 }
 
@@ -2992,9 +3096,11 @@ async fn list_operations_jaeger_local(
     State(state): State<Arc<StorageState>>,
     Path(service_name): Path<String>,
 ) -> Json<JaegerResponse<Vec<String>>> {
-    Json(jaeger_success_response(list_operations_for_query(
-        &state.query,
+    Json(jaeger_success_response(state.query.list_operations(
         &service_name,
+        i64::MIN,
+        i64::MAX,
+        usize::MAX,
     )))
 }
 
@@ -3185,10 +3291,7 @@ async fn fetch_trace_rows_cluster(
     state: &SelectState,
     trace_id: &str,
 ) -> Result<Vec<TraceSpanRow>, (StatusCode, Json<ErrorResponse>)> {
-    let mut had_error = false;
-    let mut successful_reads = 0usize;
-    let mut repair_targets = Vec::new();
-    let mut chosen_rows: Option<Vec<TraceSpanRow>> = None;
+    let mut read_state = TraceReplicaReadState::default();
     let selected_nodes = state.health.select_nodes(
         state.cluster.placements(trace_id),
         state.cluster.read_quorum(),
@@ -3251,67 +3354,186 @@ async fn fetch_trace_rows_cluster(
         match result {
             Ok(RemoteTraceReadOutcome::Rows { node, rows }) => {
                 state.health.mark_success(&node);
-                successful_reads += 1;
-                if let Some(existing) = &chosen_rows {
-                    if !canonical_trace_rows_equal(existing, &rows) {
-                        read_tasks.abort_all();
-                        return Err(bad_gateway(format!(
-                            "read quorum mismatch for trace {trace_id}"
-                        )));
-                    }
-                } else {
-                    chosen_rows = Some(rows);
-                }
-                if successful_reads >= state.cluster.read_quorum() {
+                read_state.record_rows(trace_id, rows)?;
+                if read_state.successful_row_reads >= state.cluster.read_quorum() {
                     read_tasks.abort_all();
                     break;
                 }
             }
             Ok(RemoteTraceReadOutcome::Empty { node }) => {
                 state.health.mark_success(&node);
-                repair_targets.push(node);
+                read_state.record_empty(node);
             }
             Ok(RemoteTraceReadOutcome::Failure { node, error }) => {
-                had_error = true;
                 state.metrics.record_read_error();
                 if state.health.mark_failure(&node, error.clone()) {
                     state.metrics.record_node_quarantine();
                 }
-                repair_targets.push(node.clone());
+                read_state.record_failure(node.clone());
                 warn!(node = %node, error = %error, "remote trace query failed");
             }
             Err(error) => {
-                had_error = true;
                 state.metrics.record_read_error();
+                read_state.had_error = true;
                 warn!(error = %error, "trace read task failed");
             }
         }
     }
+    read_state.finalize(state, trace_id).await
+}
 
-    if chosen_rows.is_some() && successful_reads < state.cluster.read_quorum() {
-        Err(bad_gateway(format!(
-            "read quorum not met for trace {trace_id}: successes={}, required={}",
-            successful_reads,
-            state.cluster.read_quorum()
-        )))
-    } else if successful_reads < state.cluster.read_quorum() && had_error {
-        Err(bad_gateway(format!(
-            "read quorum not met for trace {trace_id}: successes={}, required={}",
-            successful_reads,
-            state.cluster.read_quorum()
-        )))
-    } else if let Some(rows) = chosen_rows {
-        let _ = repair_trace_on_nodes(state, &repair_targets, &rows).await;
-        Ok(rows)
-    } else if successful_reads >= state.cluster.read_quorum() {
-        Ok(Vec::new())
-    } else if had_error {
-        Err(bad_gateway(format!(
-            "all replicas failed while querying trace {trace_id}"
-        )))
-    } else {
-        Ok(Vec::new())
+async fn fetch_trace_rows_batch_cluster(
+    state: &SelectState,
+    hits: &[TraceSearchHit],
+) -> Result<HashMap<String, Vec<TraceSpanRow>>, (StatusCode, Json<ErrorResponse>)> {
+    if hits.is_empty() {
+        return Ok(HashMap::new());
     }
+
+    let mut requests_by_node: HashMap<String, Vec<TraceRowsRequest>> = HashMap::new();
+    let mut read_states: HashMap<String, TraceReplicaReadState> = hits
+        .iter()
+        .map(|hit| (hit.trace_id.clone(), TraceReplicaReadState::default()))
+        .collect();
+    let mut skipped_reads = 0usize;
+    for hit in hits {
+        let selected_nodes = state.health.select_nodes(
+            state.cluster.placements(&hit.trace_id),
+            state.cluster.read_quorum(),
+        );
+        skipped_reads += selected_nodes.skipped;
+        for node in selected_nodes.nodes {
+            requests_by_node
+                .entry(node)
+                .or_default()
+                .push(TraceRowsRequest {
+                    trace_id: hit.trace_id.clone(),
+                    start_unix_nano: hit.start_unix_nano,
+                    end_unix_nano: hit.end_unix_nano,
+                });
+        }
+    }
+    state.metrics.record_read_skips(skipped_reads);
+
+    let mut read_tasks = JoinSet::new();
+    let internal_bearer_token = state.auth.internal_bearer_token().map(ToString::to_string);
+    for (node, traces) in requests_by_node {
+        state.metrics.record_read_request();
+        let client = state.http_client.clone();
+        let bearer_token = internal_bearer_token.clone();
+        let requested_trace_ids = traces
+            .iter()
+            .map(|trace| trace.trace_id.clone())
+            .collect::<Vec<_>>();
+        read_tasks.spawn(async move {
+            let response = apply_bearer_auth(
+                client.post(format!("{node}/internal/v1/traces/rows")),
+                bearer_token.as_deref(),
+            )
+            .json(&TraceRowsBatchRequest { traces })
+            .send()
+            .await;
+            (node, requested_trace_ids, response)
+        });
+    }
+
+    while let Some(result) = read_tasks.join_next().await {
+        let Ok((node, requested_trace_ids, response)) = result else {
+            state.metrics.record_read_error();
+            for trace_id in hits.iter().map(|hit| hit.trace_id.as_str()) {
+                if let Some(read_state) = read_states.get_mut(trace_id) {
+                    read_state.had_error = true;
+                }
+            }
+            continue;
+        };
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                state.metrics.record_read_error();
+                if state.health.mark_failure(&node, error.to_string()) {
+                    state.metrics.record_node_quarantine();
+                }
+                for trace_id in requested_trace_ids {
+                    if let Some(read_state) = read_states.get_mut(&trace_id) {
+                        read_state.record_failure(node.clone());
+                    }
+                }
+                warn!(node = %node, error = %error, "remote trace rows batch query failed");
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            state.metrics.record_read_error();
+            if state
+                .health
+                .mark_failure(&node, response.status().to_string())
+            {
+                state.metrics.record_node_quarantine();
+            }
+            for trace_id in requested_trace_ids {
+                if let Some(read_state) = read_states.get_mut(&trace_id) {
+                    read_state.record_failure(node.clone());
+                }
+            }
+            warn!(
+                node = %node,
+                status = %response.status(),
+                "remote trace rows batch query returned non-success status"
+            );
+            continue;
+        }
+
+        match response.json::<TraceRowsBatchResponse>().await {
+            Ok(batch_response) => {
+                state.health.mark_success(&node);
+                let rows_by_trace = batch_response
+                    .traces
+                    .into_iter()
+                    .map(|trace| (trace.trace_id, trace.rows))
+                    .collect::<HashMap<_, _>>();
+                for trace_id in requested_trace_ids {
+                    let rows = rows_by_trace.get(&trace_id).cloned().unwrap_or_default();
+                    let Some(read_state) = read_states.get_mut(&trace_id) else {
+                        continue;
+                    };
+                    if rows.is_empty() {
+                        read_state.record_empty(node.clone());
+                    } else {
+                        read_state.record_rows(&trace_id, rows)?;
+                    }
+                }
+            }
+            Err(error) => {
+                state.metrics.record_read_error();
+                for trace_id in requested_trace_ids {
+                    if let Some(read_state) = read_states.get_mut(&trace_id) {
+                        read_state.record_failure(node.clone());
+                    }
+                }
+                warn!(
+                    node = %node,
+                    error = %error,
+                    "failed to decode trace rows batch response"
+                );
+            }
+        }
+    }
+
+    let mut rows_by_trace = HashMap::new();
+    for hit in hits {
+        let rows = read_states
+            .remove(&hit.trace_id)
+            .unwrap_or_default()
+            .finalize(state, &hit.trace_id)
+            .await?;
+        if !rows.is_empty() {
+            rows_by_trace.insert(hit.trace_id.clone(), rows);
+        }
+    }
+    Ok(rows_by_trace)
 }
 
 async fn fetch_trace_rows_from_nodes(
@@ -3801,56 +4023,79 @@ async fn gather_log_rows_cluster(
     Ok(rows)
 }
 
-fn list_operations_for_query(query: &QueryService, service_name: &str) -> Vec<String> {
-    let hits = query.search_traces(&TraceSearchRequest {
-        start_unix_nano: i64::MIN,
-        end_unix_nano: i64::MAX,
-        service_name: Some(service_name.to_string()),
-        operation_name: None,
-        field_filters: Vec::new(),
-        limit: usize::MAX,
-    });
-
-    let mut operations = BTreeSet::new();
-    for hit in hits {
-        for row in query.get_trace(&hit.trace_id) {
-            if row.service_name() == Some(service_name) {
-                operations.insert(row.name.clone());
-            }
-        }
-    }
-
-    operations.into_iter().collect()
-}
-
 async fn list_operations_for_cluster(
     state: &SelectState,
     service_name: &str,
 ) -> Result<Vec<String>, (StatusCode, Json<ErrorResponse>)> {
-    let hits = gather_trace_hits_cluster(
-        state,
-        &SearchQuery {
-            start_unix_nano: i64::MIN,
-            end_unix_nano: i64::MAX,
-            service_name: Some(service_name.to_string()),
-            operation_name: None,
-            field_filter: Vec::new(),
-            limit: Some(usize::MAX),
-        },
-    )
-    .await?;
-
     let mut operations = BTreeSet::new();
-    for hit in hits {
-        let rows = fetch_trace_rows_cluster(state, &hit.trace_id).await?;
-        for row in rows {
-            if row.service_name() == Some(service_name) {
-                operations.insert(row.name);
+    let mut successful_nodes = 0usize;
+    let mut had_error = false;
+    let selected_nodes = state
+        .health
+        .select_nodes(state.cluster.storage_nodes().iter().map(String::as_str), 1);
+    state.metrics.record_read_skips(selected_nodes.skipped);
+
+    for node in selected_nodes.nodes {
+        state.metrics.record_read_request();
+        let response = match state
+            .http_client
+            .get(format!(
+                "{node}/internal/v1/services/{service_name}/operations"
+            ))
+            .bearer_auth_opt(state.auth.internal_bearer_token())
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                had_error = true;
+                state.metrics.record_read_error();
+                if state.health.mark_failure(&node, error.to_string()) {
+                    state.metrics.record_node_quarantine();
+                }
+                warn!(node = %node, error = %error, "remote operations query failed");
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            had_error = true;
+            state.metrics.record_read_error();
+            if state
+                .health
+                .mark_failure(&node, response.status().to_string())
+            {
+                state.metrics.record_node_quarantine();
+            }
+            warn!(
+                node = %node,
+                status = %response.status(),
+                "remote operations query returned non-success status"
+            );
+            continue;
+        }
+
+        match response.json::<OperationsResponse>().await {
+            Ok(remote_operations) => {
+                state.health.mark_success(&node);
+                successful_nodes += 1;
+                operations.extend(remote_operations.operations);
+            }
+            Err(error) => {
+                had_error = true;
+                state.metrics.record_read_error();
+                warn!(node = %node, error = %error, "failed to decode operations response");
             }
         }
     }
 
-    Ok(operations.into_iter().collect())
+    if successful_nodes == 0 && had_error {
+        Err(bad_gateway(
+            "all storage nodes failed while listing operations",
+        ))
+    } else {
+        Ok(operations.into_iter().collect())
+    }
 }
 
 fn search_jaeger_traces_local(
@@ -3871,10 +4116,14 @@ fn search_jaeger_traces_local(
     let search_request =
         jaeger_query.trace_search_request(service_name.clone(), fetch_limit, &tag_filters)?;
     let hits = query.search_traces(&search_request);
+    let rows_by_trace = query.get_traces_for_hits(&hits);
 
     let mut traces = Vec::new();
     for hit in hits {
-        let rows = query.get_trace(&hit.trace_id);
+        let rows = rows_by_trace
+            .get(&hit.trace_id)
+            .cloned()
+            .unwrap_or_default();
         if !trace_matches_jaeger_query(
             &rows,
             &service_name,
@@ -3914,10 +4163,14 @@ async fn search_jaeger_traces_cluster(
     let search_query =
         jaeger_query.search_query(service_name.clone(), fetch_limit, &tag_filters)?;
     let hits = gather_trace_hits_cluster(state, &search_query).await?;
+    let rows_by_trace = fetch_trace_rows_batch_cluster(state, &hits).await?;
 
     let mut traces = Vec::new();
     for hit in hits {
-        let rows = fetch_trace_rows_cluster(state, &hit.trace_id).await?;
+        let rows = rows_by_trace
+            .get(&hit.trace_id)
+            .cloned()
+            .unwrap_or_default();
         if !trace_matches_jaeger_query(
             &rows,
             &service_name,
@@ -4592,6 +4845,11 @@ fn render_storage_metrics(stats: &StorageStatsSnapshot, startup: &StorageStartup
         ),
         "# TYPE vt_storage_persisted_bytes gauge".to_string(),
         format!("vt_storage_persisted_bytes {}", stats.persisted_bytes),
+        "# TYPE vt_storage_persisted_segments gauge".to_string(),
+        format!(
+            "vt_storage_persisted_segments {}",
+            stats.persisted_segment_count
+        ),
         "# TYPE vt_storage_segments gauge".to_string(),
         format!("vt_storage_segments {}", stats.segment_count),
         "# TYPE vt_storage_trace_head_segments gauge".to_string(),
@@ -4709,6 +4967,16 @@ fn render_storage_metrics(stats: &StorageStatsSnapshot, startup: &StorageStartup
         format!(
             "vt_storage_trace_seal_bytes_total {}",
             stats.trace_seal_bytes
+        ),
+        "# TYPE vt_storage_trace_retention_deleted_segments_total counter".to_string(),
+        format!(
+            "vt_storage_trace_retention_deleted_segments_total {}",
+            stats.trace_retention_deleted_segments
+        ),
+        "# TYPE vt_storage_trace_retention_deleted_bytes_total counter".to_string(),
+        format!(
+            "vt_storage_trace_retention_deleted_bytes_total {}",
+            stats.trace_retention_deleted_bytes
         ),
         "# TYPE vt_storage_trace_batch_flush_due_to_rows_total counter".to_string(),
         format!(

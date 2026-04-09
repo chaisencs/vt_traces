@@ -12,7 +12,7 @@ use vtcore::{
 };
 use vtstorage::{
     BatchingStorageConfig, BatchingStorageEngine, MemoryStorageEngine, StorageEngine, StorageError,
-    StorageStatsSnapshot, TraceBatchPayloadMode,
+    StorageStatsSnapshot, TraceBatchPayloadMode, TraceRowsRequest, TraceRowsResponse,
 };
 
 fn make_row(trace_id: &str, span_id: &str, start: i64, end: i64) -> TraceSpanRow {
@@ -268,6 +268,89 @@ impl StorageEngine for PassthroughTraceBlockEngine {
     }
 }
 
+#[derive(Debug, Default)]
+struct QueryForwardingEngine {
+    list_operations_calls: AtomicUsize,
+    search_traces_calls: AtomicUsize,
+    rows_for_trace_calls: AtomicUsize,
+    rows_for_traces_calls: AtomicUsize,
+}
+
+impl StorageEngine for QueryForwardingEngine {
+    fn append_rows(&self, _rows: Vec<TraceSpanRow>) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn append_logs(&self, _rows: Vec<LogRow>) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn trace_window(&self, _trace_id: &str) -> Option<TraceWindow> {
+        None
+    }
+
+    fn list_trace_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn list_services(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn list_field_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn list_field_values(&self, _field_name: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn list_operations(
+        &self,
+        _service_name: &str,
+        _start_unix_nano: i64,
+        _end_unix_nano: i64,
+        _limit: usize,
+    ) -> Vec<String> {
+        self.list_operations_calls.fetch_add(1, Ordering::Relaxed);
+        vec!["GET /checkout".to_string()]
+    }
+
+    fn search_traces(&self, _request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
+        self.search_traces_calls.fetch_add(1, Ordering::Relaxed);
+        Vec::new()
+    }
+
+    fn search_logs(&self, _request: &LogSearchRequest) -> Vec<LogRow> {
+        Vec::new()
+    }
+
+    fn rows_for_trace(
+        &self,
+        _trace_id: &str,
+        _start_unix_nano: i64,
+        _end_unix_nano: i64,
+    ) -> Vec<TraceSpanRow> {
+        self.rows_for_trace_calls.fetch_add(1, Ordering::Relaxed);
+        Vec::new()
+    }
+
+    fn rows_for_traces(&self, requests: &[TraceRowsRequest]) -> Vec<TraceRowsResponse> {
+        self.rows_for_traces_calls.fetch_add(1, Ordering::Relaxed);
+        requests
+            .iter()
+            .map(|request| TraceRowsResponse {
+                trace_id: request.trace_id.clone(),
+                rows: vec![make_row(&request.trace_id, "span-forwarded", 100, 150)],
+            })
+            .collect()
+    }
+
+    fn stats(&self) -> StorageStatsSnapshot {
+        StorageStatsSnapshot::default()
+    }
+}
+
 #[test]
 fn batching_engine_trace_fast_path_preserves_all_concurrent_writes() {
     let inner = Arc::new(CountingEngine::default());
@@ -499,6 +582,32 @@ fn batching_engine_bypasses_outer_trace_batch_for_passthrough_engines() {
     assert_eq!(stats.trace_batch_flushes, 0);
     assert_eq!(stats.trace_batch_input_blocks, 0);
     assert_eq!(stats.trace_batch_output_blocks, 0);
+}
+
+#[test]
+fn batching_engine_forwards_fast_query_methods_to_inner_storage() {
+    let inner = Arc::new(QueryForwardingEngine::default());
+    let engine =
+        BatchingStorageEngine::with_config(inner.clone(), BatchingStorageConfig::default());
+
+    assert_eq!(
+        engine.list_operations("checkout", 0, 1_000, 10),
+        vec!["GET /checkout".to_string()]
+    );
+
+    let responses = engine.rows_for_traces(&[TraceRowsRequest {
+        trace_id: "trace-forwarded".to_string(),
+        start_unix_nano: 100,
+        end_unix_nano: 150,
+    }]);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].trace_id, "trace-forwarded");
+    assert_eq!(responses[0].rows.len(), 1);
+
+    assert_eq!(inner.list_operations_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(inner.rows_for_traces_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(inner.search_traces_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.rows_for_trace_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]

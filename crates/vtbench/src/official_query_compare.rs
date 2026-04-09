@@ -230,7 +230,8 @@ pub(crate) async fn run_official_query_compare(
         .build()
         .context("build reqwest client for official-query-compare")?;
     let plans = build_query_run_plans(&options);
-    let fixture_base_start_nanos = current_unix_nanos()?.saturating_sub(QUERY_FIXTURE_LOOKBACK_NANOS);
+    let fixture_base_start_nanos =
+        current_unix_nanos()?.saturating_sub(QUERY_FIXTURE_LOOKBACK_NANOS);
     write_manifest(&options, &plans, fixture_base_start_nanos)?;
 
     let mut report_files_by_target: BTreeMap<QueryBenchmarkTarget, Vec<PathBuf>> = BTreeMap::new();
@@ -251,13 +252,8 @@ pub(crate) async fn run_official_query_compare(
         prep_stop_result?;
 
         let mut bench_child = spawn_target_process(&options, plan)?;
-        let bench_result = run_query_benchmark_stage(
-            &client,
-            &options,
-            plan,
-            fixture_base_start_nanos,
-        )
-        .await;
+        let bench_result =
+            run_query_benchmark_stage(&client, &options, plan, fixture_base_start_nanos).await;
         let bench_stop_result = stop_child(&mut bench_child, plan.target.slug());
         bench_result?;
         bench_stop_result?;
@@ -301,7 +297,14 @@ async fn run_fixture_stage(
     )
     .await?;
     if matches!(plan.target, QueryBenchmarkTarget::Official) {
-        force_flush(client, &format!("http://{}:{}/internal/force_flush", options.host, options.official_port)).await?;
+        force_flush(
+            client,
+            &format!(
+                "http://{}:{}/internal/force_flush",
+                options.host, options.official_port
+            ),
+        )
+        .await?;
         sleep(Duration::from_millis(500)).await;
     }
     Ok(())
@@ -585,11 +588,23 @@ async fn run_jaeger_query_load(
         completed_queries,
         elapsed,
         &[
-            ("queries".to_string().as_str(), completed_queries.to_string()),
+            (
+                "queries".to_string().as_str(),
+                completed_queries.to_string(),
+            ),
             ("concurrency".to_string().as_str(), concurrency.to_string()),
-            ("fixture_requests".to_string().as_str(), fixture_requests.to_string()),
-            ("query_cases".to_string().as_str(), QUERY_CASES.len().to_string()),
-            ("query_limit".to_string().as_str(), DEFAULT_QUERY_LIMIT.to_string()),
+            (
+                "fixture_requests".to_string().as_str(),
+                fixture_requests.to_string(),
+            ),
+            (
+                "query_cases".to_string().as_str(),
+                QUERY_CASES.len().to_string(),
+            ),
+            (
+                "query_limit".to_string().as_str(),
+                DEFAULT_QUERY_LIMIT.to_string(),
+            ),
         ],
         Some(&latencies),
         &timeline,
@@ -604,11 +619,7 @@ fn make_query_fixture_payload_variants(
 ) -> anyhow::Result<Vec<Bytes>> {
     (0..payload_variants.max(1))
         .map(|request_index| {
-            make_query_fixture_payload(
-                request_index,
-                spans_per_request,
-                fixture_base_start_nanos,
-            )
+            make_query_fixture_payload(request_index, spans_per_request, fixture_base_start_nanos)
         })
         .collect()
 }
@@ -620,15 +631,19 @@ fn make_query_fixture_payload(
 ) -> anyhow::Result<Bytes> {
     let case = QUERY_CASES[request_index % QUERY_CASES.len()];
     let trace_id = format!("{:032x}", request_index + 1);
-    let base_start = fixture_base_start_nanos
-        + (request_index as i64) * QUERY_FIXTURE_REQUEST_SPACING_NANOS;
+    let base_start =
+        fixture_base_start_nanos + (request_index as i64) * QUERY_FIXTURE_REQUEST_SPACING_NANOS;
     let mut spans = Vec::with_capacity(spans_per_request);
     for span_offset in 0..spans_per_request {
-        let start_time_unix_nano = base_start + (span_offset as i64) * QUERY_FIXTURE_SPAN_SPACING_NANOS;
+        let start_time_unix_nano =
+            base_start + (span_offset as i64) * QUERY_FIXTURE_SPAN_SPACING_NANOS;
         let end_time_unix_nano = start_time_unix_nano + 80_000 + (span_offset as i64) * 5_000;
         spans.push(SpanRecord {
             trace_id: trace_id.clone(),
-            span_id: format!("{:016x}", request_index * spans_per_request + span_offset + 1),
+            span_id: format!(
+                "{:016x}",
+                request_index * spans_per_request + span_offset + 1
+            ),
             parent_span_id: None,
             name: case.operation.to_string(),
             start_time_unix_nano,
@@ -1009,9 +1024,15 @@ mod tests {
         )
         .expect("official query compare options should parse");
 
-        assert_eq!(options.official_bin, PathBuf::from("/tmp/victoria-traces-prod"));
+        assert_eq!(
+            options.official_bin,
+            PathBuf::from("/tmp/victoria-traces-prod")
+        );
         assert_eq!(options.rust_bin, PathBuf::from("/tmp/vtapi"));
-        assert_eq!(options.output_dir, PathBuf::from("/tmp/official-query-bench"));
+        assert_eq!(
+            options.output_dir,
+            PathBuf::from("/tmp/official-query-bench")
+        );
         assert_eq!(options.rounds, 4);
         assert_eq!(options.fixture_requests, 4096);
         assert_eq!(options.official_port, 13101);
@@ -1048,10 +1069,7 @@ mod tests {
             plans[0].ingest_url,
             "http://127.0.0.1:13081/insert/opentelemetry/v1/traces"
         );
-        assert_eq!(
-            plans[1].readiness_url,
-            "http://127.0.0.1:13083/readyz"
-        );
+        assert_eq!(plans[1].readiness_url, "http://127.0.0.1:13083/readyz");
         assert_eq!(
             plans[0].report_file,
             Path::new("/tmp/official-query-bench/round-01/official.json")

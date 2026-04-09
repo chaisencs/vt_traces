@@ -11,16 +11,22 @@ use std::{
 use vtcore::{
     Field, FieldFilter, LogRow, LogSearchRequest, TraceBlock, TraceSearchRequest, TraceSpanRow,
 };
-use vtstorage::{DiskStorageConfig, DiskStorageEngine, DiskSyncPolicy, StorageEngine};
+use vtstorage::{
+    DiskStorageConfig, DiskStorageEngine, DiskSyncPolicy, StorageEngine, TraceRowsRequest,
+};
 
 const RECOVERY_MANIFEST_FILENAME: &str = "trace-index.manifest";
 
 fn make_row(trace_id: &str, span_id: &str, start: i64, end: i64) -> TraceSpanRow {
+    make_named_row(trace_id, span_id, &format!("span-{span_id}"), start, end)
+}
+
+fn make_named_row(trace_id: &str, span_id: &str, name: &str, start: i64, end: i64) -> TraceSpanRow {
     TraceSpanRow::new(
         trace_id.to_string(),
         span_id.to_string(),
         None,
-        format!("span-{span_id}"),
+        name.to_string(),
         start,
         end,
         vec![Field::new("resource_attr:service.name", "checkout")],
@@ -120,6 +126,79 @@ fn disk_engine_recovers_rows_after_reopen() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].span_id, "span-1");
     assert_eq!(rows[1].span_id, "span-2");
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_lists_operations_from_persisted_summaries() {
+    let path = temp_test_dir("list-operations-persisted");
+    let config = DiskStorageConfig::default()
+        .with_trace_shards(1)
+        .with_target_segment_size_bytes(1);
+
+    {
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk engine");
+        engine
+            .append_rows(vec![
+                make_named_row("trace-ops-1", "span-1", "GET /checkout", 100, 150),
+                make_named_row("trace-ops-2", "span-1", "SELECT cart_items", 200, 260),
+            ])
+            .expect("append rows");
+    }
+
+    let reopened = DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine");
+    assert_eq!(
+        reopened.list_operations("checkout", i64::MIN, i64::MAX, usize::MAX),
+        vec!["GET /checkout".to_string(), "SELECT cart_items".to_string()]
+    );
+
+    fs::remove_dir_all(path).expect("cleanup temp dir");
+}
+
+#[test]
+fn disk_engine_batches_rows_for_traces_by_segment() {
+    let path = temp_test_dir("rows-for-traces-batch");
+    let config = DiskStorageConfig::default()
+        .with_trace_shards(1)
+        .with_target_segment_size_bytes(1);
+
+    {
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk engine");
+        engine
+            .append_rows(vec![
+                make_row("trace-batch-1", "span-1", 100, 150),
+                make_row("trace-batch-2", "span-1", 160, 220),
+            ])
+            .expect("append rows");
+    }
+
+    let reopened = DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine");
+    let responses = reopened.rows_for_traces(&[
+        TraceRowsRequest {
+            trace_id: "trace-batch-1".to_string(),
+            start_unix_nano: 100,
+            end_unix_nano: 150,
+        },
+        TraceRowsRequest {
+            trace_id: "trace-batch-2".to_string(),
+            start_unix_nano: 160,
+            end_unix_nano: 220,
+        },
+    ]);
+
+    assert_eq!(responses.len(), 2);
+    assert_eq!(
+        responses[0].rows,
+        vec![make_row("trace-batch-1", "span-1", 100, 150)]
+    );
+    assert_eq!(
+        responses[1].rows,
+        vec![make_row("trace-batch-2", "span-1", 160, 220)]
+    );
+    assert_eq!(reopened.stats().segment_read_batches, 1);
 
     fs::remove_dir_all(path).expect("cleanup temp dir");
 }
@@ -502,7 +581,7 @@ fn disk_engine_can_defer_wal_writes_until_drop_and_still_recover() {
 }
 
 #[test]
-fn disk_engine_exposes_search_services_and_field_values_from_head_before_seal() {
+fn disk_engine_keeps_trace_by_id_visible_before_seal_but_hides_search_indexes() {
     let path = temp_test_dir("head-query-visibility");
     let config = DiskStorageConfig::default()
         .with_trace_shards(1)
@@ -540,25 +619,9 @@ fn disk_engine_exposes_search_services_and_field_values_from_head_before_seal() 
         ])
         .expect("append rows");
 
-    wait_until(|| {
-        engine.list_services() == vec!["checkout".to_string()]
-            && engine.list_field_values("span_attr:http.method")
-                == vec!["GET".to_string(), "POST".to_string()]
-            && engine
-                .search_traces(&TraceSearchRequest {
-                    start_unix_nano: 0,
-                    end_unix_nano: 500,
-                    service_name: Some("checkout".to_string()),
-                    operation_name: Some("POST /checkout".to_string()),
-                    field_filters: vec![FieldFilter {
-                        name: "span_attr:http.method".to_string(),
-                        value: "POST".to_string(),
-                    }],
-                    limit: 10,
-                })
-                .len()
-                == 1
-    });
+    assert!(engine.list_services().is_empty());
+    assert!(engine.list_field_names().is_empty());
+    assert!(engine.list_field_values("span_attr:http.method").is_empty());
 
     let hits = engine.search_traces(&TraceSearchRequest {
         start_unix_nano: 0,
@@ -571,8 +634,7 @@ fn disk_engine_exposes_search_services_and_field_values_from_head_before_seal() 
         }],
         limit: 10,
     });
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].trace_id, "trace-head-query-2");
+    assert!(hits.is_empty());
 
     let window = engine
         .trace_window("trace-head-query-2")
@@ -589,7 +651,7 @@ fn disk_engine_exposes_search_services_and_field_values_from_head_before_seal() 
 }
 
 #[test]
-fn disk_engine_deferred_wal_keeps_query_indexes_visible_before_drop_and_after_reopen() {
+fn disk_engine_deferred_wal_hides_search_indexes_before_drop_and_recovers_them_after_reopen() {
     let path = temp_test_dir("deferred-wal-query-visibility");
     let config = DiskStorageConfig::default()
         .with_trace_shards(1)
@@ -615,24 +677,8 @@ fn disk_engine_deferred_wal_keeps_query_indexes_visible_before_drop_and_after_re
             .expect("row")])
             .expect("append rows");
 
-        wait_until(|| {
-            engine.list_services() == vec!["checkout".to_string()]
-                && engine.list_field_values("span_attr:http.method") == vec!["POST".to_string()]
-                && engine
-                    .search_traces(&TraceSearchRequest {
-                        start_unix_nano: 0,
-                        end_unix_nano: 500,
-                        service_name: Some("checkout".to_string()),
-                        operation_name: Some("POST /checkout".to_string()),
-                        field_filters: vec![FieldFilter {
-                            name: "span_attr:http.method".to_string(),
-                            value: "POST".to_string(),
-                        }],
-                        limit: 10,
-                    })
-                    .len()
-                    == 1
-        });
+        assert!(engine.list_services().is_empty());
+        assert!(engine.list_field_values("span_attr:http.method").is_empty());
 
         let hits = engine.search_traces(&TraceSearchRequest {
             start_unix_nano: 0,
@@ -645,8 +691,18 @@ fn disk_engine_deferred_wal_keeps_query_indexes_visible_before_drop_and_after_re
             }],
             limit: 10,
         });
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].trace_id, "trace-deferred-query-1");
+        assert!(hits.is_empty());
+
+        let window = engine
+            .trace_window("trace-deferred-query-1")
+            .expect("trace window should remain visible before drop");
+        let rows = engine.rows_for_trace(
+            "trace-deferred-query-1",
+            window.start_unix_nano,
+            window.end_unix_nano,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].span_id, "span-1");
     }
 
     let reopened = DiskStorageEngine::open_with_config(&path, config).expect("reopen disk engine");

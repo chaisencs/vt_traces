@@ -39,8 +39,8 @@ use vtapi::{
     ServerTlsConfig, StorageStartupState, TraceIngestProfile,
 };
 use vtcore::{
-    encode_trace_rows, LogRow, LogSearchRequest, TraceSearchHit, TraceSearchRequest, TraceSpanRow,
-    TraceWindow,
+    encode_trace_rows, Field, LogRow, LogSearchRequest, TraceSearchHit, TraceSearchRequest,
+    TraceSpanRow, TraceWindow,
 };
 use vtingest::{
     decode_export_trace_service_request_protobuf, encode_export_logs_service_request_protobuf,
@@ -50,7 +50,7 @@ use vtingest::{
 };
 use vtstorage::{
     DiskStorageConfig, DiskStorageEngine, DiskSyncPolicy, MemoryStorageEngine, StorageEngine,
-    StorageError, StorageStatsSnapshot,
+    StorageError, StorageStatsSnapshot, TraceRowsRequest, TraceRowsResponse,
 };
 
 fn temp_test_dir(name: &str) -> PathBuf {
@@ -312,6 +312,199 @@ impl StorageEngine for SlowStorageEngine {
     }
 }
 
+struct CountingQueryStorageEngine {
+    operations: Vec<String>,
+    hits: Vec<TraceSearchHit>,
+    rows_by_trace: Mutex<std::collections::HashMap<String, Vec<TraceSpanRow>>>,
+    batch_rows_by_trace: Mutex<Option<std::collections::HashMap<String, Vec<TraceSpanRow>>>>,
+    trace_windows: Mutex<std::collections::HashMap<String, TraceWindow>>,
+    list_operations_calls: AtomicU64,
+    search_traces_calls: AtomicU64,
+    rows_for_trace_calls: AtomicU64,
+    rows_for_traces_calls: AtomicU64,
+}
+
+impl CountingQueryStorageEngine {
+    fn for_operations(operations: Vec<&str>) -> Self {
+        Self {
+            operations: operations.into_iter().map(ToString::to_string).collect(),
+            hits: Vec::new(),
+            rows_by_trace: Mutex::new(std::collections::HashMap::new()),
+            batch_rows_by_trace: Mutex::new(None),
+            trace_windows: Mutex::new(std::collections::HashMap::new()),
+            list_operations_calls: AtomicU64::new(0),
+            search_traces_calls: AtomicU64::new(0),
+            rows_for_trace_calls: AtomicU64::new(0),
+            rows_for_traces_calls: AtomicU64::new(0),
+        }
+    }
+
+    fn for_search(traces: Vec<(&str, i64, i64, Vec<TraceSpanRow>)>) -> Self {
+        let mut hits = Vec::new();
+        let mut rows_by_trace = std::collections::HashMap::new();
+        let mut trace_windows = std::collections::HashMap::new();
+        for (trace_id, start_unix_nano, end_unix_nano, rows) in traces {
+            hits.push(TraceSearchHit {
+                trace_id: trace_id.to_string(),
+                start_unix_nano,
+                end_unix_nano,
+                services: vec!["checkout".to_string()],
+            });
+            rows_by_trace.insert(trace_id.to_string(), rows);
+            trace_windows.insert(
+                trace_id.to_string(),
+                TraceWindow::new(trace_id.to_string(), start_unix_nano, end_unix_nano),
+            );
+        }
+        Self {
+            operations: Vec::new(),
+            hits,
+            rows_by_trace: Mutex::new(rows_by_trace),
+            batch_rows_by_trace: Mutex::new(None),
+            trace_windows: Mutex::new(trace_windows),
+            list_operations_calls: AtomicU64::new(0),
+            search_traces_calls: AtomicU64::new(0),
+            rows_for_trace_calls: AtomicU64::new(0),
+            rows_for_traces_calls: AtomicU64::new(0),
+        }
+    }
+
+    fn for_search_with_batched_rows(
+        traces: Vec<(&str, i64, i64, Vec<TraceSpanRow>)>,
+        batched_rows: Vec<(&str, Vec<TraceSpanRow>)>,
+    ) -> Self {
+        let engine = Self::for_search(traces);
+        *engine.batch_rows_by_trace.lock().unwrap() = Some(
+            batched_rows
+                .into_iter()
+                .map(|(trace_id, rows)| (trace_id.to_string(), rows))
+                .collect(),
+        );
+        engine
+    }
+
+    fn list_operations_calls(&self) -> u64 {
+        self.list_operations_calls.load(Ordering::Relaxed)
+    }
+
+    fn search_traces_calls(&self) -> u64 {
+        self.search_traces_calls.load(Ordering::Relaxed)
+    }
+
+    fn rows_for_trace_calls(&self) -> u64 {
+        self.rows_for_trace_calls.load(Ordering::Relaxed)
+    }
+
+    fn rows_for_traces_calls(&self) -> u64 {
+        self.rows_for_traces_calls.load(Ordering::Relaxed)
+    }
+}
+
+impl StorageEngine for CountingQueryStorageEngine {
+    fn append_rows(&self, _rows: Vec<TraceSpanRow>) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn append_logs(&self, _rows: Vec<LogRow>) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn trace_window(&self, trace_id: &str) -> Option<TraceWindow> {
+        self.trace_windows.lock().unwrap().get(trace_id).cloned()
+    }
+
+    fn list_trace_ids(&self) -> Vec<String> {
+        self.trace_windows.lock().unwrap().keys().cloned().collect()
+    }
+
+    fn list_services(&self) -> Vec<String> {
+        vec!["checkout".to_string()]
+    }
+
+    fn list_field_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn list_field_values(&self, _field_name: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn list_operations(
+        &self,
+        _service_name: &str,
+        _start_unix_nano: i64,
+        _end_unix_nano: i64,
+        limit: usize,
+    ) -> Vec<String> {
+        self.list_operations_calls.fetch_add(1, Ordering::Relaxed);
+        self.operations.iter().take(limit).cloned().collect()
+    }
+
+    fn search_traces(&self, _request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
+        self.search_traces_calls.fetch_add(1, Ordering::Relaxed);
+        self.hits.clone()
+    }
+
+    fn search_logs(&self, _request: &LogSearchRequest) -> Vec<LogRow> {
+        Vec::new()
+    }
+
+    fn rows_for_trace(
+        &self,
+        trace_id: &str,
+        _start_unix_nano: i64,
+        _end_unix_nano: i64,
+    ) -> Vec<TraceSpanRow> {
+        self.rows_for_trace_calls.fetch_add(1, Ordering::Relaxed);
+        self.rows_by_trace
+            .lock()
+            .unwrap()
+            .get(trace_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn rows_for_traces(&self, requests: &[TraceRowsRequest]) -> Vec<TraceRowsResponse> {
+        self.rows_for_traces_calls.fetch_add(1, Ordering::Relaxed);
+        let batch_rows_override = self.batch_rows_by_trace.lock().unwrap();
+        let rows_by_trace = self.rows_by_trace.lock().unwrap();
+        let batch_rows = batch_rows_override.as_ref().unwrap_or(&rows_by_trace);
+        requests
+            .iter()
+            .map(|request| TraceRowsResponse {
+                trace_id: request.trace_id.clone(),
+                rows: batch_rows
+                    .get(&request.trace_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    fn stats(&self) -> StorageStatsSnapshot {
+        StorageStatsSnapshot::default()
+    }
+}
+
+fn test_trace_row(
+    trace_id: &str,
+    span_id: &str,
+    name: &str,
+    start_unix_nano: i64,
+    end_unix_nano: i64,
+) -> TraceSpanRow {
+    TraceSpanRow::new(
+        trace_id,
+        span_id,
+        Option::<String>::None,
+        name,
+        start_unix_nano,
+        end_unix_nano,
+        vec![Field::new("resource_attr:service.name", "checkout")],
+    )
+    .expect("valid test trace row")
+}
+
 #[tokio::test]
 async fn healthz_returns_ok() {
     let app = build_router(MemoryStorageEngine::new());
@@ -532,7 +725,7 @@ async fn trace_ingest_keeps_metrics_responsive_while_storage_runs() {
 }
 
 #[tokio::test]
-async fn trace_ingest_throughput_profile_can_block_metrics_on_single_worker_runtime() {
+async fn trace_ingest_throughput_profile_keeps_metrics_responsive_on_single_worker_runtime() {
     let storage = Arc::new(SlowStorageEngine::new(Duration::from_millis(250)));
     let server =
         spawn_server_on_single_worker_runtime(build_router_with_storage_and_trace_ingest_profile(
@@ -596,15 +789,14 @@ async fn trace_ingest_throughput_profile_can_block_metrics_on_single_worker_runt
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    let metrics_result = tokio::time::timeout(
+    let metrics_response = tokio::time::timeout(
         Duration::from_millis(100),
         client.get(server.url("/metrics")).send(),
     )
-    .await;
-    assert!(
-        metrics_result.is_err(),
-        "throughput profile should allow metrics to block while trace ingest is in flight",
-    );
+    .await
+    .expect("throughput profile metrics request should stay responsive")
+    .expect("throughput profile metrics request");
+    assert_eq!(metrics_response.status(), ReqwestStatusCode::OK);
 
     let ingest_response = ingest_request.await.expect("join ingest request");
     assert_eq!(ingest_response.status(), ReqwestStatusCode::OK);
@@ -1667,6 +1859,7 @@ async fn metrics_endpoint_exposes_storage_counters() {
     assert!(body.contains("vt_rows_ingested_total"));
     assert!(body.contains("vt_traces_tracked"));
     assert!(body.contains("vt_storage_retained_trace_blocks"));
+    assert!(body.contains("vt_storage_persisted_segments"));
     assert!(body.contains("vt_storage_segments"));
     assert!(body.contains("vt_storage_trace_head_segments"));
     assert!(body.contains("vt_storage_trace_head_rows"));
@@ -1682,6 +1875,8 @@ async fn metrics_endpoint_exposes_storage_counters() {
     assert!(body.contains("vt_storage_trace_seal_completed_total"));
     assert!(body.contains("vt_storage_trace_seal_rows_total"));
     assert!(body.contains("vt_storage_trace_seal_bytes_total"));
+    assert!(body.contains("vt_storage_trace_retention_deleted_segments_total"));
+    assert!(body.contains("vt_storage_trace_retention_deleted_bytes_total"));
 }
 
 #[tokio::test]
@@ -2237,7 +2432,7 @@ async fn disk_backend_survives_router_restart() {
 }
 
 #[tokio::test]
-async fn disk_backend_query_endpoints_are_immediately_visible_for_stable_and_throughput_profiles() {
+async fn disk_backend_trace_lookup_is_immediate_but_search_endpoints_wait_for_persisted_segments() {
     for (label, profile, config) in [
         (
             "stable",
@@ -2258,86 +2453,145 @@ async fn disk_backend_query_endpoints_are_immediately_visible_for_stable_and_thr
         ),
     ] {
         let path = temp_test_dir(&format!("disk-query-profile-{label}"));
-        let storage: Arc<dyn StorageEngine> =
-            Arc::new(DiskStorageEngine::open_with_config(&path, config).expect("open disk"));
-        let app = build_router_with_storage_and_trace_ingest_profile(storage, profile);
+        {
+            let storage: Arc<dyn StorageEngine> = Arc::new(
+                DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk"),
+            );
+            let app = build_router_with_storage_and_trace_ingest_profile(storage, profile);
 
-        let ingest_payload = json!({
-            "resource_spans": [
-                {
-                    "resource_attributes": [
-                        { "key": "service.name", "value": { "kind": "string", "value": "checkout" } }
-                    ],
-                    "scope_spans": [
-                        {
-                            "scope_name": null,
-                            "scope_version": null,
-                            "scope_attributes": [],
-                            "spans": [
-                                {
-                                    "trace_id": format!("trace-query-profile-{label}-1"),
-                                    "span_id": "span-1",
-                                    "parent_span_id": null,
-                                    "name": "GET /checkout",
-                                    "start_time_unix_nano": 100,
-                                    "end_time_unix_nano": 180,
-                                    "attributes": [
-                                        { "key": "http.method", "value": { "kind": "string", "value": "GET" } }
-                                    ],
-                                    "status": null
-                                },
-                                {
-                                    "trace_id": format!("trace-query-profile-{label}-2"),
-                                    "span_id": "span-2",
-                                    "parent_span_id": null,
-                                    "name": "POST /checkout",
-                                    "start_time_unix_nano": 200,
-                                    "end_time_unix_nano": 320,
-                                    "attributes": [
-                                        { "key": "http.method", "value": { "kind": "string", "value": "POST" } }
-                                    ],
-                                    "status": null
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        });
+            let ingest_payload = json!({
+                "resource_spans": [
+                    {
+                        "resource_attributes": [
+                            { "key": "service.name", "value": { "kind": "string", "value": "checkout" } }
+                        ],
+                        "scope_spans": [
+                            {
+                                "scope_name": null,
+                                "scope_version": null,
+                                "scope_attributes": [],
+                                "spans": [
+                                    {
+                                        "trace_id": format!("trace-query-profile-{label}-1"),
+                                        "span_id": "span-1",
+                                        "parent_span_id": null,
+                                        "name": "GET /checkout",
+                                        "start_time_unix_nano": 100,
+                                        "end_time_unix_nano": 180,
+                                        "attributes": [
+                                            { "key": "http.method", "value": { "kind": "string", "value": "GET" } }
+                                        ],
+                                        "status": null
+                                    },
+                                    {
+                                        "trace_id": format!("trace-query-profile-{label}-2"),
+                                        "span_id": "span-2",
+                                        "parent_span_id": null,
+                                        "name": "POST /checkout",
+                                        "start_time_unix_nano": 200,
+                                        "end_time_unix_nano": 320,
+                                        "attributes": [
+                                            { "key": "http.method", "value": { "kind": "string", "value": "POST" } }
+                                        ],
+                                        "status": null
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            });
 
-        let ingest_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/traces/ingest")
-                    .header("content-type", "application/json")
-                    .body(Body::from(ingest_payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .expect("ingest request");
-        assert_eq!(ingest_response.status(), StatusCode::OK);
+            let ingest_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/traces/ingest")
+                        .header("content-type", "application/json")
+                        .body(Body::from(ingest_payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .expect("ingest request");
+            assert_eq!(ingest_response.status(), StatusCode::OK);
 
-        let trace_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/traces/trace-query-profile-{label}-2"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .expect("trace request");
-        assert_eq!(trace_response.status(), StatusCode::OK);
-        let trace_body = axum::body::to_bytes(trace_response.into_body(), usize::MAX)
-            .await
-            .expect("trace body");
-        let trace: Value = serde_json::from_slice(&trace_body).expect("trace json");
-        assert_eq!(trace["trace_id"], format!("trace-query-profile-{label}-2"));
-        assert_eq!(trace["rows"].as_array().unwrap().len(), 1);
+            let trace_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/traces/trace-query-profile-{label}-2"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("trace request");
+            assert_eq!(trace_response.status(), StatusCode::OK);
+            let trace_body = axum::body::to_bytes(trace_response.into_body(), usize::MAX)
+                .await
+                .expect("trace body");
+            let trace: Value = serde_json::from_slice(&trace_body).expect("trace json");
+            assert_eq!(trace["trace_id"], format!("trace-query-profile-{label}-2"));
+            assert_eq!(trace["rows"].as_array().unwrap().len(), 1);
 
-        let services_response = app
+            let services_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/services")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("services request");
+            assert_eq!(services_response.status(), StatusCode::OK);
+            let services_body = axum::body::to_bytes(services_response.into_body(), usize::MAX)
+                .await
+                .expect("services body");
+            let services: Value = serde_json::from_slice(&services_body).expect("services json");
+            assert!(services["services"].as_array().unwrap().is_empty());
+
+            let search_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/traces/search?start_unix_nano=0&end_unix_nano=500&service_name=checkout&field_filter=span_attr:http.method=POST&limit=10")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("search request");
+            assert_eq!(search_response.status(), StatusCode::OK);
+            let search_body = axum::body::to_bytes(search_response.into_body(), usize::MAX)
+                .await
+                .expect("search body");
+            let search_hits: Value = serde_json::from_slice(&search_body).expect("search json");
+            assert!(search_hits["hits"].as_array().unwrap().is_empty());
+
+            let values_response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/search/tag/span.http.method/values?limit=10")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("tempo tag values request");
+            assert_eq!(values_response.status(), StatusCode::OK);
+            let values_body = axum::body::to_bytes(values_response.into_body(), usize::MAX)
+                .await
+                .expect("tempo tag values body");
+            let values: Value =
+                serde_json::from_slice(&values_body).expect("tempo tag values json");
+            assert!(values["tagValues"].as_array().unwrap().is_empty());
+        }
+
+        let reopened_storage: Arc<dyn StorageEngine> =
+            Arc::new(DiskStorageEngine::open_with_config(&path, config).expect("reopen disk"));
+        let reopened_app =
+            build_router_with_storage_and_trace_ingest_profile(reopened_storage, profile);
+
+        let services_response = reopened_app
             .clone()
             .oneshot(
                 Request::builder()
@@ -2346,18 +2600,18 @@ async fn disk_backend_query_endpoints_are_immediately_visible_for_stable_and_thr
                     .unwrap(),
             )
             .await
-            .expect("services request");
+            .expect("services request after reopen");
         assert_eq!(services_response.status(), StatusCode::OK);
         let services_body = axum::body::to_bytes(services_response.into_body(), usize::MAX)
             .await
-            .expect("services body");
+            .expect("services body after reopen");
         let services: Value = serde_json::from_slice(&services_body).expect("services json");
         assert_eq!(
             services["services"].as_array().unwrap(),
             &vec![json!("checkout")]
         );
 
-        let search_response = app
+        let search_response = reopened_app
             .clone()
             .oneshot(
                 Request::builder()
@@ -2366,11 +2620,11 @@ async fn disk_backend_query_endpoints_are_immediately_visible_for_stable_and_thr
                     .unwrap(),
             )
             .await
-            .expect("search request");
+            .expect("search request after reopen");
         assert_eq!(search_response.status(), StatusCode::OK);
         let search_body = axum::body::to_bytes(search_response.into_body(), usize::MAX)
             .await
-            .expect("search body");
+            .expect("search body after reopen");
         let search_hits: Value = serde_json::from_slice(&search_body).expect("search json");
         assert_eq!(search_hits["hits"].as_array().unwrap().len(), 1);
         assert_eq!(
@@ -2378,7 +2632,7 @@ async fn disk_backend_query_endpoints_are_immediately_visible_for_stable_and_thr
             format!("trace-query-profile-{label}-2")
         );
 
-        let values_response = app
+        let values_response = reopened_app
             .oneshot(
                 Request::builder()
                     .uri("/api/search/tag/span.http.method/values?limit=10")
@@ -2386,11 +2640,11 @@ async fn disk_backend_query_endpoints_are_immediately_visible_for_stable_and_thr
                     .unwrap(),
             )
             .await
-            .expect("tempo tag values request");
+            .expect("tempo tag values request after reopen");
         assert_eq!(values_response.status(), StatusCode::OK);
         let values_body = axum::body::to_bytes(values_response.into_body(), usize::MAX)
             .await
-            .expect("tempo tag values body");
+            .expect("tempo tag values body after reopen");
         let values: Value = serde_json::from_slice(&values_body).expect("tempo tag values json");
         assert_eq!(
             values["tagValues"].as_array().unwrap(),
@@ -3250,6 +3504,39 @@ async fn jaeger_endpoints_expose_services_operations_and_trace_payloads() {
 }
 
 #[tokio::test]
+async fn jaeger_operations_endpoint_uses_storage_list_operations_without_row_fetches() {
+    let storage = Arc::new(CountingQueryStorageEngine::for_operations(vec![
+        "GET /checkout",
+        "SELECT cart_items",
+    ]));
+    let app = build_router_with_storage(storage.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/select/jaeger/api/services/checkout/operations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("jaeger operations request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("operations body");
+    let decoded: Value = serde_json::from_slice(&body).expect("operations json");
+    assert_eq!(
+        decoded["data"].as_array().unwrap(),
+        &vec![json!("GET /checkout"), json!("SELECT cart_items")]
+    );
+    assert_eq!(decoded["total"], 2);
+    assert_eq!(storage.list_operations_calls(), 1);
+    assert_eq!(storage.search_traces_calls(), 0);
+    assert_eq!(storage.rows_for_trace_calls(), 0);
+}
+
+#[tokio::test]
 async fn jaeger_trace_search_filters_by_service_and_operation() {
     let app = build_router(MemoryStorageEngine::new());
 
@@ -3346,6 +3633,182 @@ async fn jaeger_trace_search_filters_by_service_and_operation() {
         decoded["data"][0]["spans"][0]["operationName"],
         "GET /checkout"
     );
+}
+
+#[tokio::test]
+async fn jaeger_trace_search_batches_trace_row_fetches_locally() {
+    let storage = Arc::new(CountingQueryStorageEngine::for_search(vec![
+        (
+            "trace-jaeger-search-1",
+            100_000,
+            180_000,
+            vec![test_trace_row(
+                "trace-jaeger-search-1",
+                "span-jaeger-search-1",
+                "GET /checkout",
+                100_000,
+                180_000,
+            )],
+        ),
+        (
+            "trace-jaeger-search-2",
+            200_000,
+            280_000,
+            vec![test_trace_row(
+                "trace-jaeger-search-2",
+                "span-jaeger-search-2",
+                "GET /checkout",
+                200_000,
+                280_000,
+            )],
+        ),
+    ]));
+    let app = build_router_with_storage(storage.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/select/jaeger/api/traces?service=checkout&start=50&end=400&limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("jaeger traces request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("search body");
+    let decoded: Value = serde_json::from_slice(&body).expect("search json");
+    assert_eq!(decoded["total"], 2);
+    assert_eq!(decoded["data"].as_array().unwrap().len(), 2);
+    assert_eq!(storage.search_traces_calls(), 1);
+    assert_eq!(storage.rows_for_traces_calls(), 1);
+    assert_eq!(storage.rows_for_trace_calls(), 0);
+}
+
+#[tokio::test]
+async fn cluster_jaeger_operations_use_storage_operations_endpoint() {
+    let storage = Arc::new(CountingQueryStorageEngine::for_operations(vec![
+        "GET /checkout",
+        "SELECT cart_items",
+    ]));
+    let storage_server = spawn_server(build_storage_router(storage.clone())).await;
+    let cluster =
+        ClusterConfig::new(vec![storage_server.base_url.clone()], 1).expect("cluster config");
+    let select = spawn_server(build_select_router(cluster)).await;
+    let client = Client::new();
+
+    let response = client
+        .get(select.url("/select/jaeger/api/services/checkout/operations"))
+        .send()
+        .await
+        .expect("cluster jaeger operations request");
+    assert_eq!(response.status(), ReqwestStatusCode::OK);
+    let decoded: Value = response.json().await.expect("operations json");
+    assert_eq!(
+        decoded["data"].as_array().unwrap(),
+        &vec![json!("GET /checkout"), json!("SELECT cart_items")]
+    );
+    assert_eq!(decoded["total"], 2);
+    assert_eq!(storage.list_operations_calls(), 1);
+    assert_eq!(storage.search_traces_calls(), 0);
+    assert_eq!(storage.rows_for_trace_calls(), 0);
+}
+
+#[tokio::test]
+async fn cluster_jaeger_trace_search_batches_storage_row_fetches() {
+    let storage = Arc::new(CountingQueryStorageEngine::for_search(vec![
+        (
+            "trace-cluster-jaeger-search-1",
+            100_000,
+            180_000,
+            vec![test_trace_row(
+                "trace-cluster-jaeger-search-1",
+                "span-jaeger-search-1",
+                "GET /checkout",
+                100_000,
+                180_000,
+            )],
+        ),
+        (
+            "trace-cluster-jaeger-search-2",
+            200_000,
+            280_000,
+            vec![test_trace_row(
+                "trace-cluster-jaeger-search-2",
+                "span-jaeger-search-2",
+                "GET /checkout",
+                200_000,
+                280_000,
+            )],
+        ),
+    ]));
+    let storage_server = spawn_server(build_storage_router(storage.clone())).await;
+    let cluster =
+        ClusterConfig::new(vec![storage_server.base_url.clone()], 1).expect("cluster config");
+    let select = spawn_server(build_select_router(cluster)).await;
+    let client = Client::new();
+
+    let response = client
+        .get(select.url("/select/jaeger/api/traces?service=checkout&start=50&end=400&limit=10"))
+        .send()
+        .await
+        .expect("cluster jaeger traces request");
+    assert_eq!(response.status(), ReqwestStatusCode::OK);
+    let decoded: Value = response.json().await.expect("search json");
+    assert_eq!(decoded["total"], 2);
+    assert_eq!(decoded["data"].as_array().unwrap().len(), 2);
+    assert_eq!(storage.search_traces_calls(), 1);
+    assert_eq!(storage.rows_for_traces_calls(), 1);
+    assert_eq!(storage.rows_for_trace_calls(), 0);
+}
+
+#[tokio::test]
+async fn cluster_jaeger_trace_search_enforces_per_trace_read_quorum_for_batched_rows() {
+    let trace_rows = vec![test_trace_row(
+        "trace-cluster-jaeger-quorum-1",
+        "span-jaeger-quorum-1",
+        "GET /checkout",
+        100_000,
+        180_000,
+    )];
+    let storage_a = Arc::new(CountingQueryStorageEngine::for_search(vec![(
+        "trace-cluster-jaeger-quorum-1",
+        100_000,
+        180_000,
+        trace_rows.clone(),
+    )]));
+    let storage_b = Arc::new(CountingQueryStorageEngine::for_search_with_batched_rows(
+        vec![(
+            "trace-cluster-jaeger-quorum-1",
+            100_000,
+            180_000,
+            trace_rows,
+        )],
+        vec![("trace-cluster-jaeger-quorum-1", Vec::new())],
+    ));
+    let storage_a_server = spawn_server(build_storage_router(storage_a)).await;
+    let storage_b_server = spawn_server(build_storage_router(storage_b)).await;
+    let cluster = ClusterConfig::new(
+        vec![
+            storage_a_server.base_url.clone(),
+            storage_b_server.base_url.clone(),
+        ],
+        2,
+    )
+    .expect("cluster config")
+    .with_read_quorum(2)
+    .expect("read quorum");
+    let select = spawn_server(build_select_router(cluster)).await;
+    let client = Client::new();
+
+    let response = client
+        .get(select.url("/select/jaeger/api/traces?service=checkout&start=50&end=400&limit=10"))
+        .send()
+        .await
+        .expect("cluster jaeger traces request");
+    assert_eq!(response.status(), ReqwestStatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]

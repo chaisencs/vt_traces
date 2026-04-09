@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 crc32fast.workspace = true
+libc.workspace = true
 parking_lot.workspace = true
 roaring.workspace = true
 rustc-hash.workspace = true

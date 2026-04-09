@@ -27,9 +27,7 @@ use axum::{
 use bytes::Bytes;
 use compare::{default_report_schema_version, run_compare, CompareOptions};
 use official_compare::{parse_official_compare_options, run_official_compare};
-use official_query_compare::{
-    parse_official_query_compare_options, run_official_query_compare,
-};
+use official_query_compare::{parse_official_query_compare_options, run_official_query_compare};
 use preflight::{validate_benchmark_preflight, validate_otlp_benchmark_target};
 use reqwest::Client;
 use rustc_hash::FxHasher;

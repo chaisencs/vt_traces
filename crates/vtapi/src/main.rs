@@ -228,6 +228,27 @@ fn parse_trace_ingest_profile(value: Option<&str>) -> TraceIngestProfile {
     }
 }
 
+fn parse_trace_retention(hours: Option<&str>, days: Option<&str>) -> Option<Duration> {
+    if let Some(hours) = hours {
+        if let Ok(hours) = hours.trim().parse::<u64>() {
+            return (hours > 0).then_some(Duration::from_secs(hours.saturating_mul(60 * 60)));
+        }
+    }
+    if let Some(days) = days {
+        if let Ok(days) = days.trim().parse::<u64>() {
+            return (days > 0).then_some(Duration::from_secs(days.saturating_mul(24 * 60 * 60)));
+        }
+    }
+    None
+}
+
+fn load_trace_retention() -> Option<Duration> {
+    parse_trace_retention(
+        env::var("VT_STORAGE_RETENTION_HOURS").ok().as_deref(),
+        env::var("VT_STORAGE_RETENTION_DAYS").ok().as_deref(),
+    )
+}
+
 fn disk_overrides_for_trace_ingest_profile(
     trace_ingest_profile: TraceIngestProfile,
     sync_policy: DiskSyncPolicy,
@@ -267,6 +288,9 @@ fn load_storage_sync(
             let mut config = DiskStorageConfig::default();
             if let Some(trace_shards) = configured_trace_shards {
                 config = config.with_trace_shards(trace_shards);
+            }
+            if let Some(trace_retention) = load_trace_retention() {
+                config = config.with_trace_retention(trace_retention);
             }
             let configured_target_segment_size_bytes =
                 env::var("VT_STORAGE_TARGET_SEGMENT_SIZE_BYTES")
@@ -793,11 +817,11 @@ fn load_cluster_config(local_control_node: Option<&str>) -> anyhow::Result<Clust
 #[cfg(test)]
 mod tests {
     use super::{
-        disk_overrides_for_trace_ingest_profile, parse_env_bool_value,
-        parse_trace_ingest_profile,
-        TraceIngestDiskOverrides, TraceIngestProfile, THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES,
-        THROUGHPUT_PROFILE_TRACE_SEAL_WORKER_COUNT,
+        disk_overrides_for_trace_ingest_profile, parse_env_bool_value, parse_trace_ingest_profile,
+        parse_trace_retention, TraceIngestDiskOverrides, TraceIngestProfile,
+        THROUGHPUT_PROFILE_TARGET_SEGMENT_SIZE_BYTES, THROUGHPUT_PROFILE_TRACE_SEAL_WORKER_COUNT,
     };
+    use std::time::Duration;
     use vtstorage::DiskSyncPolicy;
 
     #[test]
@@ -876,6 +900,23 @@ mod tests {
                 target_segment_size_bytes: None,
                 trace_seal_worker_count: None,
             }
+        );
+    }
+
+    #[test]
+    fn parse_trace_retention_prefers_hours_over_days() {
+        assert_eq!(
+            parse_trace_retention(Some("24"), Some("7"),),
+            Some(Duration::from_secs(24 * 60 * 60)),
+        );
+        assert_eq!(
+            parse_trace_retention(None, Some("1"),),
+            Some(Duration::from_secs(24 * 60 * 60)),
+        );
+        assert_eq!(parse_trace_retention(Some("0"), Some("1")), None);
+        assert_eq!(
+            parse_trace_retention(Some("invalid"), Some("1")),
+            Some(Duration::from_secs(24 * 60 * 60))
         );
     }
 

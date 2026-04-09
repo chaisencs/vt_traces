@@ -197,6 +197,7 @@ impl StorageEngine for MemoryStorageEngine {
             traces_tracked,
             retained_trace_blocks,
             persisted_bytes: 0,
+            persisted_segment_count: 0,
             segment_count: 0,
             typed_field_columns: 0,
             string_field_columns: 0,

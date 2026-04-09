@@ -1,5 +1,8 @@
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, RawFd};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    cmp::Reverse,
+    collections::{BTreeSet, BinaryHeap, HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
     io::{BufWriter, Cursor, ErrorKind, Read, Seek, SeekFrom, Write},
@@ -8,7 +11,7 @@ use std::{
     sync::mpsc,
     sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -23,7 +26,10 @@ use vtcore::{
 };
 
 use crate::log_state::LogIndexedState;
-use crate::{StorageEngine, StorageError, StorageStatsSnapshot, TraceBatchPayloadMode};
+use crate::{
+    StorageEngine, StorageError, StorageStatsSnapshot, TraceBatchPayloadMode, TraceRowsRequest,
+    TraceRowsResponse,
+};
 
 const SEGMENTS_DIRNAME: &str = "segments";
 const SEGMENT_PREFIX: &str = "segment-";
@@ -61,6 +67,7 @@ const LOG_WAL_HEADER_BYTES: u64 = (LOG_WAL_MAGIC.len() + 1) as u64;
 const DEFAULT_TARGET_SEGMENT_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 const COMPACTION_TARGET_MULTIPLIER: u64 = 16;
 const TRACE_WAL_WRITER_CAPACITY_BYTES: usize = 1024 * 1024;
+const DEFAULT_TRACE_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_TRACE_COMBINER_WAIT: Duration = Duration::ZERO;
 const DEFAULT_TRACE_GROUP_COMMIT_WAIT: Duration = Duration::ZERO;
 const TRACE_COMBINER_WAIT_POLL_SLICE: Duration = Duration::from_micros(25);
@@ -70,6 +77,46 @@ const PART_FIELD_TYPE_BOOL: u8 = 2;
 
 type TraceRef = u32;
 type StringRef = u32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopTraceSearchCandidate {
+    trace_ref: TraceRef,
+    trace_id: String,
+    start_unix_nano: i64,
+    end_unix_nano: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderedTraceSearchHit(TraceSearchHit);
+
+impl Ord for TopTraceSearchCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.end_unix_nano
+            .cmp(&other.end_unix_nano)
+            .then_with(|| other.trace_id.cmp(&self.trace_id))
+    }
+}
+
+impl PartialOrd for TopTraceSearchCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedTraceSearchHit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .end_unix_nano
+            .cmp(&other.0.end_unix_nano)
+            .then_with(|| other.0.trace_id.cmp(&self.0.trace_id))
+    }
+}
+
+impl PartialOrd for OrderedTraceSearchHit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 type SmallArcPairList = SmallVec<[(Arc<str>, Arc<str>); 8]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +152,8 @@ pub struct DiskStorageConfig {
     trace_wal_writer_capacity_bytes: usize,
     trace_deferred_wal_writes: bool,
     trace_seal_worker_count: usize,
+    trace_retention: Option<Duration>,
+    trace_retention_sweep_interval: Duration,
 }
 
 impl Default for DiskStorageConfig {
@@ -119,6 +168,8 @@ impl Default for DiskStorageConfig {
             trace_wal_writer_capacity_bytes: TRACE_WAL_WRITER_CAPACITY_BYTES,
             trace_deferred_wal_writes: false,
             trace_seal_worker_count: 1,
+            trace_retention: None,
+            trace_retention_sweep_interval: DEFAULT_TRACE_RETENTION_SWEEP_INTERVAL,
         }
     }
 }
@@ -171,6 +222,23 @@ impl DiskStorageConfig {
         self.trace_seal_worker_count = trace_seal_worker_count.max(1);
         self
     }
+
+    pub fn with_trace_retention(mut self, trace_retention: Duration) -> Self {
+        self.trace_retention = (!trace_retention.is_zero()).then_some(trace_retention);
+        self
+    }
+
+    pub fn with_trace_retention_sweep_interval(
+        mut self,
+        trace_retention_sweep_interval: Duration,
+    ) -> Self {
+        self.trace_retention_sweep_interval = if trace_retention_sweep_interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            trace_retention_sweep_interval
+        };
+        self
+    }
 }
 
 pub struct DiskStorageEngine {
@@ -194,9 +262,12 @@ pub struct DiskStorageEngine {
     fsync_operations: Arc<AtomicU64>,
     head_metrics: Arc<DiskTraceHeadMetrics>,
     field_column_counts: Arc<DiskFieldColumnCounts>,
+    retention_metrics: Arc<DiskTraceRetentionMetrics>,
     trace_seal_context: DiskTraceSealContext,
     trace_seal_tx: Option<mpsc::Sender<DiskTraceSealTask>>,
     trace_seal_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    trace_retention_shutdown_tx: Option<mpsc::Sender<()>>,
+    trace_retention_worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -444,14 +515,19 @@ struct DiskTraceSealTask {
 
 #[derive(Clone)]
 struct DiskTraceSealContext {
+    root_path: PathBuf,
     segments_path: PathBuf,
     sync_policy: DiskSyncPolicy,
+    trace_retention: Option<Duration>,
     segment_paths: Arc<RwLock<FxHashMap<u64, PathBuf>>>,
     trace_shards: Vec<Arc<RwLock<DiskTraceShardState>>>,
     sealing_segments: Vec<Arc<RwLock<Vec<Arc<HeadSegmentSnapshot>>>>>,
+    persisted_bytes: Arc<AtomicU64>,
     fsync_operations: Arc<AtomicU64>,
     head_metrics: Arc<DiskTraceHeadMetrics>,
     field_column_counts: Arc<DiskFieldColumnCounts>,
+    retention_metrics: Arc<DiskTraceRetentionMetrics>,
+    trace_retention_lock: Arc<Mutex<()>>,
     seal_error: Arc<Mutex<Option<String>>>,
 }
 
@@ -472,6 +548,20 @@ struct DiskFieldColumnCounts {
     string: AtomicU64,
 }
 
+#[derive(Debug, Default)]
+struct DiskTraceRetentionMetrics {
+    deleted_segments: AtomicU64,
+    deleted_bytes: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TraceRetentionPruneStats {
+    deleted_segments: u64,
+    deleted_bytes: u64,
+    deleted_typed_field_columns: u64,
+    deleted_string_field_columns: u64,
+}
+
 fn persist_snapshot_wal(snapshot: &HeadSegmentSnapshot) -> Result<(), StorageError> {
     if snapshot.staged_wal_bytes.is_empty() {
         return Ok(());
@@ -480,8 +570,10 @@ fn persist_snapshot_wal(snapshot: &HeadSegmentSnapshot) -> Result<(), StorageErr
         .create(true)
         .append(true)
         .open(&snapshot.wal_path)?;
+    advise_file_sequential(&wal_file);
     wal_file.write_all(&snapshot.staged_wal_bytes)?;
     wal_file.flush()?;
+    advise_file_dontneed(&wal_file);
     Ok(())
 }
 
@@ -550,6 +642,10 @@ impl DiskTraceSealContext {
         }
     }
 
+    fn record_background_error(&self, error: &StorageError) {
+        self.record_seal_error(error);
+    }
+
     fn settle_seal_result(
         &self,
         snapshot: Arc<HeadSegmentSnapshot>,
@@ -572,11 +668,30 @@ impl DiskTraceSealContext {
 
     fn finish_seal_task(&self, snapshot: Arc<HeadSegmentSnapshot>) {
         let result = self.persist_rotated_head_segment(snapshot.as_ref());
-        let _ = self.settle_seal_result(snapshot, result);
+        let settled = self.settle_seal_result(snapshot, result);
+        if settled.is_ok() {
+            if let Err(error) = self.enforce_trace_retention() {
+                self.record_background_error(&error);
+            }
+        }
     }
 
     fn pending_seal_error(&self) -> Option<String> {
         self.seal_error.lock().clone()
+    }
+
+    fn enforce_trace_retention(&self) -> Result<(), StorageError> {
+        enforce_trace_retention_for_shared_state(
+            &self.root_path,
+            &self.segments_path,
+            self.trace_retention,
+            &self.segment_paths,
+            &self.trace_shards,
+            &self.persisted_bytes,
+            &self.field_column_counts,
+            &self.retention_metrics,
+            &self.trace_retention_lock,
+        )
     }
 }
 
@@ -603,6 +718,29 @@ fn spawn_trace_seal_workers(
         }));
     }
     (tx, workers)
+}
+
+fn spawn_trace_retention_worker(
+    context: DiskTraceSealContext,
+    sweep_interval: Duration,
+) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<()>();
+    let sweep_interval = if sweep_interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        sweep_interval
+    };
+    let worker = thread::spawn(move || loop {
+        match rx.recv_timeout(sweep_interval) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = context.enforce_trace_retention() {
+                    context.record_background_error(&error);
+                }
+            }
+        }
+    });
+    (tx, worker)
 }
 
 #[derive(Debug, Default)]
@@ -1002,6 +1140,11 @@ impl DiskStorageEngine {
             recovered.persisted_bytes += log_persisted_bytes;
             next_segment_id = next_segment_id.max(recovered.next_segment_id);
         }
+        let startup_retention = prune_recovered_state_for_trace_retention(
+            &segments_path,
+            &mut recovered,
+            config.trace_retention,
+        )?;
         persist_recovery_manifest_file(&root_path, &recovered)?;
         let active_segments = (0..trace_shards)
             .map(|_| Mutex::new(None))
@@ -1028,20 +1171,40 @@ impl DiskStorageEngine {
             typed: AtomicU64::new(recovered.typed_field_columns),
             string: AtomicU64::new(recovered.string_field_columns),
         });
+        let retention_metrics = Arc::new(DiskTraceRetentionMetrics {
+            deleted_segments: AtomicU64::new(startup_retention.deleted_segments),
+            deleted_bytes: AtomicU64::new(startup_retention.deleted_bytes),
+        });
+        let trace_retention_lock = Arc::new(Mutex::new(()));
         let trace_seal_error = Arc::new(Mutex::new(None));
         let trace_seal_context = DiskTraceSealContext {
+            root_path: root_path.clone(),
             segments_path: segments_path.clone(),
             sync_policy: config.sync_policy,
+            trace_retention: config.trace_retention,
             segment_paths: Arc::clone(&segment_paths),
             trace_shards: trace_shards.clone(),
             sealing_segments: sealing_segments.clone(),
+            persisted_bytes: Arc::clone(&persisted_bytes),
             fsync_operations: Arc::clone(&fsync_operations),
             head_metrics: Arc::clone(&head_metrics),
             field_column_counts: Arc::clone(&field_column_counts),
+            retention_metrics: Arc::clone(&retention_metrics),
+            trace_retention_lock: Arc::clone(&trace_retention_lock),
             seal_error: trace_seal_error,
         };
         let (trace_seal_tx, trace_seal_workers) =
             spawn_trace_seal_workers(trace_seal_context.clone(), config.trace_seal_worker_count);
+        let (trace_retention_shutdown_tx, trace_retention_worker) =
+            if config.trace_retention.is_some() {
+                let (shutdown_tx, worker) = spawn_trace_retention_worker(
+                    trace_seal_context.clone(),
+                    config.trace_retention_sweep_interval,
+                );
+                (Some(shutdown_tx), Some(worker))
+            } else {
+                (None, None)
+            };
         let log_writer = BufWriter::new(
             OpenOptions::new()
                 .create(true)
@@ -1071,9 +1234,12 @@ impl DiskStorageEngine {
             fsync_operations,
             head_metrics,
             field_column_counts,
+            retention_metrics,
             trace_seal_context,
             trace_seal_tx: Some(trace_seal_tx),
             trace_seal_workers: Mutex::new(trace_seal_workers),
+            trace_retention_shutdown_tx,
+            trace_retention_worker: Mutex::new(trace_retention_worker),
         })
     }
 
@@ -1178,7 +1344,16 @@ impl DiskStorageEngine {
         }
 
         let result = self.persist_rotated_head_segment(snapshot.as_ref());
-        self.trace_seal_context.settle_seal_result(snapshot, result)
+        let settled = self.trace_seal_context.settle_seal_result(snapshot, result);
+        if settled.is_ok() {
+            self.trace_seal_context
+                .enforce_trace_retention()
+                .map_err(|error| {
+                    self.trace_seal_context.record_background_error(&error);
+                    error
+                })?;
+        }
+        settled
     }
 
     fn maybe_roll_active_segment(
@@ -1219,22 +1394,14 @@ impl DiskStorageEngine {
     }
 
     fn persist_recovery_snapshot(&self) -> Result<(), StorageError> {
-        let segment_paths = self.segment_paths.read().clone();
-        let trace_shards = self
-            .trace_shards
-            .iter()
-            .map(|shard| shard.read().clone())
-            .collect::<Vec<_>>();
-        let recovered = RecoveredDiskState {
-            segment_paths,
-            trace_shards,
-            persisted_bytes: self.persisted_bytes.load(Ordering::Relaxed),
-            typed_field_columns: self.field_column_counts.typed.load(Ordering::Relaxed),
-            string_field_columns: self.field_column_counts.string.load(Ordering::Relaxed),
-            next_segment_id: self.next_segment_id.load(Ordering::Relaxed),
-            skip_startup_compaction: false,
-        };
-        persist_recovery_manifest_file(&self.root_path, &recovered)
+        persist_recovery_snapshot_from_shared_state(
+            &self.root_path,
+            &self.segment_paths,
+            &self.trace_shards,
+            self.persisted_bytes.load(Ordering::Relaxed),
+            self.field_column_counts.typed.load(Ordering::Relaxed),
+            self.field_column_counts.string.load(Ordering::Relaxed),
+        )
     }
 
     fn trace_shard_index(&self, trace_id: &str) -> usize {
@@ -1621,104 +1788,69 @@ impl DiskStorageEngine {
         rows
     }
 
-    fn head_stats(&self) -> (u64, u64, BTreeSet<String>) {
+    fn head_stats(&self) -> (u64, u64, u64) {
         let mut segments = 0u64;
         let mut rows = 0u64;
-        let mut trace_ids = BTreeSet::new();
+        let mut head_only_traces = 0u64;
 
         for shard_index in 0..self.trace_shards.len() {
+            let mut head_trace_ids = Vec::new();
             {
                 let active_segment = self.active_segments[shard_index].lock();
                 if let Some(active_segment) = active_segment.as_ref() {
                     if !active_segment.is_empty() {
                         segments += 1;
                         rows += active_segment.row_count();
-                        trace_ids.extend(active_segment.list_trace_ids());
+                        head_trace_ids.extend(active_segment.list_trace_ids());
                     }
                 }
             }
             for snapshot in self.sealing_segments[shard_index].read().iter() {
                 segments += 1;
                 rows += snapshot.row_count();
-                trace_ids.extend(snapshot.list_trace_ids());
+                head_trace_ids.extend(snapshot.list_trace_ids());
+            }
+            if !head_trace_ids.is_empty() {
+                let persisted_state = self.trace_shards[shard_index].read();
+                head_only_traces += count_head_traces_missing_from_persisted_state(
+                    head_trace_ids,
+                    &persisted_state,
+                );
             }
         }
 
-        (segments, rows, trace_ids)
+        (segments, rows, head_only_traces)
     }
 
-    fn head_list_services(&self) -> BTreeSet<String> {
-        let mut services = BTreeSet::new();
+    fn head_trace_ids(&self) -> BTreeSet<String> {
+        let mut trace_ids = BTreeSet::new();
         for shard_index in 0..self.trace_shards.len() {
             {
                 let active_segment = self.active_segments[shard_index].lock();
                 if let Some(active_segment) = active_segment.as_ref() {
-                    services.extend(active_segment.list_services());
-                }
-            }
-            for snapshot in self.sealing_segments[shard_index].read().iter() {
-                services.extend(snapshot.list_services());
-            }
-        }
-        services
-    }
-
-    fn head_list_field_names(&self) -> BTreeSet<String> {
-        let mut field_names = BTreeSet::new();
-        for shard_index in 0..self.trace_shards.len() {
-            {
-                let active_segment = self.active_segments[shard_index].lock();
-                if let Some(active_segment) = active_segment.as_ref() {
-                    field_names.extend(active_segment.list_field_names());
-                }
-            }
-            for snapshot in self.sealing_segments[shard_index].read().iter() {
-                field_names.extend(snapshot.list_field_names());
-            }
-        }
-        field_names
-    }
-
-    fn head_list_field_values(&self, field_name: &str) -> BTreeSet<String> {
-        let mut field_values = BTreeSet::new();
-        for shard_index in 0..self.trace_shards.len() {
-            {
-                let active_segment = self.active_segments[shard_index].lock();
-                if let Some(active_segment) = active_segment.as_ref() {
-                    field_values.extend(active_segment.list_field_values(field_name));
-                }
-            }
-            for snapshot in self.sealing_segments[shard_index].read().iter() {
-                field_values.extend(snapshot.list_field_values(field_name));
-            }
-        }
-        field_values
-    }
-
-    fn head_search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
-        let mut hits_by_trace = FxHashMap::default();
-        for shard_index in 0..self.trace_shards.len() {
-            {
-                let active_segment = self.active_segments[shard_index].lock();
-                if let Some(active_segment) = active_segment.as_ref() {
-                    for hit in active_segment.search_traces(request) {
-                        merge_trace_search_hit(&mut hits_by_trace, hit);
+                    if !active_segment.is_empty() {
+                        trace_ids.extend(active_segment.list_trace_ids());
                     }
                 }
             }
             for snapshot in self.sealing_segments[shard_index].read().iter() {
-                for hit in snapshot.search_traces(request) {
-                    merge_trace_search_hit(&mut hits_by_trace, hit);
-                }
+                trace_ids.extend(snapshot.list_trace_ids());
             }
         }
-        hits_by_trace.into_values().collect()
+        trace_ids
     }
 
     fn shutdown_trace_seal_workers(&mut self) {
         self.trace_seal_tx.take();
         let mut workers = self.trace_seal_workers.lock();
         for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+
+    fn shutdown_trace_retention_worker(&mut self) {
+        self.trace_retention_shutdown_tx.take();
+        if let Some(worker) = self.trace_retention_worker.lock().take() {
             let _ = worker.join();
         }
     }
@@ -1744,6 +1876,7 @@ impl DiskStorageEngine {
 
 impl Drop for DiskStorageEngine {
     fn drop(&mut self) {
+        self.shutdown_trace_retention_worker();
         self.shutdown_trace_seal_workers();
         for (shard_index, active_segment) in self.active_segments.iter().enumerate() {
             let mut active_segment = active_segment.lock();
@@ -1844,8 +1977,7 @@ impl StorageEngine for DiskStorageEngine {
         for shard in &self.trace_shards {
             trace_ids.extend(shard.read().list_trace_ids());
         }
-        let (_, _, head_trace_ids) = self.head_stats();
-        trace_ids.extend(head_trace_ids);
+        trace_ids.extend(self.head_trace_ids());
         trace_ids.into_iter().collect()
     }
 
@@ -1854,7 +1986,6 @@ impl StorageEngine for DiskStorageEngine {
         for trace_shard in &self.trace_shards {
             services.extend(trace_shard.read().list_services());
         }
-        services.extend(self.head_list_services());
         services.into_iter().collect()
     }
 
@@ -1863,7 +1994,6 @@ impl StorageEngine for DiskStorageEngine {
         for trace_shard in &self.trace_shards {
             field_names.extend(trace_shard.read().list_field_names());
         }
-        field_names.extend(self.head_list_field_names());
         field_names.into_iter().collect()
     }
 
@@ -1872,11 +2002,38 @@ impl StorageEngine for DiskStorageEngine {
         for trace_shard in &self.trace_shards {
             field_values.extend(trace_shard.read().list_field_values(field_name));
         }
-        field_values.extend(self.head_list_field_values(field_name));
         field_values.into_iter().collect()
     }
 
+    fn list_operations(
+        &self,
+        service_name: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut operations = BTreeSet::new();
+        for trace_shard in &self.trace_shards {
+            for operation in trace_shard.read().list_operations(
+                service_name,
+                start_unix_nano,
+                end_unix_nano,
+                limit,
+            ) {
+                operations.insert(operation);
+                if operations.len() >= limit {
+                    return operations.into_iter().collect();
+                }
+            }
+        }
+        operations.into_iter().collect()
+    }
+
     fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
+        if request.limit == 0 {
+            return Vec::new();
+        }
+
         let mut hits_by_trace = FxHashMap::default();
         for trace_shard in &self.trace_shards {
             let persisted_hits = {
@@ -1893,18 +2050,7 @@ impl StorageEngine for DiskStorageEngine {
                 }
             }
         }
-        for hit in self.head_search_traces(request) {
-            merge_trace_search_hit(&mut hits_by_trace, hit);
-        }
-        let mut hits: Vec<_> = hits_by_trace.into_values().collect();
-        hits.sort_by(|left, right| {
-            right
-                .end_unix_nano
-                .cmp(&left.end_unix_nano)
-                .then_with(|| left.trace_id.cmp(&right.trace_id))
-        });
-        hits.truncate(request.limit);
-        hits
+        retain_top_trace_search_hits(hits_by_trace.into_values(), request.limit)
     }
 
     fn search_logs(&self, request: &LogSearchRequest) -> Vec<LogRow> {
@@ -1961,23 +2107,91 @@ impl StorageEngine for DiskStorageEngine {
         rows
     }
 
+    fn rows_for_traces(&self, requests: &[TraceRowsRequest]) -> Vec<TraceRowsResponse> {
+        self.row_queries
+            .fetch_add(requests.len() as u64, Ordering::Relaxed);
+
+        let segment_paths = self.segment_paths.read().clone();
+        let mut responses = requests
+            .iter()
+            .map(|request| TraceRowsResponse {
+                trace_id: request.trace_id.clone(),
+                rows: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut refs_by_segment: HashMap<u64, Vec<(usize, SegmentRowLocation)>> = HashMap::new();
+
+        for (response_index, request) in requests.iter().enumerate() {
+            let shard_index = self.trace_shard_index(&request.trace_id);
+            let row_refs = self.trace_shards[shard_index].read().row_refs_for_trace(
+                &request.trace_id,
+                request.start_unix_nano,
+                request.end_unix_nano,
+            );
+            for row_ref in row_refs {
+                refs_by_segment
+                    .entry(u64::from(row_ref.segment_id))
+                    .or_default()
+                    .push((response_index, row_ref));
+            }
+
+            let head_rows = self.head_rows_for_trace(
+                shard_index,
+                &request.trace_id,
+                request.start_unix_nano,
+                request.end_unix_nano,
+            );
+            if !head_rows.is_empty() {
+                self.segment_read_batches.fetch_add(1, Ordering::Relaxed);
+                responses[response_index].rows.extend(head_rows);
+            }
+        }
+
+        self.segment_read_batches
+            .fetch_add(refs_by_segment.len() as u64, Ordering::Relaxed);
+
+        for (segment_id, mut segment_refs) in refs_by_segment {
+            let Some(path) = segment_paths.get(&segment_id) else {
+                continue;
+            };
+            segment_refs.sort_by_key(|(_, row_ref)| row_ref.row_index);
+            if path.extension().and_then(|value| value.to_str()) == Some("part") {
+                self.part_selective_decodes.fetch_add(1, Ordering::Relaxed);
+            }
+            let refs = segment_refs
+                .iter()
+                .map(|(_, row_ref)| row_ref.clone())
+                .collect::<Vec<_>>();
+            if let Ok(segment_rows) = read_rows_for_segment(path, &refs) {
+                for ((response_index, _), row) in segment_refs.into_iter().zip(segment_rows) {
+                    responses[response_index].rows.push(row);
+                }
+            }
+        }
+
+        for response in &mut responses {
+            response.rows.sort_by_key(|row| row.end_unix_nano);
+        }
+        responses
+    }
+
     fn stats(&self) -> StorageStatsSnapshot {
         let persisted_segment_count = self.segment_paths.read().len() as u64;
         let mut rows_ingested = 0u64;
-        let mut trace_ids = BTreeSet::new();
+        let mut traces_tracked = 0u64;
         for shard in &self.trace_shards {
             let state = shard.read();
             rows_ingested += state.rows_ingested();
-            trace_ids.extend(state.list_trace_ids());
+            traces_tracked += state.traces_tracked();
         }
-        let (trace_head_segments, trace_head_rows, head_trace_ids) = self.head_stats();
+        let (trace_head_segments, trace_head_rows, head_only_traces) = self.head_stats();
         rows_ingested += trace_head_rows;
-        trace_ids.extend(head_trace_ids);
         StorageStatsSnapshot {
             rows_ingested,
-            traces_tracked: trace_ids.len() as u64,
+            traces_tracked: traces_tracked + head_only_traces,
             retained_trace_blocks: 0,
             persisted_bytes: self.persisted_bytes.load(Ordering::Relaxed),
+            persisted_segment_count,
             segment_count: persisted_segment_count + trace_head_segments,
             trace_head_segments,
             trace_head_rows,
@@ -2041,6 +2255,14 @@ impl StorageEngine for DiskStorageEngine {
             trace_seal_completed: self.head_metrics.seal_completed.load(Ordering::Relaxed),
             trace_seal_rows: self.head_metrics.seal_rows.load(Ordering::Relaxed),
             trace_seal_bytes: self.head_metrics.seal_bytes.load(Ordering::Relaxed),
+            trace_retention_deleted_segments: self
+                .retention_metrics
+                .deleted_segments
+                .load(Ordering::Relaxed),
+            trace_retention_deleted_bytes: self
+                .retention_metrics
+                .deleted_bytes
+                .load(Ordering::Relaxed),
             trace_batch_flush_due_to_wait: self
                 .append_combiner_stats
                 .iter()
@@ -2059,7 +2281,180 @@ impl StorageEngine for DiskStorageEngine {
     }
 }
 
+fn count_head_traces_missing_from_persisted_state(
+    head_trace_ids: impl IntoIterator<Item = String>,
+    persisted_state: &DiskTraceShardState,
+) -> u64 {
+    let mut unique_head_trace_ids = FxHashSet::default();
+    let mut missing = 0u64;
+    for trace_id in head_trace_ids {
+        if !unique_head_trace_ids.insert(trace_id.clone()) {
+            continue;
+        }
+        if !persisted_state.contains_trace_id(&trace_id) {
+            missing += 1;
+        }
+    }
+    missing
+}
+
+fn retain_top_trace_search_candidates(
+    candidates: impl IntoIterator<Item = TopTraceSearchCandidate>,
+    limit: usize,
+) -> Vec<TopTraceSearchCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut top_candidates = BinaryHeap::with_capacity(limit.min(64));
+    for candidate in candidates {
+        if top_candidates.len() < limit {
+            top_candidates.push(Reverse(candidate));
+            continue;
+        }
+        if top_candidates
+            .peek()
+            .map(|current| candidate > current.0)
+            .unwrap_or(true)
+        {
+            top_candidates.pop();
+            top_candidates.push(Reverse(candidate));
+        }
+    }
+
+    let mut selected = top_candidates
+        .into_iter()
+        .map(|candidate| candidate.0)
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| right.cmp(left));
+    selected
+}
+
+fn retain_top_trace_search_hit(
+    top_hits: &mut BinaryHeap<Reverse<OrderedTraceSearchHit>>,
+    hit: TraceSearchHit,
+    limit: usize,
+) {
+    if limit == 0 {
+        return;
+    }
+    if top_hits.len() < limit {
+        top_hits.push(Reverse(OrderedTraceSearchHit(hit)));
+        return;
+    }
+    if top_hits
+        .peek()
+        .map(|current| OrderedTraceSearchHit(hit.clone()) > current.0)
+        .unwrap_or(true)
+    {
+        top_hits.pop();
+        top_hits.push(Reverse(OrderedTraceSearchHit(hit)));
+    }
+}
+
+fn finalize_top_trace_search_hits(
+    top_hits: BinaryHeap<Reverse<OrderedTraceSearchHit>>,
+) -> Vec<TraceSearchHit> {
+    let mut hits = top_hits
+        .into_iter()
+        .map(|candidate| candidate.0 .0)
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .end_unix_nano
+            .cmp(&left.end_unix_nano)
+            .then_with(|| left.trace_id.cmp(&right.trace_id))
+    });
+    hits
+}
+
+fn retain_top_trace_search_hits(
+    hits: impl IntoIterator<Item = TraceSearchHit>,
+    limit: usize,
+) -> Vec<TraceSearchHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut top_hits = BinaryHeap::with_capacity(limit.min(64));
+    for hit in hits {
+        retain_top_trace_search_hit(&mut top_hits, hit, limit);
+    }
+    finalize_top_trace_search_hits(top_hits)
+}
+
 impl DiskTraceShardState {
+    fn traces_tracked(&self) -> u64 {
+        self.windows_by_trace.len() as u64
+    }
+
+    fn contains_trace_id(&self, trace_id: &str) -> bool {
+        self.trace_ids
+            .lookup(trace_id)
+            .map(|trace_ref| self.windows_by_trace.contains_key(&trace_ref))
+            .unwrap_or(false)
+    }
+
+    fn expired_persisted_segment_ids(&self, cutoff_unix_nano: i64) -> Vec<u64> {
+        let mut segment_ids = self
+            .persisted_segments
+            .iter()
+            .filter_map(|(segment_id, summary)| {
+                (summary.window.end_unix_nano < cutoff_unix_nano).then_some(*segment_id)
+            })
+            .collect::<Vec<_>>();
+        segment_ids.sort_unstable();
+        segment_ids
+    }
+
+    fn remove_persisted_segments(&mut self, segment_ids: &FxHashSet<u64>) {
+        if segment_ids.is_empty() {
+            return;
+        }
+
+        let removed_segment_ids = self
+            .persisted_segments
+            .keys()
+            .filter(|segment_id| segment_ids.contains(segment_id))
+            .copied()
+            .collect::<Vec<_>>();
+        let removed_summaries = removed_segment_ids
+            .into_iter()
+            .filter_map(|segment_id| self.persisted_segments.remove(&segment_id))
+            .collect::<Vec<_>>();
+
+        if removed_summaries.is_empty() {
+            return;
+        }
+
+        let mut removed_rows = 0u64;
+        for summary in removed_summaries {
+            for trace in summary.traces {
+                let trace_ref = trace.trace_ref;
+                let Some(row_refs) = self.row_refs_by_trace.get_mut(&trace_ref) else {
+                    self.windows_by_trace.remove(&trace_ref);
+                    self.all_trace_refs.remove(trace_ref);
+                    continue;
+                };
+
+                let retained_len_before = row_refs.len();
+                row_refs.retain(|row| !segment_ids.contains(&u64::from(row.segment_id)));
+                removed_rows += (retained_len_before.saturating_sub(row_refs.len())) as u64;
+
+                if row_refs.is_empty() {
+                    self.row_refs_by_trace.remove(&trace_ref);
+                    self.windows_by_trace.remove(&trace_ref);
+                    self.all_trace_refs.remove(trace_ref);
+                } else {
+                    self.windows_by_trace
+                        .insert(trace_ref, trace_window_bounds_for_rows(row_refs));
+                }
+            }
+        }
+
+        self.rows_ingested = self.rows_ingested.saturating_sub(removed_rows);
+    }
+
     fn observe_persisted_segment(&mut self, meta: SegmentMeta) {
         let segment_id = meta.segment_id;
         let mut summary = PersistedSegmentSummary {
@@ -2258,6 +2653,75 @@ impl DiskTraceShardState {
         values
     }
 
+    fn list_operations(
+        &self,
+        service_name: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+        limit: usize,
+    ) -> Vec<String> {
+        let Some(service_ref) = self.strings.lookup(service_name) else {
+            return Vec::new();
+        };
+        let mut operations = BTreeSet::new();
+
+        if !self.persisted_segments.is_empty() {
+            for summary in self.persisted_segments.values() {
+                if summary.window.end_unix_nano < start_unix_nano
+                    || summary.window.start_unix_nano > end_unix_nano
+                    || !summary.services.contains(&service_ref)
+                {
+                    continue;
+                }
+                for trace in &summary.traces {
+                    if trace.window.end_unix_nano < start_unix_nano
+                        || trace.window.start_unix_nano > end_unix_nano
+                        || !trace.services.contains(&service_ref)
+                    {
+                        continue;
+                    }
+                    for operation_ref in &trace.operations {
+                        if let Some(operation) = self.strings.resolve(*operation_ref) {
+                            operations.insert(operation.to_string());
+                            if operations.len() >= limit {
+                                return operations.into_iter().collect();
+                            }
+                        }
+                    }
+                }
+            }
+            return operations.into_iter().collect();
+        }
+
+        let Some(service_trace_refs) = self.trace_refs_by_service.get(&service_ref) else {
+            return Vec::new();
+        };
+
+        for (operation_ref, operation_trace_refs) in &self.trace_refs_by_operation {
+            let matching_trace_refs = service_trace_refs.clone() & operation_trace_refs.clone();
+            let has_time_overlap = matching_trace_refs.iter().any(|trace_ref| {
+                self.windows_by_trace
+                    .get(&trace_ref)
+                    .map(|window| {
+                        window.end_unix_nano >= start_unix_nano
+                            && window.start_unix_nano <= end_unix_nano
+                    })
+                    .unwrap_or(false)
+            });
+            if !has_time_overlap {
+                continue;
+            }
+            if let Some(operation) = self.strings.resolve(*operation_ref) {
+                operations.insert(operation.to_string());
+                if operations.len() >= limit {
+                    return operations.into_iter().collect();
+                }
+            }
+        }
+
+        operations.into_iter().collect()
+    }
+
     fn list_trace_ids(&self) -> Vec<String> {
         let mut trace_ids: Vec<String> = self
             .windows_by_trace
@@ -2269,21 +2733,33 @@ impl DiskTraceShardState {
     }
 
     fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
-        let candidate_trace_refs = self.candidate_trace_refs(request);
+        let top_candidates = retain_top_trace_search_candidates(
+            self.candidate_trace_refs(request)
+                .into_iter()
+                .filter_map(|trace_ref| {
+                    let window = self.windows_by_trace.get(&trace_ref)?;
+                    let overlaps = window.end_unix_nano >= request.start_unix_nano
+                        && window.start_unix_nano <= request.end_unix_nano;
+                    if !overlaps {
+                        return None;
+                    }
 
-        let mut hits: Vec<TraceSearchHit> = candidate_trace_refs
+                    Some(TopTraceSearchCandidate {
+                        trace_ref,
+                        trace_id: self.trace_ids.resolve(trace_ref)?.to_string(),
+                        start_unix_nano: window.start_unix_nano,
+                        end_unix_nano: window.end_unix_nano,
+                    })
+                }),
+            request.limit,
+        );
+
+        top_candidates
             .into_iter()
-            .filter_map(|trace_ref| {
-                let window = self.windows_by_trace.get(&trace_ref)?;
-                let overlaps = window.end_unix_nano >= request.start_unix_nano
-                    && window.start_unix_nano <= request.end_unix_nano;
-                if !overlaps {
-                    return None;
-                }
-
+            .map(|candidate| {
                 let services = self
                     .services_by_trace
-                    .get(&trace_ref)
+                    .get(&candidate.trace_ref)
                     .map(|values| {
                         let mut values: Vec<String> = values
                             .iter()
@@ -2296,23 +2772,14 @@ impl DiskTraceShardState {
                     })
                     .unwrap_or_default();
 
-                Some(TraceSearchHit {
-                    trace_id: self.trace_ids.resolve(trace_ref)?.to_string(),
-                    start_unix_nano: window.start_unix_nano,
-                    end_unix_nano: window.end_unix_nano,
+                TraceSearchHit {
+                    trace_id: candidate.trace_id,
+                    start_unix_nano: candidate.start_unix_nano,
+                    end_unix_nano: candidate.end_unix_nano,
                     services,
-                })
+                }
             })
-            .collect();
-
-        hits.sort_by(|left, right| {
-            right
-                .end_unix_nano
-                .cmp(&left.end_unix_nano)
-                .then_with(|| left.trace_id.cmp(&right.trace_id))
-        });
-        hits.truncate(request.limit);
-        hits
+            .collect()
     }
 
     fn row_refs_for_trace(
@@ -2356,12 +2823,15 @@ impl DiskTraceShardState {
         &self,
         request: &TraceSearchRequest,
     ) -> Option<Vec<TraceSearchHit>> {
+        if request.limit == 0 {
+            return Some(Vec::new());
+        }
         if self.persisted_segments.is_empty() {
             return Some(Vec::new());
         }
 
         let candidate_segments = self.candidate_persisted_segment_ids(request);
-        let mut hits = Vec::new();
+        let mut top_hits = BinaryHeap::with_capacity(request.limit.min(64));
         for segment_id in candidate_segments {
             let summary = self.persisted_segments.get(&segment_id)?;
             if summary.traces.is_empty() {
@@ -2378,22 +2848,20 @@ impl DiskTraceShardState {
                     .collect::<Vec<_>>();
                 services.sort();
                 services.dedup();
-                hits.push(TraceSearchHit {
-                    trace_id: self.trace_ids.resolve(trace.trace_ref)?.to_string(),
-                    start_unix_nano: trace.window.start_unix_nano,
-                    end_unix_nano: trace.window.end_unix_nano,
-                    services,
-                });
+                retain_top_trace_search_hit(
+                    &mut top_hits,
+                    TraceSearchHit {
+                        trace_id: self.trace_ids.resolve(trace.trace_ref)?.to_string(),
+                        start_unix_nano: trace.window.start_unix_nano,
+                        end_unix_nano: trace.window.end_unix_nano,
+                        services,
+                    },
+                    request.limit,
+                );
             }
         }
 
-        hits.sort_by(|left, right| {
-            right
-                .end_unix_nano
-                .cmp(&left.end_unix_nano)
-                .then_with(|| left.trace_id.cmp(&right.trace_id))
-        });
-        Some(hits)
+        Some(finalize_top_trace_search_hits(top_hits))
     }
 
     fn persisted_segment_matches_request(
@@ -2839,22 +3307,6 @@ impl ActiveSegment {
         self.accumulator.list_trace_ids()
     }
 
-    fn list_services(&self) -> Vec<String> {
-        self.accumulator.list_services()
-    }
-
-    fn list_field_names(&self) -> Vec<String> {
-        self.accumulator.list_field_names()
-    }
-
-    fn list_field_values(&self, field_name: &str) -> Vec<String> {
-        self.accumulator.list_field_values(field_name)
-    }
-
-    fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
-        self.accumulator.search_traces(request)
-    }
-
     fn into_snapshot(self, shard_index: usize) -> HeadSegmentSnapshot {
         let wal_enabled = !matches!(self.wal_sink, TraceWalSink::Disabled);
         let staged_wal_bytes = match self.wal_sink {
@@ -2899,22 +3351,6 @@ impl HeadSegmentSnapshot {
 
     fn list_trace_ids(&self) -> Vec<String> {
         self.accumulator.list_trace_ids()
-    }
-
-    fn list_services(&self) -> Vec<String> {
-        self.accumulator.list_services()
-    }
-
-    fn list_field_names(&self) -> Vec<String> {
-        self.accumulator.list_field_names()
-    }
-
-    fn list_field_values(&self, field_name: &str) -> Vec<String> {
-        self.accumulator.list_field_values(field_name)
-    }
-
-    fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
-        self.accumulator.search_traces(request)
     }
 
     fn read_rows_for_trace(
@@ -3010,121 +3446,6 @@ impl SegmentAccumulator {
             .collect();
         trace_ids.sort();
         trace_ids
-    }
-
-    fn list_services(&self) -> Vec<String> {
-        let mut services = BTreeSet::new();
-        for trace in self.traces.values() {
-            for service_ref in &trace.services {
-                if let Some(service_name) = self.strings.resolve(*service_ref) {
-                    services.insert(service_name.to_string());
-                }
-            }
-        }
-        let mut services: Vec<String> = services.into_iter().collect();
-        services.sort();
-        services
-    }
-
-    fn list_field_names(&self) -> Vec<String> {
-        let mut field_names = BTreeSet::new();
-        for trace in self.traces.values() {
-            for (field_name_ref, _) in &trace.fields {
-                if let Some(field_name) = self.strings.resolve(*field_name_ref) {
-                    field_names.insert(field_name.to_string());
-                }
-            }
-        }
-        let mut field_names: Vec<String> = field_names.into_iter().collect();
-        field_names.sort();
-        field_names
-    }
-
-    fn list_field_values(&self, field_name: &str) -> Vec<String> {
-        let mut values = BTreeSet::new();
-        for trace in self.traces.values() {
-            for (field_name_ref, field_value_ref) in &trace.fields {
-                let Some(existing_name) = self.strings.resolve(*field_name_ref) else {
-                    continue;
-                };
-                if existing_name != field_name {
-                    continue;
-                }
-                if let Some(field_value) = self.strings.resolve(*field_value_ref) {
-                    values.insert(field_value.to_string());
-                }
-            }
-        }
-        let mut values: Vec<String> = values.into_iter().collect();
-        values.sort();
-        values
-    }
-
-    fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
-        let mut hits: Vec<TraceSearchHit> = self
-            .traces
-            .iter()
-            .filter_map(|(trace_ref, trace)| {
-                let overlaps = trace.window.end_unix_nano >= request.start_unix_nano
-                    && trace.window.start_unix_nano <= request.end_unix_nano;
-                if !overlaps {
-                    return None;
-                }
-                if let Some(service_name) = &request.service_name {
-                    let matches = trace.services.iter().any(|service_ref| {
-                        self.strings.resolve(*service_ref) == Some(service_name.as_str())
-                    });
-                    if !matches {
-                        return None;
-                    }
-                }
-                if let Some(operation_name) = &request.operation_name {
-                    let matches = trace.operations.iter().any(|operation_ref| {
-                        self.strings.resolve(*operation_ref) == Some(operation_name.as_str())
-                    });
-                    if !matches {
-                        return None;
-                    }
-                }
-                for field_filter in &request.field_filters {
-                    let matches = trace
-                        .fields
-                        .iter()
-                        .any(|(field_name_ref, field_value_ref)| {
-                            self.strings.resolve(*field_name_ref)
-                                == Some(field_filter.name.as_str())
-                                && self.strings.resolve(*field_value_ref)
-                                    == Some(field_filter.value.as_str())
-                        });
-                    if !matches {
-                        return None;
-                    }
-                }
-
-                let mut services: Vec<String> = trace
-                    .services
-                    .iter()
-                    .filter_map(|value| self.strings.resolve(*value).map(ToString::to_string))
-                    .collect();
-                services.sort();
-
-                Some(TraceSearchHit {
-                    trace_id: self.trace_ids.resolve(*trace_ref)?.to_string(),
-                    start_unix_nano: trace.window.start_unix_nano,
-                    end_unix_nano: trace.window.end_unix_nano,
-                    services,
-                })
-            })
-            .collect();
-
-        hits.sort_by(|left, right| {
-            right
-                .end_unix_nano
-                .cmp(&left.end_unix_nano)
-                .then_with(|| left.trace_id.cmp(&right.trace_id))
-        });
-        hits.truncate(request.limit);
-        hits
     }
 
     fn ingest_prepared_block_rows<'a>(
@@ -4314,6 +4635,17 @@ fn merge_sorted_row_locations(
     existing.sort_by_key(|row| row.end_unix_nano);
 }
 
+fn trace_window_bounds_for_rows(rows: &[SegmentRowLocation]) -> TraceWindowBounds {
+    let mut bounds = rows
+        .first()
+        .map(|row| TraceWindowBounds::new(row.start_unix_nano, row.end_unix_nano))
+        .expect("trace window bounds require at least one row");
+    for row in rows.iter().skip(1) {
+        bounds.observe(row.start_unix_nano, row.end_unix_nano);
+    }
+    bounds
+}
+
 fn sort_row_locations_by_end(rows: &mut Vec<SegmentRowLocation>) {
     if rows
         .windows(2)
@@ -4447,6 +4779,7 @@ fn read_all_rows_from_row_file(
     _segment_id: u64,
 ) -> Result<Vec<(TraceSpanRow, u64, u32)>, StorageError> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let _page_cache_drop_guard = PageCacheDropGuard::new(&file);
     let (format, mut offset) = detect_row_file_format(&mut file)?;
     let mut rows = Vec::new();
     let mut last_good_end = offset;
@@ -4624,6 +4957,7 @@ fn write_batched_binary_row_file(
     sync_policy: DiskSyncPolicy,
 ) -> Result<(u64, bool), StorageError> {
     let mut file = File::create(path)?;
+    advise_file_sequential(&file);
     file.write_all(WAL_MAGIC)?;
     file.write_all(&[WAL_VERSION_BATCHED_BINARY])?;
 
@@ -4680,6 +5014,7 @@ fn write_batched_binary_row_file(
     } else {
         false
     };
+    advise_file_dontneed(&file);
     Ok((file.metadata()?.len(), synced))
 }
 
@@ -4744,6 +5079,7 @@ fn read_rows_by_indexes_from_part(
     }
 
     let mut file = File::open(path)?;
+    let _page_cache_drop_guard = PageCacheDropGuard::new(&file);
     let part_version = validate_and_skip_part_header(&mut file)?;
 
     let row_count = read_u32(&mut file)? as usize;
@@ -4945,6 +5281,7 @@ fn compact_segment_group(
 
 fn read_part(path: &Path) -> Result<ColumnarPart, StorageError> {
     let mut file = File::open(path)?;
+    let _page_cache_drop_guard = PageCacheDropGuard::new(&file);
     let part_version = validate_and_skip_part_header(&mut file)?;
     read_columnar_part(&mut file, part_version)
 }
@@ -4955,6 +5292,7 @@ fn write_part(
     sync_policy: DiskSyncPolicy,
 ) -> Result<(u64, bool), StorageError> {
     let mut file = File::create(path)?;
+    advise_file_sequential(&file);
     file.write_all(PART_MAGIC)?;
     file.write_all(&[PART_VERSION])?;
     write_columnar_part(&mut file, part)?;
@@ -4965,6 +5303,7 @@ fn write_part(
     } else {
         false
     };
+    advise_file_dontneed(&file);
     Ok((fs::metadata(path)?.len(), synced))
 }
 
@@ -6317,6 +6656,234 @@ fn persist_recovery_manifest_file(
     Ok(())
 }
 
+fn trace_retention_cutoff_unix_nano(retention: Duration, now: SystemTime) -> i64 {
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    let retention = retention.as_nanos();
+    let cutoff = now.saturating_sub(retention);
+    cutoff.min(i64::MAX as u128) as i64
+}
+
+fn saturating_fetch_sub(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
+}
+
+fn delete_persisted_segment_files(
+    segments_path: &Path,
+    segment_id: u64,
+    data_path: &Path,
+) -> Result<TraceRetentionPruneStats, StorageError> {
+    let legacy_meta_path = segment_meta_path(segments_path, segment_id);
+    let binary_meta_path = segment_binary_meta_path(segments_path, segment_id);
+    let meta = load_or_rebuild_segment_meta(segment_id, data_path, &legacy_meta_path).ok();
+    let deleted_typed_field_columns = meta
+        .as_ref()
+        .map(|meta| meta.typed_field_columns)
+        .unwrap_or(0);
+    let deleted_string_field_columns = meta
+        .as_ref()
+        .map(|meta| meta.string_field_columns)
+        .unwrap_or(0);
+
+    let mut deleted_bytes = fs::metadata(data_path).map(|meta| meta.len()).unwrap_or(0);
+    if data_path.exists() {
+        fs::remove_file(data_path)?;
+    }
+
+    for metadata_path in [&binary_meta_path, &legacy_meta_path] {
+        deleted_bytes += fs::metadata(metadata_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if metadata_path.exists() {
+            fs::remove_file(metadata_path)?;
+        }
+    }
+
+    Ok(TraceRetentionPruneStats {
+        deleted_segments: 1,
+        deleted_bytes,
+        deleted_typed_field_columns,
+        deleted_string_field_columns,
+    })
+}
+
+fn prune_recovered_state_for_trace_retention(
+    segments_path: &Path,
+    recovered: &mut RecoveredDiskState,
+    retention: Option<Duration>,
+) -> Result<TraceRetentionPruneStats, StorageError> {
+    let Some(retention) = retention else {
+        return Ok(TraceRetentionPruneStats::default());
+    };
+    let cutoff_unix_nano = trace_retention_cutoff_unix_nano(retention, SystemTime::now());
+    let mut candidate_segment_ids = FxHashSet::default();
+    for shard in &recovered.trace_shards {
+        candidate_segment_ids.extend(shard.expired_persisted_segment_ids(cutoff_unix_nano));
+    }
+    if candidate_segment_ids.is_empty() {
+        return Ok(TraceRetentionPruneStats::default());
+    }
+
+    let mut deleted = TraceRetentionPruneStats::default();
+    let mut deleted_segment_ids = FxHashSet::default();
+    for segment_id in candidate_segment_ids {
+        let Some(data_path) = recovered.segment_paths.get(&segment_id).cloned() else {
+            continue;
+        };
+        let deleted_segment =
+            delete_persisted_segment_files(segments_path, segment_id, &data_path)?;
+        deleted.deleted_segments += deleted_segment.deleted_segments;
+        deleted.deleted_bytes += deleted_segment.deleted_bytes;
+        deleted.deleted_typed_field_columns += deleted_segment.deleted_typed_field_columns;
+        deleted.deleted_string_field_columns += deleted_segment.deleted_string_field_columns;
+        deleted_segment_ids.insert(segment_id);
+    }
+
+    if deleted_segment_ids.is_empty() {
+        return Ok(TraceRetentionPruneStats::default());
+    }
+
+    for shard in &mut recovered.trace_shards {
+        shard.remove_persisted_segments(&deleted_segment_ids);
+    }
+    recovered
+        .segment_paths
+        .retain(|segment_id, _| !deleted_segment_ids.contains(segment_id));
+    recovered.persisted_bytes = recovered
+        .persisted_bytes
+        .saturating_sub(deleted.deleted_bytes);
+    recovered.typed_field_columns = recovered
+        .typed_field_columns
+        .saturating_sub(deleted.deleted_typed_field_columns);
+    recovered.string_field_columns = recovered
+        .string_field_columns
+        .saturating_sub(deleted.deleted_string_field_columns);
+    Ok(deleted)
+}
+
+fn enforce_trace_retention_for_shared_state(
+    root_path: &Path,
+    segments_path: &Path,
+    trace_retention: Option<Duration>,
+    segment_paths: &Arc<RwLock<FxHashMap<u64, PathBuf>>>,
+    trace_shards: &[Arc<RwLock<DiskTraceShardState>>],
+    persisted_bytes: &Arc<AtomicU64>,
+    field_column_counts: &Arc<DiskFieldColumnCounts>,
+    retention_metrics: &Arc<DiskTraceRetentionMetrics>,
+    trace_retention_lock: &Arc<Mutex<()>>,
+) -> Result<(), StorageError> {
+    let Some(retention) = trace_retention else {
+        return Ok(());
+    };
+    let _retention_guard = trace_retention_lock.lock();
+    let cutoff_unix_nano = trace_retention_cutoff_unix_nano(retention, SystemTime::now());
+
+    let mut candidate_segment_ids = FxHashSet::default();
+    for shard in trace_shards {
+        candidate_segment_ids.extend(shard.read().expired_persisted_segment_ids(cutoff_unix_nano));
+    }
+    if candidate_segment_ids.is_empty() {
+        return Ok(());
+    }
+
+    let candidate_paths = {
+        let segment_paths = segment_paths.read();
+        candidate_segment_ids
+            .iter()
+            .filter_map(|segment_id| {
+                segment_paths
+                    .get(segment_id)
+                    .cloned()
+                    .map(|path| (*segment_id, path))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut deleted = TraceRetentionPruneStats::default();
+    let mut deleted_segment_ids = FxHashSet::default();
+    for (segment_id, data_path) in candidate_paths {
+        let deleted_segment =
+            delete_persisted_segment_files(segments_path, segment_id, &data_path)?;
+        deleted.deleted_segments += deleted_segment.deleted_segments;
+        deleted.deleted_bytes += deleted_segment.deleted_bytes;
+        deleted.deleted_typed_field_columns += deleted_segment.deleted_typed_field_columns;
+        deleted.deleted_string_field_columns += deleted_segment.deleted_string_field_columns;
+        deleted_segment_ids.insert(segment_id);
+    }
+
+    if deleted_segment_ids.is_empty() {
+        return Ok(());
+    }
+
+    for shard in trace_shards {
+        shard
+            .write()
+            .remove_persisted_segments(&deleted_segment_ids);
+    }
+    segment_paths
+        .write()
+        .retain(|segment_id, _| !deleted_segment_ids.contains(segment_id));
+    saturating_fetch_sub(persisted_bytes, deleted.deleted_bytes);
+    saturating_fetch_sub(
+        &field_column_counts.typed,
+        deleted.deleted_typed_field_columns,
+    );
+    saturating_fetch_sub(
+        &field_column_counts.string,
+        deleted.deleted_string_field_columns,
+    );
+    retention_metrics
+        .deleted_segments
+        .fetch_add(deleted.deleted_segments, Ordering::Relaxed);
+    retention_metrics
+        .deleted_bytes
+        .fetch_add(deleted.deleted_bytes, Ordering::Relaxed);
+
+    persist_recovery_snapshot_from_shared_state(
+        root_path,
+        segment_paths,
+        trace_shards,
+        persisted_bytes.load(Ordering::Relaxed),
+        field_column_counts.typed.load(Ordering::Relaxed),
+        field_column_counts.string.load(Ordering::Relaxed),
+    )
+}
+
+fn persist_recovery_snapshot_from_shared_state(
+    root_path: &Path,
+    segment_paths: &Arc<RwLock<FxHashMap<u64, PathBuf>>>,
+    trace_shards: &[Arc<RwLock<DiskTraceShardState>>],
+    persisted_bytes: u64,
+    typed_field_columns: u64,
+    string_field_columns: u64,
+) -> Result<(), StorageError> {
+    let segment_paths = segment_paths.read().clone();
+    let trace_shards = trace_shards
+        .iter()
+        .map(|shard| shard.read().clone())
+        .collect::<Vec<_>>();
+    let next_segment_id = segment_paths
+        .keys()
+        .copied()
+        .max()
+        .map(|segment_id| segment_id + 1)
+        .unwrap_or(1);
+    let recovered = RecoveredDiskState {
+        segment_paths,
+        trace_shards,
+        persisted_bytes,
+        typed_field_columns,
+        string_field_columns,
+        next_segment_id,
+        skip_startup_compaction: false,
+    };
+    persist_recovery_manifest_file(root_path, &recovered)
+}
+
 fn write_recovery_shard_file(
     path: &Path,
     shard_index: usize,
@@ -6755,6 +7322,75 @@ fn invalid_data(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(ErrorKind::InvalidData, message.into())
 }
 
+struct PageCacheDropGuard {
+    #[cfg(target_os = "linux")]
+    fd: RawFd,
+}
+
+impl PageCacheDropGuard {
+    fn new(file: &File) -> Self {
+        advise_file_sequential(file);
+        Self {
+            #[cfg(target_os = "linux")]
+            fd: file.as_raw_fd(),
+        }
+    }
+}
+
+impl Drop for PageCacheDropGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        let _ = try_advise_fd_dontneed(self.fd);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_advise_fd(fd: RawFd, advice: libc::c_int) -> std::io::Result<()> {
+    let result = unsafe { libc::posix_fadvise(fd, 0, 0, advice) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(result))
+    }
+}
+
+fn try_advise_file_sequential(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return try_advise_fd(file.as_raw_fd(), libc::POSIX_FADV_SEQUENTIAL);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+fn try_advise_file_dontneed(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return try_advise_fd(file.as_raw_fd(), libc::POSIX_FADV_DONTNEED);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+fn advise_file_sequential(file: &File) {
+    let _ = try_advise_file_sequential(file);
+}
+
+fn advise_file_dontneed(file: &File) {
+    let _ = try_advise_file_dontneed(file);
+}
+
+#[cfg(target_os = "linux")]
+fn try_advise_fd_dontneed(fd: RawFd) -> std::io::Result<()> {
+    try_advise_fd(fd, libc::POSIX_FADV_DONTNEED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -6768,14 +7404,18 @@ mod tests {
         write_segment_meta_binary, ActiveSegment, BatchInternCache, DiskStorageConfig,
         DiskStorageEngine, DiskSyncPolicy, DiskTraceShardState, PreparedTraceBlockAppend,
         PreparedTraceShardBatch, SegmentAccumulator, SegmentFileSet, SegmentRowLocation,
-        SegmentTraceAccumulator, SEGMENTS_DIRNAME,
+        SegmentTraceAccumulator, TraceWindowBounds, SEGMENTS_DIRNAME,
     };
     use crate::{StorageEngine, StorageError};
     use serde_json::Value;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
         collections::HashMap,
         fs,
+        fs::File,
         path::{Path, PathBuf},
+        sync::Arc,
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -6788,6 +7428,21 @@ mod tests {
             start_unix_nano: start,
             end_unix_nano: end,
         }
+    }
+
+    fn current_unix_nanos() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix clock")
+            .as_nanos()
+            .try_into()
+            .expect("nanoseconds fit in i64")
+    }
+
+    #[cfg(unix)]
+    fn set_directory_mode(path: &Path, mode: u32) {
+        let permissions = fs::Permissions::from_mode(mode);
+        fs::set_permissions(path, permissions).expect("update directory permissions");
     }
 
     fn trace_row(
@@ -6834,6 +7489,75 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rust-vt-disk-unit-{name}-{nanos}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn page_cache_hint_helpers_accept_regular_files() {
+        let path = temp_test_dir("page-cache-hints");
+        let file_path = path.join("segment-00000000000000000001.part");
+        let file = File::create(&file_path).expect("create test file");
+
+        super::try_advise_file_sequential(&file).expect("sequential hint should succeed");
+        super::try_advise_file_dontneed(&file).expect("dontneed hint should succeed");
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn count_head_traces_missing_from_persisted_state_dedupes_head_and_persisted_trace_ids() {
+        let mut persisted = DiskTraceShardState::default();
+        let persisted_trace_ref = persisted.trace_ids.intern("trace-persisted");
+        persisted
+            .windows_by_trace
+            .insert(persisted_trace_ref, TraceWindowBounds::new(100, 150));
+        persisted.all_trace_refs.insert(persisted_trace_ref);
+
+        assert_eq!(
+            super::count_head_traces_missing_from_persisted_state(
+                vec![
+                    "trace-persisted".to_string(),
+                    "trace-persisted".to_string(),
+                    "trace-head".to_string(),
+                ],
+                &persisted,
+            ),
+            1,
+        );
+    }
+
+    #[test]
+    fn retain_top_trace_search_candidates_keeps_latest_hits_with_trace_id_tiebreak() {
+        let selected = super::retain_top_trace_search_candidates(
+            vec![
+                super::TopTraceSearchCandidate {
+                    trace_ref: 1,
+                    trace_id: "trace-z".to_string(),
+                    start_unix_nano: 0,
+                    end_unix_nano: 100,
+                },
+                super::TopTraceSearchCandidate {
+                    trace_ref: 2,
+                    trace_id: "trace-a".to_string(),
+                    start_unix_nano: 0,
+                    end_unix_nano: 100,
+                },
+                super::TopTraceSearchCandidate {
+                    trace_ref: 3,
+                    trace_id: "trace-b".to_string(),
+                    start_unix_nano: 0,
+                    end_unix_nano: 300,
+                },
+            ],
+            2,
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.trace_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["trace-b", "trace-a"],
+        );
     }
 
     fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -7239,6 +7963,58 @@ mod tests {
             .expect("summary-backed persisted search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].trace_id, "trace-summary-roundtrip");
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn search_persisted_segments_respects_request_limit() {
+        let path = temp_test_dir("persisted-search-limit");
+        let segments_path = path.join(SEGMENTS_DIRNAME);
+        fs::create_dir_all(&segments_path).expect("create segments dir");
+
+        for (segment_id, end_unix_nano) in [(1, 100), (2, 200), (3, 300)] {
+            write_test_wal_segment(
+                &segments_path,
+                segment_id,
+                vec![trace_row(
+                    &format!("trace-limit-{segment_id}"),
+                    &format!("span-{segment_id}"),
+                    "GET /checkout",
+                    end_unix_nano - 50,
+                    end_unix_nano,
+                    &[("resource_attr:service.name", "checkout")],
+                )],
+            )
+            .expect("write summary segment");
+        }
+
+        let mut shard = DiskTraceShardState::default();
+        for segment_id in [1, 2, 3] {
+            shard.observe_persisted_segment(
+                rebuild_segment_meta(segment_id, &segment_wal_path(&segments_path, segment_id))
+                    .expect("rebuild summary meta"),
+            );
+        }
+        let request = TraceSearchRequest {
+            start_unix_nano: 0,
+            end_unix_nano: 1_000,
+            service_name: Some("checkout".to_string()),
+            operation_name: None,
+            field_filters: Vec::new(),
+            limit: 2,
+        };
+
+        let hits = shard
+            .search_persisted_segments(&request)
+            .expect("summary-backed persisted search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.trace_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["trace-limit-3", "trace-limit-2"],
+        );
 
         fs::remove_dir_all(path).expect("cleanup temp dir");
     }
@@ -7935,6 +8711,321 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn trace_retention_prunes_expired_segments_on_startup() {
+        let path = temp_test_dir("trace-retention-startup");
+        let segments_path = path.join(SEGMENTS_DIRNAME);
+        fs::create_dir_all(&segments_path).expect("create segments dir");
+
+        let now = current_unix_nanos();
+        let expired_start = now - Duration::from_secs(48 * 60 * 60).as_nanos() as i64;
+        let expired_end = expired_start + 50;
+        write_test_wal_segment(
+            &segments_path,
+            1,
+            vec![trace_row(
+                "trace-retention-startup",
+                "span-1",
+                "GET /checkout",
+                expired_start,
+                expired_end,
+                &[("resource_attr:service.name", "checkout")],
+            )],
+        )
+        .expect("write expired startup segment");
+
+        let engine = DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default()
+                .with_trace_shards(1)
+                .with_trace_retention(Duration::from_secs(24 * 60 * 60)),
+        )
+        .expect("open disk engine with retention");
+
+        let stats = engine.stats();
+        assert_eq!(stats.persisted_segment_count, 0);
+        assert_eq!(stats.trace_retention_deleted_segments, 1);
+        assert!(stats.trace_retention_deleted_bytes > 0);
+        assert!(engine.trace_window("trace-retention-startup").is_none());
+        assert!(engine
+            .search_traces(&TraceSearchRequest {
+                start_unix_nano: expired_start - 10,
+                end_unix_nano: expired_end + 10,
+                service_name: None,
+                operation_name: None,
+                field_filters: Vec::new(),
+                limit: 10,
+            })
+            .is_empty());
+        assert!(
+            !segment_wal_path(&segments_path, 1).exists(),
+            "expired wal segment should be deleted during startup retention",
+        );
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn trace_retention_prunes_expired_segments_after_seal() {
+        let path = temp_test_dir("trace-retention-runtime");
+        let now = current_unix_nanos();
+        let expired_start = now - Duration::from_secs(48 * 60 * 60).as_nanos() as i64;
+        let expired_end = expired_start + 50;
+        let engine = DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default()
+                .with_trace_shards(1)
+                .with_target_segment_size_bytes(1)
+                .with_trace_retention(Duration::from_secs(24 * 60 * 60)),
+        )
+        .expect("open disk engine with runtime retention");
+
+        engine
+            .append_rows(vec![trace_row(
+                "trace-retention-runtime",
+                "span-1",
+                "GET /inventory",
+                expired_start,
+                expired_end,
+                &[("resource_attr:service.name", "inventory")],
+            )])
+            .expect("append expired trace");
+
+        wait_until(|| engine.stats().trace_retention_deleted_segments >= 1);
+        let stats = engine.stats();
+        assert_eq!(stats.persisted_segment_count, 0);
+        assert!(stats.trace_retention_deleted_bytes > 0);
+        assert!(engine.trace_window("trace-retention-runtime").is_none());
+        assert!(engine
+            .rows_for_trace(
+                "trace-retention-runtime",
+                expired_start - 10,
+                expired_end + 10,
+            )
+            .is_empty());
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn trace_retention_idle_sweep_prunes_expired_segments_without_new_writes() {
+        let path = temp_test_dir("trace-retention-idle-sweep");
+        let now = current_unix_nanos();
+        let engine = DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default()
+                .with_trace_shards(1)
+                .with_trace_wal_enabled(false)
+                .with_target_segment_size_bytes(1)
+                .with_trace_retention(Duration::from_millis(80))
+                .with_trace_retention_sweep_interval(Duration::from_millis(10)),
+        )
+        .expect("open disk engine with idle retention sweep");
+
+        engine
+            .append_rows(vec![trace_row(
+                "trace-retention-idle-sweep",
+                "span-1",
+                "GET /catalog",
+                now,
+                now + 50,
+                &[("resource_attr:service.name", "catalog")],
+            )])
+            .expect("append trace before idle sweep");
+
+        wait_until(|| engine.stats().persisted_segment_count == 1);
+        wait_until(|| engine.stats().trace_retention_deleted_segments >= 1);
+
+        let stats = engine.stats();
+        assert_eq!(stats.persisted_segment_count, 0);
+        assert!(engine.trace_window("trace-retention-idle-sweep").is_none());
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn concurrent_trace_retention_calls_are_serialized() {
+        let path = temp_test_dir("trace-retention-serialized");
+        let segments_path = path.join(SEGMENTS_DIRNAME);
+        fs::create_dir_all(&segments_path).expect("create segments dir");
+
+        let now = current_unix_nanos();
+        let expired_start = now - Duration::from_secs(48 * 60 * 60).as_nanos() as i64;
+        let expired_end = expired_start + 50;
+        write_test_wal_segment(
+            &segments_path,
+            1,
+            vec![trace_row(
+                "trace-retention-serialized",
+                "span-1",
+                "GET /checkout",
+                expired_start,
+                expired_end,
+                &[("resource_attr:service.name", "checkout")],
+            )],
+        )
+        .expect("write expired wal segment");
+
+        let engine = DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default().with_trace_shards(1),
+        )
+        .expect("open disk engine without retention worker");
+
+        let root_path = engine.root_path.clone();
+        let segments_path = engine.segments_path.clone();
+        let segment_paths = Arc::clone(&engine.segment_paths);
+        let trace_shards = engine.trace_shards.clone();
+        let persisted_bytes = Arc::clone(&engine.persisted_bytes);
+        let field_column_counts = Arc::clone(&engine.field_column_counts);
+        let retention_metrics = Arc::clone(&engine.retention_metrics);
+        let trace_retention_lock = Arc::clone(&engine.trace_seal_context.trace_retention_lock);
+        let retention = Duration::from_secs(24 * 60 * 60);
+
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                let root_path = root_path.clone();
+                let segments_path = segments_path.clone();
+                let segment_paths = Arc::clone(&segment_paths);
+                let trace_shards = trace_shards.clone();
+                let persisted_bytes = Arc::clone(&persisted_bytes);
+                let field_column_counts = Arc::clone(&field_column_counts);
+                let retention_metrics = Arc::clone(&retention_metrics);
+                let trace_retention_lock = Arc::clone(&trace_retention_lock);
+                scope.spawn(move || {
+                    super::enforce_trace_retention_for_shared_state(
+                        &root_path,
+                        &segments_path,
+                        Some(retention),
+                        &segment_paths,
+                        &trace_shards,
+                        &persisted_bytes,
+                        &field_column_counts,
+                        &retention_metrics,
+                        &trace_retention_lock,
+                    )
+                    .expect("serialized retention should succeed");
+                });
+            }
+        });
+
+        let stats = engine.stats();
+        assert_eq!(stats.persisted_segment_count, 0);
+        assert_eq!(stats.trace_retention_deleted_segments, 1);
+        assert!(stats.trace_retention_deleted_bytes > 0);
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_retention_sync_failure_is_returned_and_marked_unhealthy() {
+        let path = temp_test_dir("trace-retention-sync-failure");
+        let now = current_unix_nanos();
+        let expired_start = now - Duration::from_secs(48 * 60 * 60).as_nanos() as i64;
+        let expired_end = expired_start + 50;
+        let engine = DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default()
+                .with_trace_shards(1)
+                .with_trace_wal_enabled(false)
+                .with_target_segment_size_bytes(1)
+                .with_trace_retention(Duration::from_secs(24 * 60 * 60)),
+        )
+        .expect("open disk engine for sync retention failure");
+
+        set_directory_mode(&path, 0o555);
+        let result = engine.append_rows(vec![trace_row(
+            "trace-retention-sync-failure",
+            "span-1",
+            "GET /checkout",
+            expired_start,
+            expired_end,
+            &[("resource_attr:service.name", "checkout")],
+        )]);
+        set_directory_mode(&path, 0o755);
+
+        let error = result.expect_err("sync retention failure should propagate");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("Permission denied")
+                || error_text.contains("Operation not permitted"),
+            "unexpected sync retention error: {error_text}",
+        );
+        let pending_error = engine
+            .trace_seal_context
+            .pending_seal_error()
+            .expect("seal health should capture sync retention failure");
+        assert!(
+            pending_error.contains("Permission denied")
+                || pending_error.contains("Operation not permitted"),
+            "unexpected pending seal error: {pending_error}",
+        );
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_retention_background_failure_marks_engine_unhealthy() {
+        let path = temp_test_dir("trace-retention-background-failure");
+        let now = current_unix_nanos();
+        let expired_start = now - Duration::from_secs(48 * 60 * 60).as_nanos() as i64;
+        let expired_end = expired_start + 50;
+        let engine = DiskStorageEngine::open_with_config(
+            &path,
+            DiskStorageConfig::default()
+                .with_trace_shards(1)
+                .with_target_segment_size_bytes(1)
+                .with_trace_retention(Duration::from_secs(24 * 60 * 60))
+                .with_trace_retention_sweep_interval(Duration::from_secs(60)),
+        )
+        .expect("open disk engine for background retention failure");
+
+        set_directory_mode(&path, 0o555);
+        engine
+            .append_rows(vec![trace_row(
+                "trace-retention-background-failure",
+                "span-1",
+                "GET /checkout",
+                expired_start,
+                expired_end,
+                &[("resource_attr:service.name", "checkout")],
+            )])
+            .expect("background seal enqueue should still succeed");
+
+        wait_until(|| engine.trace_seal_context.pending_seal_error().is_some());
+
+        let pending_error = engine
+            .trace_seal_context
+            .pending_seal_error()
+            .expect("background retention failure should be recorded");
+        assert!(
+            pending_error.contains("Permission denied")
+                || pending_error.contains("Operation not permitted"),
+            "unexpected pending seal error: {pending_error}",
+        );
+
+        let append_result = engine.append_rows(vec![trace_row(
+            "trace-retention-health-check",
+            "span-2",
+            "GET /health",
+            now,
+            now + 25,
+            &[("resource_attr:service.name", "health")],
+        )]);
+        set_directory_mode(&path, 0o755);
+
+        let error = append_result.expect_err("health check should reject appends after failure");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("background trace seal failed"),
+            "unexpected append health error: {error_text}",
+        );
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
     }
 
     #[test]

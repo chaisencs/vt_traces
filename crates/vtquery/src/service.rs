@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use vtcore::{LogRow, LogSearchRequest, TraceSearchHit, TraceSearchRequest, TraceSpanRow};
-use vtstorage::StorageEngine;
+use vtstorage::{StorageEngine, TraceRowsRequest};
 
 #[derive(Clone)]
 pub struct QueryService {
@@ -37,6 +37,17 @@ impl QueryService {
         self.storage.list_field_values(field_name)
     }
 
+    pub fn list_operations(
+        &self,
+        service_name: &str,
+        start_unix_nano: i64,
+        end_unix_nano: i64,
+        limit: usize,
+    ) -> Vec<String> {
+        self.storage
+            .list_operations(service_name, start_unix_nano, end_unix_nano, limit)
+    }
+
     pub fn search_traces(&self, request: &TraceSearchRequest) -> Vec<TraceSearchHit> {
         self.storage.search_traces(request)
     }
@@ -51,5 +62,28 @@ impl QueryService {
         });
         rows.truncate(request.limit);
         rows
+    }
+
+    pub fn get_traces_for_hits(
+        &self,
+        hits: &[TraceSearchHit],
+    ) -> HashMap<String, Vec<TraceSpanRow>> {
+        let requests = hits
+            .iter()
+            .map(|hit| TraceRowsRequest {
+                trace_id: hit.trace_id.clone(),
+                start_unix_nano: hit.start_unix_nano,
+                end_unix_nano: hit.end_unix_nano,
+            })
+            .collect::<Vec<_>>();
+        self.storage
+            .rows_for_traces(&requests)
+            .into_iter()
+            .map(|response| {
+                let mut rows = response.rows;
+                rows.sort_by_key(|row| row.end_unix_nano);
+                (response.trace_id, rows)
+            })
+            .collect()
     }
 }
