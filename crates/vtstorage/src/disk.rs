@@ -173,7 +173,6 @@ impl DiskStorageConfig {
     }
 }
 
-#[derive(Debug)]
 pub struct DiskStorageEngine {
     root_path: PathBuf,
     segments_path: PathBuf,
@@ -195,6 +194,9 @@ pub struct DiskStorageEngine {
     fsync_operations: Arc<AtomicU64>,
     head_metrics: Arc<DiskTraceHeadMetrics>,
     field_column_counts: Arc<DiskFieldColumnCounts>,
+    trace_seal_context: DiskTraceSealContext,
+    trace_seal_tx: Option<mpsc::Sender<DiskTraceSealTask>>,
+    trace_seal_workers: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -435,6 +437,24 @@ struct HeadSegmentSnapshot {
     cached_payload_bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct DiskTraceSealTask {
+    snapshot: Arc<HeadSegmentSnapshot>,
+}
+
+#[derive(Clone)]
+struct DiskTraceSealContext {
+    segments_path: PathBuf,
+    sync_policy: DiskSyncPolicy,
+    segment_paths: Arc<RwLock<FxHashMap<u64, PathBuf>>>,
+    trace_shards: Vec<Arc<RwLock<DiskTraceShardState>>>,
+    sealing_segments: Vec<Arc<RwLock<Vec<Arc<HeadSegmentSnapshot>>>>>,
+    fsync_operations: Arc<AtomicU64>,
+    head_metrics: Arc<DiskTraceHeadMetrics>,
+    field_column_counts: Arc<DiskFieldColumnCounts>,
+    seal_error: Arc<Mutex<Option<String>>>,
+}
+
 #[derive(Debug, Default)]
 struct DiskTraceHeadMetrics {
     group_commit_flushes: AtomicU64,
@@ -463,6 +483,126 @@ fn persist_snapshot_wal(snapshot: &HeadSegmentSnapshot) -> Result<(), StorageErr
     wal_file.write_all(&snapshot.staged_wal_bytes)?;
     wal_file.flush()?;
     Ok(())
+}
+
+impl DiskTraceSealContext {
+    fn persist_rotated_head_segment(
+        &self,
+        snapshot: &HeadSegmentSnapshot,
+    ) -> Result<(), StorageError> {
+        let data_path = if snapshot.wal_enabled {
+            persist_snapshot_wal(snapshot)?;
+            snapshot.wal_path.clone()
+        } else {
+            let rows_path = segment_row_file_path(&self.segments_path, snapshot.segment_id);
+            let (_, synced) = write_batched_binary_row_file(
+                &rows_path,
+                &snapshot.cached_payload_bytes,
+                &snapshot.cached_payload_ranges,
+                self.sync_policy,
+            )?;
+            if synced {
+                self.fsync_operations.fetch_add(1, Ordering::Relaxed);
+            }
+            rows_path
+        };
+        let meta = snapshot.build_meta(&data_path)?;
+        let typed_field_columns = meta.typed_field_columns;
+        let string_field_columns = meta.string_field_columns;
+        self.segment_paths
+            .write()
+            .insert(snapshot.segment_id, data_path);
+        {
+            let mut shard_state = self.trace_shards[snapshot.shard_index].write();
+            shard_state.observe_persisted_segment(meta);
+        }
+        self.field_column_counts
+            .typed
+            .fetch_add(typed_field_columns, Ordering::Relaxed);
+        self.field_column_counts
+            .string
+            .fetch_add(string_field_columns, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn remove_sealing_snapshot(&self, snapshot: &Arc<HeadSegmentSnapshot>) {
+        let mut sealing = self.sealing_segments[snapshot.shard_index].write();
+        sealing.retain(|existing| !Arc::ptr_eq(existing, snapshot));
+    }
+
+    fn record_seal_success(&self, snapshot: &Arc<HeadSegmentSnapshot>) {
+        self.remove_sealing_snapshot(snapshot);
+        self.head_metrics
+            .seal_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.head_metrics
+            .seal_rows
+            .fetch_add(snapshot.row_count(), Ordering::Relaxed);
+        self.head_metrics
+            .seal_bytes
+            .fetch_add(snapshot.persisted_bytes(), Ordering::Relaxed);
+    }
+
+    fn record_seal_error(&self, error: &StorageError) {
+        let mut seal_error = self.seal_error.lock();
+        if seal_error.is_none() {
+            *seal_error = Some(error.to_string());
+        }
+    }
+
+    fn settle_seal_result(
+        &self,
+        snapshot: Arc<HeadSegmentSnapshot>,
+        result: Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        self.head_metrics
+            .seal_queue_depth
+            .fetch_sub(1, Ordering::Relaxed);
+        match result {
+            Ok(()) => {
+                self.record_seal_success(&snapshot);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_seal_error(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_seal_task(&self, snapshot: Arc<HeadSegmentSnapshot>) {
+        let result = self.persist_rotated_head_segment(snapshot.as_ref());
+        let _ = self.settle_seal_result(snapshot, result);
+    }
+
+    fn pending_seal_error(&self) -> Option<String> {
+        self.seal_error.lock().clone()
+    }
+}
+
+fn spawn_trace_seal_workers(
+    context: DiskTraceSealContext,
+    worker_count: usize,
+) -> (mpsc::Sender<DiskTraceSealTask>, Vec<thread::JoinHandle<()>>) {
+    let (tx, rx) = mpsc::channel::<DiskTraceSealTask>();
+    let shared_rx = Arc::new(Mutex::new(rx));
+    let worker_count = worker_count.max(1);
+    let mut workers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let worker_context = context.clone();
+        let worker_rx = Arc::clone(&shared_rx);
+        workers.push(thread::spawn(move || loop {
+            let task = {
+                let rx = worker_rx.lock();
+                rx.recv()
+            };
+            match task {
+                Ok(task) => worker_context.finish_seal_task(task.snapshot),
+                Err(_) => break,
+            }
+        }));
+    }
+    (tx, workers)
 }
 
 #[derive(Debug, Default)]
@@ -888,6 +1028,20 @@ impl DiskStorageEngine {
             typed: AtomicU64::new(recovered.typed_field_columns),
             string: AtomicU64::new(recovered.string_field_columns),
         });
+        let trace_seal_error = Arc::new(Mutex::new(None));
+        let trace_seal_context = DiskTraceSealContext {
+            segments_path: segments_path.clone(),
+            sync_policy: config.sync_policy,
+            segment_paths: Arc::clone(&segment_paths),
+            trace_shards: trace_shards.clone(),
+            sealing_segments: sealing_segments.clone(),
+            fsync_operations: Arc::clone(&fsync_operations),
+            head_metrics: Arc::clone(&head_metrics),
+            field_column_counts: Arc::clone(&field_column_counts),
+            seal_error: trace_seal_error,
+        };
+        let (trace_seal_tx, trace_seal_workers) =
+            spawn_trace_seal_workers(trace_seal_context.clone(), config.trace_seal_worker_count);
         let log_writer = BufWriter::new(
             OpenOptions::new()
                 .create(true)
@@ -917,6 +1071,9 @@ impl DiskStorageEngine {
             fsync_operations,
             head_metrics,
             field_column_counts,
+            trace_seal_context,
+            trace_seal_tx: Some(trace_seal_tx),
+            trace_seal_workers: Mutex::new(trace_seal_workers),
         })
     }
 
@@ -970,61 +1127,77 @@ impl DiskStorageEngine {
 
     fn persist_rotated_head_segment(
         &self,
+        snapshot: &HeadSegmentSnapshot,
+    ) -> Result<(), StorageError> {
+        self.trace_seal_context
+            .persist_rotated_head_segment(snapshot)
+    }
+
+    fn check_trace_seal_health(&self) -> Result<(), StorageError> {
+        if let Some(error) = self.trace_seal_context.pending_seal_error() {
+            return Err(StorageError::Message(format!(
+                "background trace seal failed: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn enqueue_rotated_head_segment(
+        &self,
         snapshot: HeadSegmentSnapshot,
     ) -> Result<(), StorageError> {
-        let data_path = if snapshot.wal_enabled {
-            persist_snapshot_wal(&snapshot)?;
-            snapshot.wal_path.clone()
-        } else {
-            let rows_path = segment_row_file_path(&self.segments_path, snapshot.segment_id);
-            let (_, synced) = write_batched_binary_row_file(
-                &rows_path,
-                &snapshot.cached_payload_bytes,
-                &snapshot.cached_payload_ranges,
-                self.config.sync_policy,
-            )?;
-            if synced {
-                self.fsync_operations.fetch_add(1, Ordering::Relaxed);
-            }
-            rows_path
-        };
-        let meta = snapshot.build_meta(&data_path)?;
-        let typed_field_columns = meta.typed_field_columns;
-        let string_field_columns = meta.string_field_columns;
-        self.segment_paths
+        let snapshot = Arc::new(snapshot);
+        self.sealing_segments[snapshot.shard_index]
             .write()
-            .insert(snapshot.segment_id, data_path);
-        {
-            let mut shard_state = self.trace_shards[snapshot.shard_index].write();
-            shard_state.observe_persisted_segment(meta);
+            .push(snapshot.clone());
+        self.head_metrics
+            .seal_queue_depth
+            .fetch_add(1, Ordering::Relaxed);
+
+        if snapshot.wal_enabled {
+            let send_result = self
+                .trace_seal_tx
+                .as_ref()
+                .ok_or_else(|| {
+                    StorageError::Message(
+                        "trace seal worker queue is unavailable during enqueue".to_string(),
+                    )
+                })?
+                .send(DiskTraceSealTask {
+                    snapshot: snapshot.clone(),
+                })
+                .map_err(|error| {
+                    StorageError::Message(format!("failed to enqueue trace seal task: {error}"))
+                });
+            return match send_result {
+                Ok(()) => Ok(()),
+                Err(error) => self
+                    .trace_seal_context
+                    .settle_seal_result(snapshot, Err(error)),
+            };
         }
-        self.field_column_counts
-            .typed
-            .fetch_add(typed_field_columns, Ordering::Relaxed);
-        self.field_column_counts
-            .string
-            .fetch_add(string_field_columns, Ordering::Relaxed);
-        Ok(())
+
+        let result = self.persist_rotated_head_segment(snapshot.as_ref());
+        self.trace_seal_context.settle_seal_result(snapshot, result)
     }
 
     fn maybe_roll_active_segment(
         &self,
         shard_index: usize,
         active_segment_slot: &mut Option<ActiveSegment>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<HeadSegmentSnapshot>, StorageError> {
         let should_seal = active_segment_slot.as_ref().is_some_and(|active_segment| {
             !active_segment.is_empty()
                 && active_segment.persisted_bytes() >= self.config.target_segment_size_bytes
         });
         if !should_seal {
-            return Ok(());
+            return Ok(None);
         }
         let mut sealed_head = active_segment_slot
             .take()
             .expect("active segment should exist when sealing");
         sealed_head.flush()?;
         let snapshot = sealed_head.into_snapshot(shard_index);
-        self.persist_rotated_head_segment(snapshot)?;
         let next_segment_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         *active_segment_slot = Some(ActiveSegment::open(
             &self.segments_path,
@@ -1033,7 +1206,7 @@ impl DiskStorageEngine {
             self.config.trace_wal_writer_capacity_bytes,
             self.config.trace_deferred_wal_writes,
         )?);
-        Ok(())
+        Ok(Some(snapshot))
     }
 
     fn flush_log_writer(&self) -> Result<(), StorageError> {
@@ -1106,6 +1279,7 @@ impl DiskStorageEngine {
         prepared_batches: Vec<PreparedTraceShardBatch>,
     ) -> Result<(), StorageError> {
         debug_assert!(!prepared_batches.is_empty());
+        self.check_trace_seal_health()?;
         let mut active_segment_slot = self.active_segments[shard_index].lock();
         let active_segment = self.ensure_active_segment(&mut active_segment_slot)?;
         let mut total_rows = 0usize;
@@ -1120,7 +1294,12 @@ impl DiskStorageEngine {
         self.persisted_bytes
             .fetch_add(total_bytes, Ordering::Relaxed);
         self.group_commit_active_segment(active_segment, total_rows, total_bytes)?;
-        self.maybe_roll_active_segment(shard_index, &mut active_segment_slot)?;
+        let rotated_snapshot =
+            self.maybe_roll_active_segment(shard_index, &mut active_segment_slot)?;
+        drop(active_segment_slot);
+        if let Some(rotated_snapshot) = rotated_snapshot {
+            self.enqueue_rotated_head_segment(rotated_snapshot)?;
+        }
         Ok(())
     }
 
@@ -1208,7 +1387,10 @@ impl DiskStorageEngine {
         &self,
         shard_index: usize,
         requests: Vec<DiskTraceAppendRequest>,
-    ) -> (PreparedTraceShardBatch, Vec<mpsc::Sender<Result<(), String>>>) {
+    ) -> (
+        PreparedTraceShardBatch,
+        Vec<mpsc::Sender<Result<(), String>>>,
+    ) {
         let mut earliest_enqueue = requests[0].enqueued_at;
         let mut input_blocks = 0usize;
         let mut row_count = 0usize;
@@ -1532,10 +1714,37 @@ impl DiskStorageEngine {
         }
         hits_by_trace.into_values().collect()
     }
+
+    fn shutdown_trace_seal_workers(&mut self) {
+        self.trace_seal_tx.take();
+        let mut workers = self.trace_seal_workers.lock();
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+
+    fn flush_pending_sealing_segments(&self) {
+        for shard_index in 0..self.sealing_segments.len() {
+            let pending = {
+                let sealing = self.sealing_segments[shard_index].read();
+                sealing.iter().cloned().collect::<Vec<_>>()
+            };
+            for snapshot in pending {
+                if self
+                    .trace_seal_context
+                    .persist_rotated_head_segment(snapshot.as_ref())
+                    .is_ok()
+                {
+                    self.trace_seal_context.record_seal_success(&snapshot);
+                }
+            }
+        }
+    }
 }
 
 impl Drop for DiskStorageEngine {
     fn drop(&mut self) {
+        self.shutdown_trace_seal_workers();
         for (shard_index, active_segment) in self.active_segments.iter().enumerate() {
             let mut active_segment = active_segment.lock();
             if let Some(mut active_segment) = active_segment.take() {
@@ -1549,9 +1758,10 @@ impl Drop for DiskStorageEngine {
                     }
                 }
                 let snapshot = active_segment.into_snapshot(shard_index);
-                let _ = self.persist_rotated_head_segment(snapshot);
+                let _ = self.persist_rotated_head_segment(&snapshot);
             }
         }
+        self.flush_pending_sealing_segments();
         let _ = self.flush_log_writer();
         let _ = self.persist_recovery_snapshot();
     }
@@ -1752,7 +1962,7 @@ impl StorageEngine for DiskStorageEngine {
     }
 
     fn stats(&self) -> StorageStatsSnapshot {
-        let segment_paths = self.segment_paths.read();
+        let persisted_segment_count = self.segment_paths.read().len() as u64;
         let mut rows_ingested = 0u64;
         let mut trace_ids = BTreeSet::new();
         for shard in &self.trace_shards {
@@ -1768,7 +1978,7 @@ impl StorageEngine for DiskStorageEngine {
             traces_tracked: trace_ids.len() as u64,
             retained_trace_blocks: 0,
             persisted_bytes: self.persisted_bytes.load(Ordering::Relaxed),
-            segment_count: segment_paths.len() as u64 + trace_head_segments,
+            segment_count: persisted_segment_count + trace_head_segments,
             trace_head_segments,
             trace_head_rows,
             typed_field_columns: self.field_column_counts.typed.load(Ordering::Relaxed),
@@ -1892,8 +2102,13 @@ impl DiskTraceShardState {
                 FxHashMap::default();
             for (field_name, values) in &trace.fields {
                 let field_name_ref = self.strings.intern(field_name);
-                let summary_values = summary.field_values_by_name.entry(field_name_ref).or_default();
-                let trace_values = trace_field_values_by_name.entry(field_name_ref).or_default();
+                let summary_values = summary
+                    .field_values_by_name
+                    .entry(field_name_ref)
+                    .or_default();
+                let trace_values = trace_field_values_by_name
+                    .entry(field_name_ref)
+                    .or_default();
                 for value in values {
                     let field_value_ref = self.strings.intern(value);
                     if !summary_values.contains(&field_value_ref) {
@@ -2137,7 +2352,10 @@ impl DiskTraceShardState {
         segment_ids
     }
 
-    fn search_persisted_segments(&self, request: &TraceSearchRequest) -> Option<Vec<TraceSearchHit>> {
+    fn search_persisted_segments(
+        &self,
+        request: &TraceSearchRequest,
+    ) -> Option<Vec<TraceSearchHit>> {
         if self.persisted_segments.is_empty() {
             return Some(Vec::new());
         }
@@ -2664,12 +2882,15 @@ impl ActiveSegment {
         }
         Ok(())
     }
-
 }
 
 impl HeadSegmentSnapshot {
     fn trace_window_bounds(&self, trace_id: &str) -> Option<TraceWindowBounds> {
         self.accumulator.trace_window_bounds(trace_id)
+    }
+
+    fn persisted_bytes(&self) -> u64 {
+        self.accumulator.persisted_bytes
     }
 
     fn row_count(&self) -> u64 {
@@ -3380,7 +3601,6 @@ impl PartFieldColumnValues {
             Self::Bool(_) => PART_FIELD_TYPE_BOOL,
         }
     }
-
 }
 
 impl OptionalI64Column {
@@ -3529,11 +3749,8 @@ fn recover_state(
         });
     }
 
-    let recovered_segments = materialize_recovery_entries(
-        recovery_entries,
-        recovery_seal_worker_count,
-        segments_path,
-    )?;
+    let recovered_segments =
+        materialize_recovery_entries(recovery_entries, recovery_seal_worker_count, segments_path)?;
 
     for recovered_segment in recovered_segments {
         recovered.persisted_bytes += recovered_segment.data_bytes;
@@ -4051,7 +4268,6 @@ fn observe_prepared_row_indexed_fields<'a>(
     }
 }
 
-
 fn merge_sorted_row_locations(
     existing: &mut Vec<SegmentRowLocation>,
     mut incoming: Vec<SegmentRowLocation>,
@@ -4432,8 +4648,9 @@ fn write_batched_binary_row_file(
             row_index += 1;
         }
 
-        let batch_body_len = u32::try_from(wal_batch_body_bytes(chunk_payload_bytes, chunk_rows))
-            .map_err(|_| invalid_data("batched row-file payload exceeds u32 length"))?;
+        let batch_body_len =
+            u32::try_from(wal_batch_body_bytes(chunk_payload_bytes, chunk_rows))
+                .map_err(|_| invalid_data("batched row-file payload exceeds u32 length"))?;
         let row_count_bytes = (chunk_rows as u32).to_le_bytes();
         let mut row_length_prefixes = Vec::with_capacity(chunk_rows * LENGTH_PREFIX_BYTES as usize);
         let mut checksum = crc32fast::Hasher::new();
@@ -5450,12 +5667,20 @@ fn write_persisted_segment_summaries_binary<W: Write>(
         write_u32_vec(writer, &summary.operations)?;
         let mut field_entries = summary.field_values_by_name.iter().collect::<Vec<_>>();
         field_entries.sort_by_key(|(field_name_ref, _)| **field_name_ref);
-        write_len(writer, field_entries.len(), "persisted segment summary fields")?;
+        write_len(
+            writer,
+            field_entries.len(),
+            "persisted segment summary fields",
+        )?;
         for (field_name_ref, field_value_refs) in field_entries {
             write_u32(writer, *field_name_ref)?;
             write_u32_vec(writer, field_value_refs)?;
         }
-        write_len(writer, summary.traces.len(), "persisted segment trace summaries")?;
+        write_len(
+            writer,
+            summary.traces.len(),
+            "persisted segment trace summaries",
+        )?;
         for trace in &summary.traces {
             write_u32(writer, trace.trace_ref)?;
             write_trace_window_bounds_binary(writer, trace.window)?;
@@ -6122,10 +6347,9 @@ fn load_recovery_manifest_file(root_path: &Path) -> Result<RecoveryManifest, Sto
     }
     let version = read_u8(&mut file)?;
     if !matches!(version, 1..=RECOVERY_MANIFEST_VERSION) {
-        return Err(invalid_data(format!(
-            "unsupported recovery manifest version {version}"
-        ))
-        .into());
+        return Err(
+            invalid_data(format!("unsupported recovery manifest version {version}")).into(),
+        );
     }
 
     let next_segment_id = read_u64(&mut file)?;
@@ -6439,7 +6663,9 @@ fn segment_wal_path(segments_path: &Path, segment_id: u64) -> PathBuf {
 }
 
 fn segment_row_file_path(segments_path: &Path, segment_id: u64) -> PathBuf {
-    segments_path.join(format!("{SEGMENT_PREFIX}{segment_id:020}{LEGACY_ROWS_SUFFIX}"))
+    segments_path.join(format!(
+        "{SEGMENT_PREFIX}{segment_id:020}{LEGACY_ROWS_SUFFIX}"
+    ))
 }
 
 fn segment_part_path(segments_path: &Path, segment_id: u64) -> PathBuf {
@@ -6532,18 +6758,17 @@ fn invalid_data(message: impl Into<String>) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        coalesce_trace_blocks_for_shard, decode_trace_row, load_or_rebuild_segment_meta,
-        load_valid_recovery_snapshot, deserialize_disk_trace_shard_state,
-        merge_sorted_row_locations, parse_segment_file_name, persist_recovery_manifest_file,
-        prepare_block_row_metadata, prepare_shared_group_metadata, rebuild_segment_meta,
-        recover_state, route_trace_blocks_for_append, search_segment_meta_for_request,
-        segment_binary_meta_path, segment_meta_path, segment_part_path, segment_row_file_path,
-        segment_wal_path, trace_block_shard_index, trace_shard_index, write_segment_meta_binary,
-        serialize_disk_trace_shard_state,
-        ActiveSegment, BatchInternCache, DiskStorageConfig, DiskStorageEngine, DiskSyncPolicy,
-        DiskTraceShardState, PreparedTraceBlockAppend, PreparedTraceShardBatch,
-        SegmentAccumulator, SegmentFileSet, SegmentRowLocation, SegmentTraceAccumulator,
-        SEGMENTS_DIRNAME,
+        coalesce_trace_blocks_for_shard, decode_trace_row, deserialize_disk_trace_shard_state,
+        load_or_rebuild_segment_meta, load_valid_recovery_snapshot, merge_sorted_row_locations,
+        parse_segment_file_name, persist_recovery_manifest_file, prepare_block_row_metadata,
+        prepare_shared_group_metadata, rebuild_segment_meta, recover_state,
+        route_trace_blocks_for_append, search_segment_meta_for_request, segment_binary_meta_path,
+        segment_meta_path, segment_part_path, segment_row_file_path, segment_wal_path,
+        serialize_disk_trace_shard_state, trace_block_shard_index, trace_shard_index,
+        write_segment_meta_binary, ActiveSegment, BatchInternCache, DiskStorageConfig,
+        DiskStorageEngine, DiskSyncPolicy, DiskTraceShardState, PreparedTraceBlockAppend,
+        PreparedTraceShardBatch, SegmentAccumulator, SegmentFileSet, SegmentRowLocation,
+        SegmentTraceAccumulator, SEGMENTS_DIRNAME,
     };
     use crate::{StorageEngine, StorageError};
     use serde_json::Value;
@@ -6695,8 +6920,8 @@ mod tests {
         )
         .expect("write legacy json meta");
 
-        let loaded = load_or_rebuild_segment_meta(1, &data_path, &meta_path)
-            .expect("load legacy json meta");
+        let loaded =
+            load_or_rebuild_segment_meta(1, &data_path, &meta_path).expect("load legacy json meta");
         assert_eq!(loaded.row_count, rebuilt.row_count);
         assert_eq!(loaded.services, rebuilt.services);
         assert!(
@@ -6786,7 +7011,10 @@ mod tests {
                 .expect("write retained wal segment");
             fs::remove_file(&part_path).expect("remove part to force wal-backed recovery");
         }
-        assert!(wal_path.exists(), "fixture should contain retained wal payload");
+        assert!(
+            wal_path.exists(),
+            "fixture should contain retained wal payload"
+        );
         assert!(
             !part_path.exists(),
             "fixture should force recovery to rely on wal kind",
@@ -6840,7 +7068,8 @@ mod tests {
             .with_trace_wal_enabled(false);
 
         {
-            let engine = DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk");
+            let engine =
+                DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk");
             engine
                 .append_rows(vec![trace_row(
                     "trace-recovery-rows",
@@ -6856,7 +7085,10 @@ mod tests {
 
         let segments_path = path.join(SEGMENTS_DIRNAME);
         let rows_path = segment_row_file_path(&segments_path, 1);
-        assert!(rows_path.exists(), "fixture should contain persisted row-file segment");
+        assert!(
+            rows_path.exists(),
+            "fixture should contain persisted row-file segment"
+        );
 
         let mut segment_files: HashMap<u64, SegmentFileSet> = HashMap::new();
         for entry in fs::read_dir(&segments_path).expect("read segments dir") {
@@ -6990,8 +7222,8 @@ mod tests {
         );
 
         let encoded = serialize_disk_trace_shard_state(&shard).expect("encode shard state");
-        let decoded =
-            deserialize_disk_trace_shard_state(&encoded).expect("decode shard state with summaries");
+        let decoded = deserialize_disk_trace_shard_state(&encoded)
+            .expect("decode shard state with summaries");
         let request = TraceSearchRequest {
             start_unix_nano: 0,
             end_unix_nano: 1_000,
@@ -7112,7 +7344,9 @@ mod tests {
             "minimal persisted indexes must still preserve trace windows",
         );
         assert_eq!(
-            shard.row_refs_for_trace("trace-minimal-indexes", 0, 1_000).len(),
+            shard
+                .row_refs_for_trace("trace-minimal-indexes", 0, 1_000)
+                .len(),
             1,
             "minimal persisted indexes must still preserve row refs",
         );
@@ -7703,4 +7937,134 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wal_backed_roll_does_not_block_following_appends_when_persist_finalize_is_stalled() {
+        let path = temp_test_dir("async-roll-append");
+        let config = DiskStorageConfig::default()
+            .with_target_segment_size_bytes(1)
+            .with_trace_shards(1);
+        let engine = std::sync::Arc::new(
+            DiskStorageEngine::open_with_config(&path, config).expect("open disk"),
+        );
+
+        let segment_paths_guard = engine.segment_paths.read();
+
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let first_engine = engine.clone();
+        let first_handle = thread::spawn(move || {
+            let result = first_engine.append_rows(vec![trace_row(
+                "trace-async-roll-1",
+                "span-1",
+                "GET /checkout",
+                100,
+                150,
+                &[("resource_attr:service.name", "checkout")],
+            )]);
+            first_tx.send(result).expect("report first append result");
+        });
+
+        let first_result = first_rx.recv_timeout(Duration::from_millis(200));
+        assert!(
+            first_result.is_ok(),
+            "first append should not wait for rotated-head finalize while segment_paths is read-locked",
+        );
+        first_result
+            .expect("first append completion signal")
+            .expect("first append succeeds");
+
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let second_engine = engine.clone();
+        let second_handle = thread::spawn(move || {
+            let result = second_engine.append_rows(vec![trace_row(
+                "trace-async-roll-2",
+                "span-1",
+                "GET /inventory",
+                200,
+                250,
+                &[("resource_attr:service.name", "inventory")],
+            )]);
+            second_tx.send(result).expect("report second append result");
+        });
+
+        let second_result = second_rx.recv_timeout(Duration::from_millis(200));
+        assert!(
+            second_result.is_ok(),
+            "follow-up append should keep making progress even when the previous rotated segment cannot finish persisting yet",
+        );
+        second_result
+            .expect("second append completion signal")
+            .expect("second append succeeds");
+
+        drop(segment_paths_guard);
+        first_handle.join().expect("join first append thread");
+        second_handle.join().expect("join second append thread");
+        wait_until(|| engine.stats().segment_count >= 2);
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn stats_does_not_hold_segment_paths_read_lock_while_waiting_on_head_locks() {
+        let path = temp_test_dir("stats-lock-scope");
+        let config = DiskStorageConfig::default()
+            .with_target_segment_size_bytes(u64::MAX)
+            .with_trace_shards(1);
+        let engine = std::sync::Arc::new(
+            DiskStorageEngine::open_with_config(&path, config).expect("open disk"),
+        );
+        engine
+            .append_rows(vec![trace_row(
+                "trace-stats-lock",
+                "span-1",
+                "GET /checkout",
+                100,
+                150,
+                &[("resource_attr:service.name", "checkout")],
+            )])
+            .expect("seed active segment");
+
+        let active_segment_guard = engine.active_segments[0].lock();
+
+        let (stats_started_tx, stats_started_rx) = std::sync::mpsc::channel();
+        let (stats_done_tx, stats_done_rx) = std::sync::mpsc::channel();
+        let stats_engine = engine.clone();
+        let stats_handle = thread::spawn(move || {
+            stats_started_tx
+                .send(())
+                .expect("report stats thread start");
+            let snapshot = stats_engine.stats();
+            stats_done_tx
+                .send(snapshot.segment_count)
+                .expect("report stats thread completion");
+        });
+
+        stats_started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("stats thread should start");
+        thread::sleep(Duration::from_millis(50));
+
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let writer_engine = engine.clone();
+        let writer_handle = thread::spawn(move || {
+            let _guard = writer_engine.segment_paths.write();
+            writer_tx
+                .send(())
+                .expect("report segment_paths writer lock acquisition");
+        });
+
+        writer_rx.recv_timeout(Duration::from_millis(200)).expect(
+            "segment_paths writer should not be blocked by stats waiting on the active head lock",
+        );
+
+        drop(active_segment_guard);
+        stats_done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("stats thread should finish once the active head lock is released");
+        stats_handle.join().expect("join stats thread");
+        writer_handle
+            .join()
+            .expect("join segment_paths writer thread");
+
+        fs::remove_dir_all(path).expect("cleanup temp dir");
+    }
 }

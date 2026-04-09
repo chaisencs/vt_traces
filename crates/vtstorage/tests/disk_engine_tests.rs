@@ -720,7 +720,13 @@ fn disk_engine_stats_keep_cached_field_column_counts_after_part_path_changes() {
         .expect("row")])
         .expect("append rows");
 
-    wait_until(|| engine.stats().segment_count >= 1);
+    wait_until(|| {
+        let stats = engine.stats();
+        stats.segment_count >= 1
+            && stats.trace_seal_queue_depth == 0
+            && stats.typed_field_columns == 1
+            && stats.string_field_columns == 2
+    });
 
     let stats = engine.stats();
     assert_eq!(stats.typed_field_columns, 1);
@@ -1096,8 +1102,8 @@ fn disk_engine_uses_selective_decode_for_part_reads() {
     let config = DiskStorageConfig::default().with_target_segment_size_bytes(1);
 
     {
-        let engine = DiskStorageEngine::open_with_config(&path, config.clone())
-            .expect("open disk engine");
+        let engine =
+            DiskStorageEngine::open_with_config(&path, config.clone()).expect("open disk engine");
         engine
             .append_rows(vec![make_row("trace-part-read-1", "span-1", 100, 150)])
             .expect("append first row");
@@ -1415,7 +1421,10 @@ fn disk_engine_trace_by_id_reads_across_rotated_persisted_segments() {
         .append_rows(vec![make_row("trace-federated-1", "span-2", 160, 210)])
         .expect("append second head row");
 
-    wait_until(|| engine.stats().segment_count >= 2);
+    wait_until(|| {
+        let stats = engine.stats();
+        stats.segment_count >= 2 && stats.trace_seal_queue_depth == 0
+    });
 
     let window = engine
         .trace_window("trace-federated-1")
@@ -1476,16 +1485,19 @@ fn disk_engine_reports_head_group_commit_and_seal_metrics() {
         .append_rows(vec![make_row("trace-head-metrics-2", "span-1", 200, 250)])
         .expect("append second metrics row");
 
-    wait_until(|| engine.stats().segment_count >= 2);
+    wait_until(|| {
+        let stats = engine.stats();
+        stats.segment_count >= 2 && stats.trace_seal_queue_depth == 0
+    });
 
     let stats = engine.stats();
     assert!(stats.trace_group_commit_flushes >= 2);
     assert!(stats.trace_group_commit_rows >= 2);
     assert!(stats.trace_group_commit_bytes > 0);
     assert_eq!(stats.trace_seal_queue_depth, 0);
-    assert_eq!(stats.trace_seal_completed, 0);
-    assert_eq!(stats.trace_seal_rows, 0);
-    assert_eq!(stats.trace_seal_bytes, 0);
+    assert!(stats.trace_seal_completed >= 2);
+    assert!(stats.trace_seal_rows >= 2);
+    assert!(stats.trace_seal_bytes > 0);
 
     drop(engine);
     fs::remove_dir_all(seal_path).expect("cleanup temp dir");
